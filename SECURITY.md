@@ -1,0 +1,22 @@
+# Security Policy
+
+## Scope
+
+This policy covers the OpenMail source code and official releases in this repository.
+
+## Reporting a vulnerability
+
+Do not open a public issue for a suspected vulnerability. Use a private GitHub Security Advisory for this repository when available. If that channel is unavailable, open a minimal issue asking for a private reporting channel without including exploit details.
+
+## Security requirements
+
+- Never commit OAuth client secrets, refresh tokens, access tokens, credentials, or mailbox exports.
+- Store refresh tokens through the Windows secure credential store.
+- Use the smallest provider permission scopes that support the feature.
+- Treat all provider content as untrusted input.
+- Sanitize rendered HTML mail and attachments before display.
+- Keep local database and attachment paths inside the OpenMail application data directory.
+
+## Supported versions
+
+Only the latest public `main` revision and the latest published release receive active fixes until a release policy is established.
