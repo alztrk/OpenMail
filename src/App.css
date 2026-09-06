@@ -92,6 +92,24 @@ button { cursor: pointer; }
 .setting-toggle:checked::after { transform: translateX(16px); background: #8bc48f; }
 .setting-toggle:focus-visible { outline: 2px solid #79b982; outline-offset: 2px; }
 .setting-toggle:disabled { cursor: not-allowed; opacity: .45; }
+.ui-icon-button { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid transparent; border-radius: 7px; color: #89958c; background: transparent; }
+.ui-slider { width: 150px; accent-color: #79b982; }
+.ui-separator { height: 1px; background: #202a22; }
+.ui-skeleton { min-height: 12px; border-radius: 5px; background: linear-gradient(90deg, #121713, #1b2a1e, #121713); background-size: 200% 100%; animation: skeleton-shimmer 1.4s ease-in-out infinite; }
+.ui-tooltip { position: relative; display: inline-flex; }
+.ui-tooltip-content { pointer-events: none; position: absolute; z-index: 130; bottom: calc(100% + 8px); left: 50%; padding: 6px 8px; transform: translateX(-50%) translateY(3px); border: 1px solid #2a3a2d; border-radius: 5px; opacity: 0; color: #dfe6df; background: #121713; font-size: 11px; white-space: nowrap; transition: opacity 120ms ease, transform 120ms ease; }
+.ui-tooltip:hover .ui-tooltip-content, .ui-tooltip:focus-within .ui-tooltip-content { opacity: 1; transform: translateX(-50%) translateY(0); }
+.ui-dialog-backdrop { position: fixed; z-index: 150; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(0 0 0 / 64%); }
+.ui-dialog { width: min(520px, 100%); padding: 22px; border: 1px solid #2a3a2d; border-radius: 10px; background: #121713; box-shadow: 0 20px 60px rgb(0 0 0 / 42%); }
+.ui-dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.ui-dialog-heading h2 { margin: 0; color: #f1f3ef; font-size: 20px; }
+.ui-dialog-heading button { border: 0; color: #89958c; background: transparent; font-size: 20px; }
+.ui-dropdown { position: relative; }
+.ui-dropdown summary { cursor: pointer; list-style: none; }
+.ui-dropdown-content { position: absolute; z-index: 120; top: calc(100% + 6px); right: 0; min-width: 180px; padding: 6px; border: 1px solid #2a3a2d; border-radius: 7px; background: #121713; box-shadow: 0 14px 34px rgb(0 0 0 / 42%); }
+.ui-scroll-area { overflow: auto; scrollbar-width: thin; }
+.ui-toast { position: fixed; z-index: 160; right: 22px; bottom: 22px; padding: 11px 14px; border: 1px solid #466c4e; border-radius: 7px; color: #dfe6df; background: #121713; box-shadow: 0 12px 28px rgb(0 0 0 / 32%); font-size: 13px; }
+@keyframes skeleton-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 .time-range { display: flex; gap: 12px; padding: 0 0 16px; }
 .time-range label { display: grid; gap: 6px; color: #89958c; font-size: 11px; }
 html[data-theme='light'] { color: #1d2720; background: #f3f6f3; }
