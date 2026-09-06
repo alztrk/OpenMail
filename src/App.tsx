@@ -1,8 +1,50 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import './App.css'
 
 type MailboxFilter = 'all' | 'gmail' | 'outlook'
+
+function WindowHeader() {
+  const { t } = useTranslation()
+  const [isMaximized, setIsMaximized] = useState(false)
+
+  const minimize = async () => {
+    await getCurrentWindow().minimize()
+  }
+
+  const toggleMaximize = async () => {
+    const window = getCurrentWindow()
+    await window.toggleMaximize()
+    setIsMaximized(await window.isMaximized())
+  }
+
+  const close = async () => {
+    await getCurrentWindow().close()
+  }
+
+  return (
+    <header className="window-header">
+      <div className="window-drag-region" data-tauri-drag-region="true">
+        <div className="window-brand">
+          <span className="brand-dot" aria-hidden="true" />
+          <span>OpenMail</span>
+        </div>
+      </div>
+      <div className="window-controls" data-tauri-drag-region="false">
+        <button className="window-control" type="button" aria-label={t('minimize')} onClick={() => void minimize()}>
+          <span aria-hidden="true">−</span>
+        </button>
+        <button className="window-control" type="button" aria-label={t(isMaximized ? 'restore' : 'maximize')} onClick={() => void toggleMaximize()}>
+          <span aria-hidden="true">{isMaximized ? '❐' : '□'}</span>
+        </button>
+        <button className="window-control close-control" type="button" aria-label={t('close')} onClick={() => void close()}>
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
+    </header>
+  )
+}
 
 function App() {
   const { t, i18n } = useTranslation()
@@ -11,6 +53,7 @@ function App() {
 
   return (
     <main className="app-shell">
+      <WindowHeader />
       <aside className="sidebar" aria-label={t('navigation')}>
         <div className="brand-mark"><span className="brand-dot" aria-hidden="true" /><span>OpenMail</span></div>
         <button className="compose-button" type="button" onClick={() => setIsComposerOpen(true)}><span aria-hidden="true">+</span>{t('compose')}</button>

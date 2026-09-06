@@ -15,6 +15,9 @@
         "title": "OpenMail",
         "width": 800,
         "height": 600,
+        "minWidth": 640,
+        "minHeight": 420,
+        "decorations": false,
         "resizable": true,
         "fullscreen": false
       }
