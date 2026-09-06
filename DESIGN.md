@@ -2,7 +2,7 @@
 
 ## Design read
 
-OpenMail is a frequently used Windows desktop tool. Its interface is calm, local, and quick to scan: a dark work surface, one lime accent, and thin boundaries that keep the mail workspace quiet.
+OpenMail is a frequently used Windows desktop tool. Its interface is calm, local, and quick to scan: a near-black work surface, one muted green accent, and thin boundaries that keep the mail workspace quiet.
 
 ## Direction
 
@@ -19,14 +19,14 @@ OpenMail should feel like a local tool that stays beside the user's work, not a 
 
 ## Visual tokens
 
-- Background: `#151815`
-- Sidebar surface: `#191D1A`
-- Raised surface: `#202620`
-- Hairline border: `#2B302C`
-- Primary text: `#E8E9E3`
-- Secondary text: `#929A92`
-- Muted text: `#697269`
-- Single accent: `#D4E05B`
+- Background: `#080A09`
+- Sidebar surface: `#0E1210`
+- Raised surface: `#121713`
+- Hairline border: `#202A22`
+- Primary text: `#F1F3EF`
+- Secondary text: `#A4AEA6`
+- Muted text: `#6F7B72`
+- Single accent: `#79B982`
 - Positive sync state: `#9CC66B`
 - Radius rule: 7-8px controls, 10-12px protected surfaces, circular avatar only.
 - Shadows: only for modal or protected overlay surfaces, never on every row or card.
