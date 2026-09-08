@@ -4,7 +4,7 @@ OpenMail is a lightweight, local-first Windows desktop mail client for bringing 
 
 ## Project status
 
-OpenMail is under active public development. The repository currently contains the Tauri desktop shell, the first interface foundation, bilingual UI scaffolding, and the product and design records. Gmail integration is the next product milestone.
+OpenMail is under active public development. The repository currently contains the Tauri desktop shell, bilingual UI, Gmail OAuth with PKCE, local mailbox caching, incremental synchronization, HTML mail rendering, desktop notifications, Windows tray controls, and the product and design records. Microsoft account support remains a future provider milestone.
 
 ## Principles
 
@@ -21,7 +21,7 @@ OpenMail is under active public development. The repository currently contains t
 - React and TypeScript for the interface.
 - Tailwind CSS v4 for utility styling.
 - shadcn/ui for owned component primitives.
-- SQLite for local mailbox data.
+- JSON files for local mailbox metadata and message cache during the current MVP.
 - i18next and react-i18next for localization.
 
 ## Development
@@ -41,21 +41,27 @@ npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-Build Windows installers:
+Build the Windows portable release:
 
 ```powershell
-npm run tauri build
+npm run tauri build -- --no-bundle
 ```
+
+The portable release is a single `openmail.exe`. Before building, set the
+`GMAIL_CLIENT_SECRET` constant in `src-tauri/src/config.rs` when using the
+configured Gmail OAuth client. The value is part of the source configuration;
+no `.env` file or release helper script is required at runtime.
 
 ## Localization
 
-Translations live in `src/i18n.ts`. Supported locale codes are `en` and `tr`. New user-facing text must be added to both translation objects and referenced by a stable key from React components.
+Translations live in `src/locales/en.json` and `src/locales/tr.json`. Supported locale codes are `en` and `tr`. New user-facing text must be added to both locale files and referenced by a stable key from React components.
 
 ## Documentation map
 
 - [Product record](PRODUCT.md)
 - [Design system](DESIGN.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Authentication](docs/AUTHENTICATION.md)
 - [Development guide](docs/DEVELOPMENT.md)
 - [Local data and privacy](docs/PRIVACY.md)
 - [Contributing](CONTRIBUTING.md)

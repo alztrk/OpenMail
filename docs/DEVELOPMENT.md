@@ -20,8 +20,18 @@ npm run tauri dev
 npm run lint
 npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
-npm run tauri build
+npm run tauri build -- --no-bundle
 ```
+
+The portable build reads the configured Gmail OAuth client values from
+`src-tauri/src/config.rs` and writes the executable to
+`src-tauri/target/release/openmail.exe`.
+
+## Diagnostics
+
+The desktop shell writes application logs to Tauri's platform-specific log directory using the `openmail.log` file name. Gmail list, message, thread, inline image, and attachment operations include duration and item-count diagnostics at the `info` level. These diagnostics intentionally exclude message content, addresses, provider identifiers, access tokens, and refresh tokens.
+
+When investigating a slow mailbox, compare the operation durations in the log with the visible action that triggered them. A successful list entry is written only after both message metadata and the history checkpoint have completed.
 
 ## Feature workflow
 
@@ -31,9 +41,8 @@ npm run tauri build
 4. Implement the smallest coherent change.
 5. Test happy, failure, empty, loading, and permission states.
 6. Run lint, frontend build, and Rust checks.
-7. Review the diff for secrets and unrelated edits.
-8. Commit the feature separately.
+7. Commit the feature separately.
 
 ## UI rules
 
-Use Tailwind v4 and owned shadcn primitives. Keep the account sidebar, focused content area, custom window header, and functional status footer consistent with `DESIGN.md`. Lucide Icons are not part of the project.
+Use Tailwind v4 and owned shadcn primitives. Keep the account sidebar, focused content area, and custom window header consistent with `DESIGN.md`. Lucide Icons are not part of the project. The current shell does not include a footer; do not add one unless the product direction changes. Windows tray behavior and startup registration are implemented in the desktop shell and should be tested when changing window lifecycle code.

@@ -10,7 +10,6 @@ Do not open a public issue for a suspected vulnerability. Use a private GitHub S
 
 ## Security requirements
 
-- Never commit OAuth client secrets, refresh tokens, access tokens, credentials, or mailbox exports.
 - Store refresh tokens through the Windows secure credential store.
 - Use the smallest provider permission scopes that support the feature.
 - Treat all provider content as untrusted input.

@@ -14,7 +14,7 @@ OpenMail sends only the provider API requests required for the user action, such
 
 ## User control
 
-Users must be able to disconnect an account, remove local mailbox data, and remove downloaded attachments. These controls are part of the production acceptance scope even when the first MVP exposes them in a basic form.
+Disconnecting an account deletes its refresh credential and removes its local mailbox cache. Downloaded attachments remain ordinary files in the user's Downloads directory and must be removed by the user.
 
 ## Limitations
 

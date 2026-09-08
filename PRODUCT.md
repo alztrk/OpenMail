@@ -34,7 +34,7 @@ The application starts with Windows or on user request and can remain active in 
 - Synchronization runs while the application or its tray service is active.
 - Without a publicly reachable provider push endpoint, notifications while the application is fully stopped are not guaranteed.
 - The interface is calm, fast to scan, and low-resource.
-- Lucide Icons are not used. The first design uses text and restrained geometric marks; a separate icon family requires an explicit decision.
+- Lucide Icons are not used. Tabler Icons is the shared icon family for interface actions, navigation, settings, and mail state.
 
 ## Brand Commitments
 
@@ -51,6 +51,14 @@ No real mailbox content or additional brand assets have been supplied. The inter
 - Provider independent: Gmail and Outlook use a shared mail model.
 - Quiet reliability: sync, error, and connection states are clear without being distracting.
 - Lightweight operation: background and interface processes avoid unnecessary resource use.
+
+## Current implementation status
+
+- Gmail OAuth with PKCE is implemented.
+- Mail metadata and loaded message pages use local JSON cache files.
+- Refresh tokens are stored in Windows Credential Manager.
+- HTML mail rendering, attachments, incremental synchronization, desktop notifications, tray controls, and launch-at-startup are implemented.
+- Outlook support remains planned and is not available in the current release.
 
 ## Accessibility & Inclusion
 

@@ -10,11 +10,11 @@ OpenMail should feel like a local tool that stays beside the user's work, not a 
 
 ## Layout
 
-- Full-window layout with a custom header, account sidebar, content area, and an optional status footer.
+- Full-window layout with a custom header, account sidebar, and content area.
 - Header: `OpenMail` on the left; custom minimize, maximize, and close controls on the right.
 - Sidebar: accounts are first-class navigation objects. Provider, account identity, and sync state appear together.
 - Content: inbox, search, filters, and message rows stay in one reading flow.
-- Footer: only appears when it carries real sync status, last checked time, or version information. No decorative footer.
+- Footer: not present in the current shell. Do not reserve empty space for a footer.
 - Narrow windows collapse or reduce the sidebar without losing the message workflow.
 
 ## Visual tokens
@@ -43,7 +43,7 @@ Use a Windows system sans-serif stack. Headings are short and moderately weighte
 - `MailList`: controlled-density rows, never a card grid.
 - `MailRow`: sender, subject, preview, time, and read state.
 - `SearchField`: keyboard-accessible search with visible focus.
-- `StatusFooter`: real sync information only.
+- Sync status: surfaced through the existing refresh and error states when it carries useful information.
 - `Composer`: protected surface for new mail and replies.
 
 ## Interaction states
@@ -52,7 +52,7 @@ Every primary surface needs loading, empty, error, disabled, and success states.
 
 ## Icon policy
 
-Lucide is not used. The first version favors restrained text and geometric marks. If a real icon requirement appears, select one icon family and record the decision here. Hand-drawn SVG path icons are not allowed.
+Lucide is not used. Tabler Icons is the shared icon family for interface actions, navigation, settings, and mail state. Provider branding remains in its own SVG assets. Hand-drawn SVG path icons are not allowed.
 
 ## Performance and motion
 
@@ -62,7 +62,7 @@ Preserve Tauri's lightweight footprint. Avoid continuous animation, blur, and he
 
 - The first viewport clearly contains OpenMail, the account area, the content title, and window controls.
 - The sidebar is reserved for accounts and navigation; mail content stays on the right.
-- Header and footer carry real function; no decorative zones are added.
+- Header carries real window controls; no decorative footer zone is added.
 - The color system uses one accent color.
 - The message list is a scannable row layout, not a card grid.
 - Keyboard focus, empty, loading, and error states are visible.
