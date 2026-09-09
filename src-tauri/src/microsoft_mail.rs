@@ -244,7 +244,7 @@ async fn fetch_message_page(
         .map(validate_next_link)
         .transpose()?
         .unwrap_or_else(|| format!("{GRAPH_API_URL}/{path}"));
-    let response = send_authenticated(account_id, "list messages", |access_token| {
+    let response = send_authenticated_read(account_id, "list messages", |access_token| {
         let mut request = client
             .get(&url)
             .bearer_auth(access_token)
@@ -280,7 +280,7 @@ async fn fetch_message_page(
 pub async fn get_message(account_id: &str, message_id: &str) -> Result<MailMessage, String> {
     let url = message_url(message_id)?;
     let client = shared_http_client()?;
-    let response = send_authenticated(account_id, "load message", |access_token| {
+    let response = send_authenticated_read(account_id, "load message", |access_token| {
         client
             .get(url.clone())
             .bearer_auth(access_token)
@@ -329,7 +329,7 @@ pub async fn download_attachment(
 ) -> Result<String, String> {
     let url = attachment_url(message_id, attachment_id)?;
     let client = shared_http_client()?;
-    let response = send_authenticated(account_id, "download attachment", |access_token| {
+    let response = send_authenticated_read(account_id, "download attachment", |access_token| {
         client.get(url.clone()).bearer_auth(access_token)
     })
     .await?;
@@ -488,7 +488,7 @@ async fn sync_from_delta(
     let mut removed = Vec::new();
     let mut cursor = None;
     for _ in 0..100 {
-        let response = send_authenticated(account_id, "sync messages", |access_token| {
+        let response = send_authenticated_read(account_id, "sync messages", |access_token| {
             client.get(&url).bearer_auth(access_token)
         })
         .await?;
@@ -622,6 +622,29 @@ async fn send_authenticated<F>(
 where
     F: Fn(&str) -> RequestBuilder,
 {
+    send_authenticated_with_policy(account_id, operation, build_request, false).await
+}
+
+async fn send_authenticated_read<F>(
+    account_id: &str,
+    operation: &str,
+    build_request: F,
+) -> Result<Response, String>
+where
+    F: Fn(&str) -> RequestBuilder,
+{
+    send_authenticated_with_policy(account_id, operation, build_request, true).await
+}
+
+async fn send_authenticated_with_policy<F>(
+    account_id: &str,
+    operation: &str,
+    build_request: F,
+    retry_rate_limit: bool,
+) -> Result<Response, String>
+where
+    F: Fn(&str) -> RequestBuilder,
+{
     let mut access_token = refresh_access_token(account_id).await?;
     let mut response = build_request(&access_token)
         .send()
@@ -634,6 +657,20 @@ where
             .send()
             .await
             .map_err(|error| format!("Microsoft Graph {operation} retry failed: {error}"))?;
+    }
+    if retry_rate_limit && response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1)
+            .min(5);
+        log::warn!("Microsoft Graph rate limit reached during {operation}; retrying once");
+        std::thread::sleep(Duration::from_secs(retry_after));
+        response = build_request(&access_token).send().await.map_err(|error| {
+            format!("Microsoft Graph {operation} rate-limit retry failed: {error}")
+        })?;
     }
     if response.status().is_success() {
         return Ok(response);
