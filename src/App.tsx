@@ -1657,13 +1657,6 @@ function App() {
     if (nextMessage) selectReaderMessage(nextMessage)
   }
 
-  useLayoutEffect(() => {
-    if (!selectedMessageId || activeView !== 'mail') return
-    const canvas = mainCanvasRef.current
-    if (!canvas) return
-    canvas.scrollTop = 0
-  }, [activeView, selectedMessageId])
-
   useEffect(() => {
     if (!selectedMessageId || activeView !== 'mail') return undefined
     const mobileViewport = window.matchMedia('(max-width: 580px)')
