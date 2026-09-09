@@ -334,13 +334,21 @@ async fn list_messages_with_query(
         (responses, Some(history_id_result?))
     };
     let mut messages = Vec::with_capacity(responses.len());
+    let mut skipped_count = 0;
     for response in responses {
-        messages.push(to_mail_message(response?));
+        match response {
+            Ok(message) => messages.push(to_mail_message(message)),
+            Err(error) => {
+                skipped_count += 1;
+                log::warn!("Gmail message metadata was skipped during list: {error}");
+            }
+        }
     }
 
     log::info!(
-        "Gmail list completed: messages={} duration_ms={}",
+        "Gmail list completed: messages={} skipped={} duration_ms={}",
         messages.len(),
+        skipped_count,
         started_at.elapsed().as_millis()
     );
     Ok(MessagePage {
