@@ -122,6 +122,15 @@ fn format_gmail_api_error(status: reqwest::StatusCode, body: &str, operation: &s
         return "GMAIL_PERMISSION_REQUIRED: Gmail permissions are incomplete. Reconnect the account."
             .to_string();
     }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return format!("AUTH_REQUIRED: Gmail authorization expired during {operation}");
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return format!("GMAIL_PERMISSION_REQUIRED: Gmail denied {operation}. Reconnect the account with mailbox permissions.");
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return format!("GMAIL_RATE_LIMITED: Gmail rate limited {operation}. Try again shortly.");
+    }
     let message = parsed
         .as_ref()
         .and_then(|response| response.error.message.clone())

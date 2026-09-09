@@ -749,6 +749,11 @@ fn format_graph_error(status: StatusCode, body: &str, operation: &str) -> String
     if status == StatusCode::TOO_MANY_REQUESTS {
         return format!("OUTLOOK_RATE_LIMITED: Microsoft Graph {operation} was rate limited");
     }
+    if status.is_server_error() {
+        return format!(
+            "OUTLOOK_TEMPORARY_ERROR: Microsoft Graph {operation} is temporarily unavailable"
+        );
+    }
     format!("Microsoft Graph {operation} failed with HTTP {status}: {message}")
 }
 

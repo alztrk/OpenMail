@@ -386,6 +386,11 @@ function App() {
     if (message.startsWith('AUTH_REQUIRED:')) return t('gmailReauthorizationRequired')
     if (message.startsWith('GMAIL_CLIENT_CONFIG:')) return t('gmailClientConfigurationRequired')
     if (message.startsWith('GMAIL_PERMISSION_REQUIRED:')) return t('gmailPermissionRequired')
+    if (message.startsWith('GMAIL_RATE_LIMITED:')) return t('gmailRateLimited')
+    if (message.startsWith('OUTLOOK_REAUTH_REQUIRED:')) return t('outlookReauthorizationRequired')
+    if (message.startsWith('OUTLOOK_PERMISSION_REQUIRED:')) return t('outlookPermissionRequired')
+    if (message.startsWith('OUTLOOK_RATE_LIMITED:')) return t('outlookRateLimited')
+    if (message.startsWith('OUTLOOK_TEMPORARY_ERROR:')) return t('outlookTemporaryError')
     if (message === 'EMPTY_CONVERSATION') return t('emptyConversation')
     return message
   }, [t])
