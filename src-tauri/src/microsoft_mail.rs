@@ -112,6 +112,8 @@ struct GraphPage<T> {
     value: Vec<T>,
     #[serde(rename = "@odata.nextLink")]
     next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink")]
+    delta_link: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +174,8 @@ struct GraphMessage {
     from: Option<GraphRecipient>,
     body: Option<GraphBody>,
     attachments: Option<Vec<GraphAttachment>>,
+    #[serde(rename = "@removed")]
+    removed: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +432,26 @@ pub async fn sync_messages(
     account_id: &str,
     cached_page: Option<MessagePage>,
 ) -> Result<SyncResult, String> {
+    if let Some(cached_page) = cached_page.as_ref() {
+        if let Some(delta_link) = cached_page.history_id.as_deref() {
+            if delta_link.starts_with("https://graph.microsoft.com/") {
+                return sync_from_delta(account_id, cached_page, delta_link).await;
+            }
+        }
+    }
+    if cached_page.is_none() {
+        let initial_page = MessagePage {
+            messages: Vec::new(),
+            next_page_token: None,
+            history_id: None,
+        };
+        let initial_url = format!(
+            "{GRAPH_API_URL}/me/mailFolders/inbox/messages/delta?$select=id,conversationId,internetMessageId,subject,from,receivedDateTime,isRead,flag,bodyPreview,hasAttachments&$top={PAGE_SIZE}"
+        );
+        let mut result = sync_from_delta(account_id, &initial_page, &initial_url).await?;
+        result.new_message_count = 0;
+        return Ok(result);
+    }
     let previous_ids = cached_page
         .as_ref()
         .map(|page| {
@@ -444,8 +468,74 @@ pub async fn sync_messages(
         .filter(|message| !previous_ids.contains(&message.id.as_str()))
         .count();
     Ok(SyncResult {
-        page,
+        page: MessagePage {
+            history_id: page.history_id,
+            ..page
+        },
         new_message_count,
+        removed_message_ids: Vec::new(),
+    })
+}
+
+async fn sync_from_delta(
+    account_id: &str,
+    cached_page: &MessagePage,
+    delta_link: &str,
+) -> Result<SyncResult, String> {
+    let client = shared_http_client()?;
+    let mut url = validate_next_link(delta_link)?;
+    let mut changed = Vec::new();
+    let mut removed = Vec::new();
+    let mut cursor = None;
+    for _ in 0..100 {
+        let response = send_authenticated(account_id, "sync messages", |access_token| {
+            client.get(&url).bearer_auth(access_token)
+        })
+        .await?;
+        let page = response
+            .json::<GraphPage<GraphMessage>>()
+            .await
+            .map_err(|error| {
+                format!("Microsoft Graph delta response could not be decoded: {error}")
+            })?;
+        for message in page.value {
+            if message.removed.is_some() {
+                removed.push(message.id);
+            } else {
+                changed.push(to_mail_message(message));
+            }
+        }
+        if let Some(next) = page.next_link {
+            url = validate_next_link(&next)?;
+            continue;
+        }
+        cursor = page.delta_link;
+        break;
+    }
+    let mut messages = cached_page.messages.clone();
+    let removed_set: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+    messages.retain(|message| !removed_set.contains(message.id.as_str()));
+    let previous_ids: std::collections::HashSet<&str> =
+        messages.iter().map(|m| m.id.as_str()).collect();
+    let new_message_count = changed
+        .iter()
+        .filter(|message| !previous_ids.contains(message.id.as_str()))
+        .count();
+    for message in changed {
+        if let Some(existing) = messages.iter_mut().find(|item| item.id == message.id) {
+            *existing = message;
+        } else {
+            messages.push(message);
+        }
+    }
+    Ok(SyncResult {
+        page: MessagePage {
+            messages,
+            next_page_token: None,
+            history_id: cursor,
+        },
+        new_message_count,
+        removed_message_ids: removed,
     })
 }
 
@@ -830,6 +920,7 @@ mod tests {
                 content: Some("<p>Hello</p>".to_string()),
             }),
             attachments: None,
+            removed: None,
         });
 
         assert_eq!(message.sender, "Sender");

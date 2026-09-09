@@ -81,7 +81,7 @@ Use `$select` for list rows and fetch the full body only for the selected messag
 
 Graph delta is a per-folder operation. The initial sync should enumerate the mailbox folders, then run a full delta round for Inbox and the folders OpenMail exposes. Persist the returned `@odata.nextLink` while a round is incomplete and persist `@odata.deltaLink` when the round finishes.
 
-The current adapter performs a bounded full Inbox refresh because delta cursor persistence is not implemented yet. It advertises `supports_incremental_sync: false` so the UI and diagnostics do not claim delta synchronization. Subsequent implementation work should:
+The adapter initializes and persists the Microsoft Graph Inbox delta link in the local message cache. Subsequent syncs follow the provider-issued delta cursor and apply changed and removed message entries without refreshing the complete Inbox. Subsequent implementation work should:
 
 - Reuse the saved delta link for each folder.
 - Apply additions, updates, and deletions transactionally to the local cache.
@@ -102,7 +102,7 @@ The adapter must verify whether the selected Graph id remains stable after a mov
 
 ## Implementation steps
 
-1. Persist Graph delta cursors per folder and merge delta additions, updates, and deletions transactionally.
+1. Persist Graph delta cursors for folders beyond Inbox and merge delta additions, updates, and deletions transactionally.
 2. Extract the shared loopback OAuth and PKCE flow while keeping provider endpoints and scopes in each adapter.
 3. Add Graph throttling backoff and a dedicated reconnect state for revoked refresh tokens.
 4. Add localized provider setup, permission, throttling, and offline messages.

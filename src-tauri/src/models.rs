@@ -57,6 +57,8 @@ pub struct MailThread {
 pub struct SyncResult {
     pub page: MessagePage,
     pub new_message_count: usize,
+    #[serde(default)]
+    pub removed_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -68,7 +68,7 @@ impl ProviderCapabilities {
         can_mark_read: true,
         can_star: true,
         can_spam: true,
-        supports_incremental_sync: false,
+        supports_incremental_sync: true,
         supports_html: true,
         supports_attachments: true,
     };
@@ -271,6 +271,7 @@ impl MailProviderAdapter for GmailAdapter {
             Ok(SyncResult {
                 page: result.page,
                 new_message_count: result.new_message_count,
+                removed_message_ids: result.removed_message_ids,
             })
         })
     }

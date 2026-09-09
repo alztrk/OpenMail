@@ -321,10 +321,16 @@ pub async fn sync_messages(
         result.new_message_count,
         started_at.elapsed().as_millis()
     );
-    let page = message_cache::save_sync(&state.app_data_dir, &account_id, result.page)?;
+    let page = message_cache::save_sync(
+        &state.app_data_dir,
+        &account_id,
+        result.page,
+        &result.removed_message_ids,
+    )?;
     Ok(SyncResult {
         page,
         new_message_count: result.new_message_count,
+        removed_message_ids: result.removed_message_ids,
     })
 }
 

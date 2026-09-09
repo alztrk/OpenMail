@@ -344,6 +344,7 @@ async fn list_messages_with_query(
 pub struct SyncOutcome {
     pub page: MessagePage,
     pub new_message_count: usize,
+    pub removed_message_ids: Vec<String>,
 }
 
 pub async fn sync_messages(
@@ -354,12 +355,14 @@ pub async fn sync_messages(
         return Ok(SyncOutcome {
             page: list_messages(account_id, None).await?,
             new_message_count: 0,
+            removed_message_ids: Vec::new(),
         });
     };
     let Some(start_history_id) = cached_page.history_id.clone() else {
         return Ok(SyncOutcome {
             page: list_messages(account_id, None).await?,
             new_message_count: 0,
+            removed_message_ids: Vec::new(),
         });
     };
 
@@ -373,6 +376,7 @@ pub async fn sync_messages(
         return Ok(SyncOutcome {
             page: list_messages(account_id, None).await?,
             new_message_count: 0,
+            removed_message_ids: Vec::new(),
         });
     }
 
@@ -426,6 +430,7 @@ pub async fn sync_messages(
     Ok(SyncOutcome {
         page,
         new_message_count: added_ids.len(),
+        removed_message_ids: removed_ids,
     })
 }
 

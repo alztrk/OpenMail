@@ -248,24 +248,24 @@ pub fn save_sync(
     data_dir: &Path,
     account_id: &str,
     page: MessagePage,
+    removed_message_ids: &[String],
 ) -> Result<MessagePage, String> {
     let existing_page = load(data_dir, account_id)?.unwrap_or(MessagePage {
         messages: Vec::new(),
         next_page_token: None,
         history_id: None,
     });
+    let removed_ids: std::collections::HashSet<&str> =
+        removed_message_ids.iter().map(String::as_str).collect();
     let incoming_ids: std::collections::HashSet<String> = page
         .messages
         .iter()
         .map(|message| message.id.clone())
         .collect();
     let mut messages = page.messages;
-    messages.extend(
-        existing_page
-            .messages
-            .into_iter()
-            .filter(|message| !incoming_ids.contains(&message.id)),
-    );
+    messages.extend(existing_page.messages.into_iter().filter(|message| {
+        !incoming_ids.contains(&message.id) && !removed_ids.contains(message.id.as_str())
+    }));
     save_page(
         data_dir,
         account_id,
@@ -729,6 +729,7 @@ mod tests {
                 next_page_token: Some("next-page".to_string()),
                 history_id: Some("history-2".to_string()),
             },
+            &[],
         )
         .expect("sync should save");
 
@@ -738,6 +739,51 @@ mod tests {
         assert_eq!(synced.next_page_token.as_deref(), Some("next-page"));
         assert_eq!(synced.history_id.as_deref(), Some("history-2"));
         fs::remove_dir_all(data_dir).expect("sync cache test directory should be removable");
+    }
+
+    #[test]
+    fn sync_removes_messages_reported_by_provider() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-cache-removal-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        let mut keep = message("keep");
+        keep.id = "keep".to_string();
+        let mut remove = message("remove");
+        remove.id = "remove".to_string();
+        save_page(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![keep, remove],
+                next_page_token: None,
+                history_id: Some("history-1".to_string()),
+            },
+            false,
+        )
+        .expect("initial cache should save");
+
+        let synced = save_sync(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![{
+                    let mut keep = message("keep");
+                    keep.id = "keep".to_string();
+                    keep
+                }],
+                next_page_token: None,
+                history_id: Some("history-2".to_string()),
+            },
+            &["remove".to_string()],
+        )
+        .expect("sync should save");
+
+        assert_eq!(synced.messages.len(), 1);
+        assert_eq!(synced.messages[0].id, "keep");
+        fs::remove_dir_all(data_dir).expect("sync removal test directory should be removable");
     }
 
     #[test]
