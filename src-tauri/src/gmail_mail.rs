@@ -9,7 +9,7 @@ use base64::{
     Engine,
 };
 use futures::future::{join, join_all};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -139,6 +139,35 @@ fn format_gmail_api_error(status: reqwest::StatusCode, body: &str, operation: &s
         .map(|value| format!(" [{value}]"))
         .unwrap_or_default();
     format!("Gmail {operation} failed with HTTP {status}{reason_suffix}: {message}")
+}
+
+async fn send_gmail_read_with_retry<F>(
+    build_request: F,
+    operation: &str,
+) -> Result<Response, String>
+where
+    F: Fn() -> RequestBuilder,
+{
+    let mut response = build_request()
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1)
+            .min(5);
+        log::warn!("Gmail rate limit reached during {operation}; retrying once");
+        std::thread::sleep(Duration::from_secs(retry_after));
+        response = build_request()
+            .send()
+            .await
+            .map_err(|error| format!("Gmail rate-limit retry failed: {error}"))?;
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,23 +336,26 @@ async fn list_messages_with_query(
             let client = client.clone();
             let access_token = access_token.clone();
             async move {
-                client
-                    .get(format!("{GMAIL_API_URL}/messages/{}", reference.id))
-                    .bearer_auth(access_token)
-                    .query(&[
-                        ("format", "metadata"),
-                        ("metadataHeaders", "From"),
-                        ("metadataHeaders", "Subject"),
-                        ("metadataHeaders", "Date"),
-                    ])
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .error_for_status()
-                    .map_err(|error| error.to_string())?
-                    .json::<GmailMessage>()
-                    .await
-                    .map_err(|error| error.to_string())
+                send_gmail_read_with_retry(
+                    || {
+                        client
+                            .get(format!("{GMAIL_API_URL}/messages/{}", reference.id))
+                            .bearer_auth(&access_token)
+                            .query(&[
+                                ("format", "metadata"),
+                                ("metadataHeaders", "From"),
+                                ("metadataHeaders", "Subject"),
+                                ("metadataHeaders", "Date"),
+                            ])
+                    },
+                    &format!("message metadata {}", reference.id),
+                )
+                .await?
+                .error_for_status()
+                .map_err(|error| error.to_string())?
+                .json::<GmailMessage>()
+                .await
+                .map_err(|error| error.to_string())
             }
         });
     let (responses, history_id) = if query.is_some() {
@@ -1322,27 +1354,30 @@ async fn fetch_metadata_messages(
     ids: Vec<String>,
 ) -> Result<Vec<(MailMessage, bool)>, String> {
     join_all(ids.into_iter().map(|id| async move {
-        client
-            .get(format!("{GMAIL_API_URL}/messages/{id}"))
-            .bearer_auth(access_token)
-            .query(&[
-                ("format", "metadata"),
-                ("metadataHeaders", "From"),
-                ("metadataHeaders", "Subject"),
-                ("metadataHeaders", "Date"),
-            ])
-            .send()
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?
-            .json::<GmailMessage>()
-            .await
-            .map(|message| {
-                let is_inbox = has_label(&message.label_ids, "INBOX");
-                (to_mail_message(message), is_inbox)
-            })
-            .map_err(|error| error.to_string())
+        send_gmail_read_with_retry(
+            || {
+                client
+                    .get(format!("{GMAIL_API_URL}/messages/{id}"))
+                    .bearer_auth(access_token)
+                    .query(&[
+                        ("format", "metadata"),
+                        ("metadataHeaders", "From"),
+                        ("metadataHeaders", "Subject"),
+                        ("metadataHeaders", "Date"),
+                    ])
+            },
+            &format!("message metadata {id}"),
+        )
+        .await?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json::<GmailMessage>()
+        .await
+        .map(|message| {
+            let is_inbox = has_label(&message.label_ids, "INBOX");
+            (to_mail_message(message), is_inbox)
+        })
+        .map_err(|error| error.to_string())
     }))
     .await
     .into_iter()
