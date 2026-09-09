@@ -1945,4 +1945,20 @@ mod tests {
         invalidate_access_token(account_id);
         assert!(load_cached_access_token(account_id).is_none());
     }
+
+    #[test]
+    fn classifies_gmail_recovery_errors() {
+        assert!(
+            format_gmail_api_error(StatusCode::UNAUTHORIZED, "", "load message")
+                .starts_with("AUTH_REQUIRED:")
+        );
+        assert!(
+            format_gmail_api_error(StatusCode::FORBIDDEN, "", "change message")
+                .starts_with("GMAIL_PERMISSION_REQUIRED:")
+        );
+        assert!(
+            format_gmail_api_error(StatusCode::TOO_MANY_REQUESTS, "", "list messages")
+                .starts_with("GMAIL_RATE_LIMITED:")
+        );
+    }
 }

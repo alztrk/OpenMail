@@ -970,4 +970,24 @@ mod tests {
         assert!(message.unread);
         assert!(message.starred);
     }
+
+    #[test]
+    fn classifies_graph_recovery_errors() {
+        assert!(
+            format_graph_error(StatusCode::UNAUTHORIZED, "", "load message")
+                .starts_with("OUTLOOK_REAUTH_REQUIRED:")
+        );
+        assert!(
+            format_graph_error(StatusCode::FORBIDDEN, "", "change message")
+                .starts_with("OUTLOOK_PERMISSION_REQUIRED:")
+        );
+        assert!(
+            format_graph_error(StatusCode::TOO_MANY_REQUESTS, "", "list messages")
+                .starts_with("OUTLOOK_RATE_LIMITED:")
+        );
+        assert!(
+            format_graph_error(StatusCode::INTERNAL_SERVER_ERROR, "", "list messages")
+                .starts_with("OUTLOOK_TEMPORARY_ERROR:")
+        );
+    }
 }
