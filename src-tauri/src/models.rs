@@ -66,6 +66,43 @@ pub enum MailProvider {
     Outlook,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailFolder {
+    Inbox,
+    Spam,
+    Sent,
+    Trash,
+    Starred,
+}
+
+impl MailFolder {
+    pub const fn cache_scope(self) -> Option<&'static str> {
+        match self {
+            Self::Inbox => None,
+            Self::Spam => Some("folder:SPAM"),
+            Self::Sent => Some("folder:SENT"),
+            Self::Trash => Some("folder:TRASH"),
+            Self::Starred => Some("folder:STARRED"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAction {
+    Archive,
+    Trash,
+    Untrash,
+    Spam,
+    NotSpam,
+    DeleteForever,
+    MarkRead,
+    MarkUnread,
+    Star,
+    Unstar,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthStatus {

@@ -12,6 +12,7 @@ OpenMail is under active public development. The repository currently contains t
 - No OpenMail-hosted mailbox backend is required.
 - OAuth 2.0 + PKCE is used instead of collecting mailbox passwords.
 - The application should remain lightweight and quick on Windows.
+- Only one OpenMail desktop instance runs at a time; a second launch focuses the existing window.
 - User-facing application text is localized in English and Turkish.
 - Product documentation is maintained in English.
 
@@ -62,6 +63,7 @@ Translations live in `src/locales/en.json` and `src/locales/tr.json`. Supported 
 - [Design system](DESIGN.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Authentication](docs/AUTHENTICATION.md)
+- [Provider integration plans](docs/providers/README.md)
 - [Development guide](docs/DEVELOPMENT.md)
 - [Local data and privacy](docs/PRIVACY.md)
 - [Contributing](CONTRIBUTING.md)

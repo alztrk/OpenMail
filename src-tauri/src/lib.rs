@@ -4,7 +4,10 @@ mod config;
 mod gmail_auth;
 mod gmail_mail;
 mod message_cache;
+mod microsoft_auth;
+mod microsoft_mail;
 mod models;
+mod provider;
 mod secure_store;
 
 use tauri::{
@@ -18,6 +21,16 @@ use tauri_plugin_log::{Target, TargetKind};
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }))?;
+
             app.manage(commands::AppState::new(app.path().app_data_dir()?));
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
@@ -64,6 +77,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_accounts,
+            commands::get_provider_capabilities,
             commands::list_messages,
             commands::search_messages,
             commands::list_folder_messages,
@@ -71,6 +85,7 @@ pub fn run() {
             commands::get_cached_thread,
             commands::get_cached_folder_messages,
             commands::get_cached_search_messages,
+            commands::search_cached_messages,
             commands::cache_folder_messages,
             commands::cache_search_messages,
             commands::get_message,
@@ -83,7 +98,7 @@ pub fn run() {
             commands::sync_messages,
             commands::modify_message,
             commands::get_auth_status,
-            commands::start_gmail_auth,
+            commands::start_auth,
             commands::remove_account,
             commands::set_default_account,
             commands::set_launch_at_startup

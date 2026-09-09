@@ -32,3 +32,6 @@ url = "2.5"
 base64 = "0.22"
 futures = "0.3"
 winreg = "0.55"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"

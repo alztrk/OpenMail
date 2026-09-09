@@ -25,7 +25,7 @@ export type AppSettings = {
 
 export const defaultSettings: AppSettings = {
   launchAtStartup: false, minimizeToTray: true, closeToTray: false, confirmOnClose: true, confirmActions: true,
-  theme: 'dark', density: 'comfortable', fontScale: 1, readerFontScale: 1,
+  theme: 'dark', density: 'comfortable', fontScale: 1.05, readerFontScale: 1,
   dateFormat: 'system', clockFormat: '24', language: 'en', notificationsEnabled: true, notificationSound: true,
   notificationSoundName: 'default', quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '07:00',
 }

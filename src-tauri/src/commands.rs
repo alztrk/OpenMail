@@ -6,9 +6,12 @@ use std::{
 use tauri::State;
 
 use crate::{
-    account_store, gmail_auth, gmail_mail, message_cache,
-    models::{AuthState, MailAccount, MailMessage, MessagePage, SyncResult},
-    secure_store,
+    account_store, message_cache,
+    models::{
+        AuthState, MailAccount, MailFolder, MailMessage, MailProvider, MessageAction, MessagePage,
+        SyncResult,
+    },
+    provider, secure_store,
 };
 
 pub struct AppState {
@@ -32,6 +35,15 @@ pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<MailAccount>, Str
 }
 
 #[tauri::command]
+pub fn get_provider_capabilities(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<provider::ProviderCapabilities, String> {
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    Ok(adapter.capabilities())
+}
+
+#[tauri::command]
 pub fn get_cached_messages(
     account_id: String,
     state: State<'_, AppState>,
@@ -51,17 +63,10 @@ pub fn get_cached_thread(
 #[tauri::command]
 pub fn get_cached_folder_messages(
     account_id: String,
-    label: String,
+    folder: MailFolder,
     state: State<'_, AppState>,
 ) -> Result<Option<MessagePage>, String> {
-    if !matches!(label.as_str(), "SPAM" | "SENT" | "TRASH" | "STARRED") {
-        return Err("Unsupported Gmail folder".to_string());
-    }
-    message_cache::load_scope(
-        &state.app_data_dir,
-        &account_id,
-        Some(&format!("folder:{label}")),
-    )
+    message_cache::load_scope(&state.app_data_dir, &account_id, folder.cache_scope())
 }
 
 #[tauri::command]
@@ -81,22 +86,28 @@ pub fn get_cached_search_messages(
 }
 
 #[tauri::command]
+pub fn search_cached_messages(
+    account_id: String,
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<MessagePage, String> {
+    message_cache::search_cached_messages(&state.app_data_dir, &account_id, &query)
+}
+
+#[tauri::command]
 pub fn cache_folder_messages(
     account_id: String,
-    label: String,
+    folder: MailFolder,
     page: MessagePage,
     append: bool,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
-    if !matches!(label.as_str(), "SPAM" | "SENT" | "TRASH" | "STARRED") {
-        return Err("Unsupported Gmail folder".to_string());
-    }
     message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
         page,
         append,
-        Some(&format!("folder:{label}")),
+        folder.cache_scope(),
     )
 }
 
@@ -126,8 +137,11 @@ pub async fn list_messages(
     page_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
-    log::info!("Loading Gmail messages for account");
-    let page = gmail_mail::list_messages(&account_id, page_token.as_deref()).await?;
+    log::info!("Loading messages for account");
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let page = adapter
+        .list_messages(&account_id, page_token.as_deref())
+        .await?;
     message_cache::save_page(&state.app_data_dir, &account_id, page, page_token.is_some())
 }
 
@@ -136,20 +150,25 @@ pub async fn search_messages(
     account_id: String,
     query: String,
     page_token: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
-    gmail_mail::search_messages(&account_id, &query, page_token.as_deref()).await
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter
+        .search_messages(&account_id, &query, page_token.as_deref())
+        .await
 }
 
 #[tauri::command]
 pub async fn list_folder_messages(
     account_id: String,
-    label: String,
+    folder: MailFolder,
     page_token: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
-    if !matches!(label.as_str(), "SPAM" | "SENT" | "TRASH" | "STARRED") {
-        return Err("Unsupported Gmail folder".to_string());
-    }
-    gmail_mail::list_folder_messages_page(&account_id, &label, page_token.as_deref()).await
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter
+        .list_folder_messages(&account_id, folder, page_token.as_deref())
+        .await
 }
 
 #[tauri::command]
@@ -158,7 +177,8 @@ pub async fn get_message(
     message_id: String,
     state: State<'_, AppState>,
 ) -> Result<MailMessage, String> {
-    let message = gmail_mail::get_message(&account_id, &message_id).await?;
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let message = adapter.get_message(&account_id, &message_id).await?;
     message_cache::update_message(&state.app_data_dir, &account_id, message.clone())?;
     Ok(message)
 }
@@ -169,7 +189,8 @@ pub async fn get_thread(
     thread_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MailMessage>, String> {
-    let thread = gmail_mail::get_thread(&account_id, &thread_id).await?;
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let thread = adapter.get_thread(&account_id, &thread_id).await?;
     message_cache::update_messages(&state.app_data_dir, &account_id, thread.messages.clone())?;
     Ok(thread.messages)
 }
@@ -180,18 +201,21 @@ pub async fn download_attachment(
     message_id: String,
     attachment_id: String,
     filename: String,
+    state: State<'_, AppState>,
 ) -> Result<String, String> {
     let user_profile = std::env::var_os("USERPROFILE")
         .ok_or_else(|| "The Windows Downloads folder is unavailable".to_string())?;
     let download_dir = std::path::PathBuf::from(user_profile).join("Downloads");
-    gmail_mail::download_attachment(
-        &account_id,
-        &message_id,
-        &attachment_id,
-        &filename,
-        &download_dir,
-    )
-    .await
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter
+        .download_attachment(
+            &account_id,
+            &message_id,
+            &attachment_id,
+            &filename,
+            &download_dir,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -206,28 +230,35 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn send_reply(
     account_id: String,
+    message_id: Option<String>,
     sender: String,
     recipient: String,
     subject: String,
     body: String,
     thread_id: Option<String>,
     in_reply_to: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<String, String> {
-    gmail_mail::send_reply(
-        &account_id,
-        &sender,
-        &recipient,
-        &subject,
-        &body,
-        thread_id.as_deref(),
-        in_reply_to.as_deref(),
-    )
-    .await
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter
+        .send_reply(provider::ReplyRequest {
+            account_id: &account_id,
+            message_id: message_id.as_deref(),
+            sender: &sender,
+            recipient: &recipient,
+            subject: &subject,
+            body: &body,
+            thread_id: thread_id.as_deref(),
+            in_reply_to: in_reply_to.as_deref(),
+        })
+        .await
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     account_id: String,
     sender: String,
@@ -236,8 +267,20 @@ pub async fn send_message(
     bcc: String,
     subject: String,
     body: String,
+    state: State<'_, AppState>,
 ) -> Result<String, String> {
-    gmail_mail::send_message(&account_id, &sender, &recipient, &cc, &bcc, &subject, &body).await
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter
+        .send_message(provider::SendRequest {
+            account_id: &account_id,
+            sender: &sender,
+            recipient: &recipient,
+            cc: &cc,
+            bcc: &bcc,
+            subject: &subject,
+            body: &body,
+        })
+        .await
 }
 
 #[tauri::command]
@@ -246,7 +289,8 @@ pub async fn cache_sent_message(
     message_id: String,
     state: State<'_, AppState>,
 ) -> Result<MailMessage, String> {
-    let message = gmail_mail::get_message(&account_id, &message_id).await?;
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let message = adapter.get_message(&account_id, &message_id).await?;
     message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
@@ -267,11 +311,12 @@ pub async fn sync_messages(
     state: State<'_, AppState>,
 ) -> Result<SyncResult, String> {
     let started_at = Instant::now();
-    log::info!("Synchronizing Gmail messages");
+    log::info!("Synchronizing messages for account");
     let cached_page = message_cache::load(&state.app_data_dir, &account_id)?;
-    let result = gmail_mail::sync_messages(&account_id, cached_page).await?;
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let result = adapter.sync_messages(&account_id, cached_page).await?;
     log::info!(
-        "Gmail synchronization completed: messages={} new_messages={} duration_ms={}",
+        "Message synchronization completed: messages={} new_messages={} duration_ms={}",
         result.page.messages.len(),
         result.new_message_count,
         started_at.elapsed().as_millis()
@@ -287,11 +332,17 @@ pub async fn sync_messages(
 pub async fn modify_message(
     account_id: String,
     message_id: String,
-    action: String,
+    action: MessageAction,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    gmail_mail::modify_message(&account_id, &message_id, &action).await?;
-    message_cache::apply_message_action(&state.app_data_dir, &account_id, &message_id, &action)
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    if !provider::supports_message_action(adapter.capabilities(), action) {
+        return Err("The selected provider does not support this message action".to_string());
+    }
+    adapter
+        .modify_message(&account_id, &message_id, action)
+        .await?;
+    message_cache::apply_message_action(&state.app_data_dir, &account_id, &message_id, action)
 }
 
 #[tauri::command]
@@ -304,12 +355,13 @@ pub fn get_auth_status(state: State<'_, AppState>) -> Result<AuthState, String> 
 }
 
 #[tauri::command]
-pub fn start_gmail_auth(
+pub fn start_auth(
+    provider: MailProvider,
     login_hint: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    log::info!("Starting Gmail authorization flow");
-    gmail_auth::start(
+    log::info!("Starting authorization flow for selected provider");
+    provider::auth_adapter_for(provider)?.start(
         state.app_data_dir.clone(),
         Arc::clone(&state.auth_state),
         login_hint,
@@ -322,6 +374,10 @@ pub fn remove_account(
     state: State<'_, AppState>,
 ) -> Result<Vec<MailAccount>, String> {
     let mut accounts = account_store::load_accounts(&state.app_data_dir)?;
+    let removed_provider = accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.provider.clone());
     let removed_default = accounts
         .iter()
         .any(|account| account.id == account_id && account.is_default);
@@ -332,6 +388,9 @@ pub fn remove_account(
         }
     }
     secure_store::delete_refresh_token(&account_id)?;
+    if let Some(provider) = removed_provider {
+        provider::invalidate_session(provider, &account_id);
+    }
     message_cache::remove_account(&state.app_data_dir, &account_id)?;
     account_store::save_accounts(&state.app_data_dir, &accounts)?;
     Ok(accounts)

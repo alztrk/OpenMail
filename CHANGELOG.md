@@ -6,6 +6,9 @@ All notable changes to OpenMail are recorded here.
 
 ### Added
 
+- Single-instance Windows startup now focuses the existing OpenMail window instead of opening a second process.
+- Global search now opens a compact result surface with one clear hierarchy, provider-aware account identity, and no repeated query or scope chrome.
+- Global search now checks local mailbox cache while provider requests run concurrently, and Gmail search no longer waits for an unrelated history cursor request.
 - Product and design system documentation.
 - Tauri 2 Windows application shell.
 - Initial local-first bilingual interface in English and Turkish.
@@ -16,6 +19,17 @@ All notable changes to OpenMail are recorded here.
 - Sanitized HTML mail rendering with inline image hydration and plain-text whitespace preservation.
 - HTML mail frames now wait for populated documents before measuring and normalize the frame canvas without overriding email-owned layout styles.
 - HTML mail sanitization now preserves common email table layout attributes while explicitly forbidding active form and embedded content.
+- Reader support sections stay left-aligned while only the rendered message body uses the centered reading column.
+- Plain-text, empty-content, loading, and error reader states now keep the left reading alignment instead of moving when HTML content is unavailable.
+- Sticky reader metadata now uses a tighter vertical rhythm so more of the message body remains visible while reading.
+- Reader metadata now compacts after scrolling, keeping the selected message context visible without crowding the reading surface.
+- Reader delete action now stays visually quiet until it receives focus or hover, preserving the reader's calm action hierarchy.
+- Mailbox filters now use a restrained segmented control, while the active folder uses the same accent edge for a consistent selection language.
+- Mailbox filters now expose single-selection semantics and keyboard navigation for assistive technology users.
+- Mailbox navigation now remains fixed while the message list scrolls independently, keeping folders, filters, and paging controls reachable during triage.
+- Narrow layouts now keep account onboarding and loading reader states visible, while empty mailbox, search, and filter results keep navigation available.
+- Narrow layouts now retain a compact account rail so account switching and settings remain reachable.
+- Theme-aware scrollbars and native form control color schemes now keep light and dark surfaces visually consistent.
 - Mail context menus now support complete keyboard navigation with arrow, Home, End, and Escape keys.
 - Mail row accessibility names now announce unread state directly instead of relying on a decorative status dot.
 - Gmail synchronization logs now include completed message counts, new-message counts, and elapsed time.
@@ -44,6 +58,7 @@ All notable changes to OpenMail are recorded here.
 - Confirmed window close requests now have the required Tauri destroy permission and close the application after confirmation.
 - Gmail diagnostics record operation durations and item counts without logging message content or identifiers.
 - Settings controls are now semantically associated with their visible labels for keyboard and assistive technology users.
+- Narrow settings layouts now provide an explicit path back to the mailbox, and initial mailbox loading exposes an accurate status label.
 - Folder refreshes preserve already loaded message bodies, HTML, avatars, and attachments.
 - Mail bodies detect text direction automatically for mixed-language and right-to-left messages.
 - The custom window header now reflects the actual maximized state on startup.
@@ -53,6 +68,8 @@ All notable changes to OpenMail are recorded here.
 - Multiple MIME body attachments within one Gmail message are hydrated concurrently.
 - Inline image attachment hydration now runs concurrently within each message.
 - Account icons expose idle, syncing, and error states without adding another control to the sidebar.
+- Account navigation now scrolls independently when many accounts are connected, while identity popovers render outside the rail overflow boundary and stay inside the viewport edges.
+- Global search now lives in the window header and searches every connected account concurrently, showing provider-aware results in a keyboard-navigable modal panel.
 - Search cache isolation is covered by a Rust regression test.
 - A corrupted primary message cache now recovers from its valid backup.
 - Cached message bodies now remain visible while conversation details refresh in the background.
@@ -67,6 +84,9 @@ All notable changes to OpenMail are recorded here.
 - Remove the unsupported Windows notification action listener path that caused a startup IPC error.
 - System theme now follows Windows appearance changes while OpenMail is running.
 - Settings controls now expose accessible names, and quiet hours use the shared switch component.
+- Empty conversation errors now use localized recovery copy, and the settings navigation panel keeps horizontal overflow suppressed.
+- Account, folder, filter, and settings navigation semantics now expose their active context more clearly to assistive technology.
+- Reader font scaling now applies consistently to plain-text and sanitized HTML message bodies, including conversation history.
 - Product and design records now document Tabler Icons as the shared interface icon family.
 - Added a reduced-motion policy for users whose Windows accessibility settings request less animation.
 - Sender avatars in the mailbox now load lazily to reduce initial network work on large message lists.
@@ -75,7 +95,6 @@ All notable changes to OpenMail are recorded here.
 - Exposed the mailbox search shortcut through the field's accessibility metadata.
 - Quiet-hours time fields now use the shared input component for consistent focus and styling behavior.
 - Compose and reply fields now share a reusable textarea component.
-- Mail filters now expose toggle-group semantics and their active state to assistive technology.
 - Light theme now applies its palette to shared select, textarea, and switch controls.
 - Light-theme compose textarea styling now has explicit cascade priority over its shared base rule.
 - Compose subject inputs now use the shared dark and light theme form styling instead of browser defaults.
@@ -84,6 +103,8 @@ All notable changes to OpenMail are recorded here.
 - Fixed light-theme contrast for the Settings page heading.
 - Settings and provider tabs now support roving focus and arrow-key navigation.
 - Settings and provider tabs now expose explicit tab-to-panel relationships.
+- Mail context menus now focus the first available action and return focus to the originating mail row when dismissed.
+- Leaving the reader with Back or Escape now returns keyboard focus to the previously selected mail row.
 
 ### Planned
 

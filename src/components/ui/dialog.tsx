@@ -1,22 +1,27 @@
-import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode } from 'react'
+import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode, type RefObject } from 'react'
 import { IconX } from '@tabler/icons-react'
 
-type DialogProps = { open: boolean; title: string; closeLabel: string; children: ReactNode; onClose: () => void }
+type DialogProps = { open: boolean; title: string; closeLabel: string; children: ReactNode; onClose: () => void; returnFocusRef?: RefObject<HTMLElement | null>; initialFocusRef?: RefObject<HTMLElement | null> }
 
-export function Dialog({ open, title, closeLabel, children, onClose }: DialogProps) {
+export function Dialog({ open, title, closeLabel, children, onClose, returnFocusRef, initialFocusRef }: DialogProps) {
   const dialogRef = useRef<HTMLElement>(null)
   const titleId = useId()
 
   useEffect(() => {
     if (!open) return undefined
-    const previousActiveElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const previousActiveElement = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null
+    const returnFocusElement = returnFocusRef?.current ?? previousActiveElement
     const dialog = dialogRef.current
     const focusableElements = dialog?.querySelectorAll<HTMLElement>(
       'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
     )
-    focusableElements?.[0]?.focus()
-    return () => previousActiveElement?.focus()
-  }, [open])
+    const initialFocusElement = initialFocusRef?.current
+    const focusTarget = initialFocusElement?.isConnected ? initialFocusElement : focusableElements?.[0]
+    focusTarget?.focus()
+    return () => {
+      if (returnFocusElement?.isConnected) returnFocusElement.focus()
+    }
+  }, [initialFocusRef, open, returnFocusRef])
 
   if (!open) return null
   const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {

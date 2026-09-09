@@ -7,28 +7,35 @@ use std::{
 };
 
 use oauth2::{
-    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    EndpointNotSet, EndpointSet, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet,
+    EndpointSet, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use tauri::async_runtime;
 
 use crate::{
-    account_store,
-    config::GmailConfig,
-    gmail_mail,
+    account_store, microsoft_mail,
     models::{AuthState, AuthStatus, MailAccount, MailProvider},
     secure_store,
 };
 
-type GmailClient =
+const GRAPH_AUTHORIZE_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
+const GRAPH_TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+const GRAPH_PROFILE_URL: &str =
+    "https://graph.microsoft.com/v1.0/me?$select=id,mail,userPrincipalName,displayName";
+
+type MicrosoftClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 #[derive(Debug, Deserialize)]
 struct UserProfile {
-    #[serde(rename = "emailAddress")]
-    email_address: String,
+    id: String,
+    mail: Option<String>,
+    #[serde(rename = "userPrincipalName")]
+    user_principal_name: Option<String>,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
 }
 
 pub fn start(
@@ -36,10 +43,8 @@ pub fn start(
     auth_state: Arc<Mutex<AuthState>>,
     login_hint: Option<String>,
 ) -> Result<String, String> {
-    let config = GmailConfig::embedded();
-    log::debug!("Gmail OAuth configuration loaded");
-    let listener =
-        TcpListener::bind((config.redirect_host.as_str(), 0)).map_err(|error| error.to_string())?;
+    let client_id = public_client_id()?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
     listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
@@ -47,20 +52,18 @@ pub fn start(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let redirect_uri = format!("http://{}:{}/oauth2/callback", config.redirect_host, port);
-    log::info!("Gmail OAuth callback listener opened on {redirect_uri}");
-    let client = build_client(&config, &redirect_uri)?;
+    let redirect_uri = format!("http://localhost:{port}/oauth2/callback");
+    let client = build_client(&client_id, &redirect_uri)?;
     let (pkce_challenge, pkce_verifier) = oauth2::PkceCodeChallenge::new_random_sha256();
     let mut authorization_request = client
         .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new(
-            "https://www.googleapis.com/auth/gmail.modify".to_string(),
-        ))
-        .add_scope(Scope::new(
-            "https://www.googleapis.com/auth/gmail.send".to_string(),
-        ))
-        .add_extra_param("access_type", "offline")
-        .add_extra_param("prompt", "consent");
+        .add_scope(Scope::new("openid".to_string()))
+        .add_scope(Scope::new("profile".to_string()))
+        .add_scope(Scope::new("email".to_string()))
+        .add_scope(Scope::new("User.Read".to_string()))
+        .add_scope(Scope::new("Mail.ReadWrite".to_string()))
+        .add_scope(Scope::new("Mail.Send".to_string()))
+        .add_scope(Scope::new("offline_access".to_string()));
     if let Some(login_hint) = login_hint.filter(|value| !value.trim().is_empty()) {
         authorization_request = authorization_request.add_extra_param("login_hint", login_hint);
     }
@@ -77,7 +80,7 @@ pub fn start(
     }
 
     webbrowser::open(authorization_url.as_str()).map_err(|error| {
-        log::error!("Unable to open the system browser for Gmail authorization: {error}");
+        log::error!("Unable to open the system browser for Outlook authorization: {error}");
         error.to_string()
     })?;
 
@@ -101,23 +104,26 @@ pub fn start(
     Ok(authorization_url.to_string())
 }
 
-fn build_client(config: &GmailConfig, redirect_uri: &str) -> Result<GmailClient, String> {
-    let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
-        .map_err(|error| error.to_string())?;
-    let token_url = TokenUrl::new("https://oauth2.googleapis.com/token".to_string())
-        .map_err(|error| error.to_string())?;
+fn public_client_id() -> Result<String, String> {
+    option_env!("OPENMAIL_MICROSOFT_CLIENT_ID")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "Microsoft Graph is not configured. Build OpenMail with the public client ID in OPENMAIL_MICROSOFT_CLIENT_ID.".to_string()
+        })
+}
+
+fn build_client(client_id: &str, redirect_uri: &str) -> Result<MicrosoftClient, String> {
+    let auth_url =
+        AuthUrl::new(GRAPH_AUTHORIZE_URL.to_string()).map_err(|error| error.to_string())?;
+    let token_url =
+        TokenUrl::new(GRAPH_TOKEN_URL.to_string()).map_err(|error| error.to_string())?;
     let redirect_url =
         RedirectUrl::new(redirect_uri.to_string()).map_err(|error| error.to_string())?;
-    let mut client = BasicClient::new(ClientId::new(config.client_id.clone()))
+    Ok(BasicClient::new(ClientId::new(client_id.to_string()))
         .set_auth_uri(auth_url)
         .set_token_uri(token_url)
-        .set_redirect_uri(redirect_url);
-
-    if let Some(client_secret) = config.client_secret.as_deref() {
-        client = client.set_client_secret(ClientSecret::new(client_secret.to_string()));
-    }
-
-    Ok(client)
+        .set_redirect_uri(redirect_url))
 }
 
 fn receive_callback(
@@ -127,7 +133,7 @@ fn receive_callback(
     let started_at = std::time::Instant::now();
     loop {
         if started_at.elapsed() >= Duration::from_secs(300) {
-            return Err("OAuth callback timed out".to_string());
+            return Err("Microsoft OAuth callback timed out".to_string());
         }
 
         let (mut stream, _) = match listener.accept() {
@@ -147,15 +153,13 @@ fn receive_callback(
             .read_line(&mut request_line)
             .map_err(|error| error.to_string())?;
         let Some(path) = request_line.split_whitespace().nth(1) else {
-            log::debug!(
-                "Ignored an empty or invalid OAuth callback connection ({bytes_read} bytes)"
-            );
+            log::debug!("Ignored an empty or invalid Outlook OAuth callback ({bytes_read} bytes)");
             continue;
         };
         let url = match url::Url::parse(&format!("http://localhost{path}")) {
             Ok(value) => value,
             Err(error) => {
-                log::debug!("Ignored an invalid OAuth callback URL: {error}");
+                log::debug!("Ignored an invalid Outlook OAuth callback URL: {error}");
                 continue;
             }
         };
@@ -168,15 +172,15 @@ fn receive_callback(
                 &mut stream,
                 "OpenMail authorization was cancelled. You can close this tab.",
             );
-            log::warn!("Google authorization was declined or failed: {error}");
-            return Err(format!("Google authorization failed: {error}"));
+            log::warn!("Microsoft authorization was declined or failed: {error}");
+            return Err(format!("Microsoft authorization failed: {error}"));
         }
         let Some(code) = url
             .query_pairs()
             .find(|(key, _)| key == "code")
             .map(|(_, value)| value.into_owned())
         else {
-            log::debug!("Ignored an OAuth callback without an authorization code");
+            log::debug!("Ignored an Outlook OAuth callback without an authorization code");
             continue;
         };
         let Some(state) = url
@@ -184,7 +188,7 @@ fn receive_callback(
             .find(|(key, _)| key == "state")
             .map(|(_, value)| value.into_owned())
         else {
-            log::debug!("Ignored an OAuth callback without state");
+            log::debug!("Ignored an Outlook OAuth callback without state");
             continue;
         };
         if state != expected_state {
@@ -192,10 +196,9 @@ fn receive_callback(
                 &mut stream,
                 "OpenMail rejected this authorization response. You can close this tab.",
             );
-            log::warn!("Rejected Gmail OAuth callback because state validation failed");
-            return Err("OAuth state validation failed".to_string());
+            log::warn!("Rejected Microsoft OAuth callback because state validation failed");
+            return Err("Microsoft OAuth state validation failed".to_string());
         }
-        log::info!("Received a valid Gmail OAuth callback");
         write_callback_response(
             &mut stream,
             "OpenMail authorization completed. You can close this tab.",
@@ -207,16 +210,17 @@ fn receive_callback(
 fn write_callback_response(stream: &mut std::net::TcpStream, message: &str) {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-        message.len(), message
+        message.len(),
+        message
     );
     if let Err(error) = std::io::Write::write_all(stream, response.as_bytes()) {
-        log::warn!("Unable to write the OAuth callback response: {error}");
+        log::warn!("Unable to write the Outlook OAuth callback response: {error}");
     }
 }
 
 async fn finish(
     data: (
-        GmailClient,
+        MicrosoftClient,
         AuthorizationCode,
         oauth2::PkceCodeVerifier,
         std::path::PathBuf,
@@ -224,18 +228,15 @@ async fn finish(
     auth_state: Arc<Mutex<AuthState>>,
 ) -> Result<(), String> {
     let (client, code, verifier, app_data_dir) = data;
-    let http_client = Client::new();
     let token = client
         .exchange_code(code)
         .set_pkce_verifier(verifier)
-        .request_async(&http_client)
+        .request_async(&Client::new())
         .await
         .map_err(|error| error.to_string())?;
-    log::info!("Gmail authorization code exchanged successfully");
-    let access_token = token.access_token().secret();
     let profile = Client::new()
-        .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
-        .bearer_auth(access_token)
+        .get(GRAPH_PROFILE_URL)
+        .bearer_auth(token.access_token().secret())
         .send()
         .await
         .map_err(|error| error.to_string())?
@@ -244,26 +245,33 @@ async fn finish(
         .json::<UserProfile>()
         .await
         .map_err(|error| error.to_string())?;
-    log::info!("Gmail profile loaded successfully");
-    let account_id = format!("gmail:{}", profile.email_address);
+    let address = profile
+        .mail
+        .or(profile.user_principal_name)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Microsoft Graph did not return a mailbox address".to_string())?;
     let refresh_token = token.refresh_token().ok_or_else(|| {
-        log::error!("Gmail authorization completed without a refresh token");
-        "Google did not return a refresh token. Reauthorize OpenMail and try again.".to_string()
+        "Microsoft did not return a refresh token. Reauthorize OpenMail and try again.".to_string()
     })?;
+    let account_id = format!("outlook:{}", profile.id);
     secure_store::save_refresh_token(&account_id, refresh_token.secret())?;
-    gmail_mail::invalidate_access_token(&account_id);
+    microsoft_mail::invalidate_access_token(&account_id);
+
     let mut accounts = account_store::load_accounts(&app_data_dir)?;
-    let is_default = accounts.is_empty();
+    let is_default = accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.is_default)
+        .unwrap_or(accounts.is_empty());
     accounts.retain(|account| account.id != account_id);
     accounts.push(MailAccount {
         id: account_id.clone(),
-        provider: MailProvider::Gmail,
-        address: profile.email_address,
-        display_name: None,
+        provider: MailProvider::Outlook,
+        address,
+        display_name: profile.display_name,
         is_default,
     });
     account_store::save_accounts(&app_data_dir, &accounts)?;
-    log::info!("Gmail account metadata saved locally");
     if let Ok(mut state) = auth_state.lock() {
         *state = AuthState {
             status: AuthStatus::Connected,
@@ -275,12 +283,23 @@ async fn finish(
 }
 
 fn set_failed(state: &Arc<Mutex<AuthState>>, error: String) {
-    log::error!("Gmail authorization failed: {error}");
+    log::error!("Microsoft authorization failed: {error}");
     if let Ok(mut value) = state.lock() {
         *value = AuthState {
             status: AuthStatus::Failed,
             account_id: None,
             error: Some(error),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_public_client_without_client_secret() {
+        let client = build_client("public-client-id", "http://localhost:12345/oauth2/callback");
+        assert!(client.is_ok());
     }
 }

@@ -4,7 +4,7 @@
 
   <text x="0" y="67" fill="#1E241E" font-family="Bahnschrift, 'Segoe UI Variable', 'Segoe UI', sans-serif" font-size="58" font-weight="600" letter-spacing="-1.8">Open</text>
 
-  <g transform="translate(126 15) scale(2.75)" fill="none" stroke="#68751A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <g transform="translate(126 15) scale(2.75)" fill="none" stroke="#4F8B5A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
     <path d="m3 7 9 6 9-6" />
   </g>

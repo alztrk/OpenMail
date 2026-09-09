@@ -2,9 +2,10 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{MailMessage, MessagePage};
+use crate::models::{MailFolder, MailMessage, MessageAction, MessagePage};
 
 const MAX_SEARCH_CACHE_ENTRIES: usize = 20;
+const MAX_LOCAL_SEARCH_RESULTS: usize = 100;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CacheFile {
@@ -59,6 +60,58 @@ pub fn load_scope(
         .into_iter()
         .find(|entry| entry.account_id == cache_key)
         .map(|entry| entry.page))
+}
+
+pub fn search_cached_messages(
+    data_dir: &Path,
+    account_id: &str,
+    query: &str,
+) -> Result<MessagePage, String> {
+    let query = query.trim().to_lowercase();
+    if query.len() < 2 {
+        return Err("Search query is too short".to_string());
+    }
+
+    let cache = read(data_dir)?;
+    let account_prefix = format!("{account_id}::");
+    let mut messages = Vec::new();
+    for entry in cache.accounts {
+        if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix) {
+            continue;
+        }
+        for message in entry.page.messages {
+            if !message_contains_query(&message, &query) {
+                continue;
+            }
+            if messages
+                .iter()
+                .any(|cached: &MailMessage| cached.id == message.id)
+            {
+                continue;
+            }
+            messages.push(message);
+        }
+    }
+
+    messages.sort_by(|left, right| right.time.cmp(&left.time));
+    messages.truncate(MAX_LOCAL_SEARCH_RESULTS);
+    Ok(MessagePage {
+        messages,
+        next_page_token: None,
+        history_id: None,
+    })
+}
+
+fn message_contains_query(message: &MailMessage, query: &str) -> bool {
+    [
+        &message.sender,
+        &message.address,
+        &message.subject,
+        &message.preview,
+        &message.body,
+    ]
+    .into_iter()
+    .any(|value| value.to_lowercase().contains(query))
 }
 
 pub fn save_page(
@@ -290,29 +343,14 @@ pub fn apply_message_action(
     data_dir: &Path,
     account_id: &str,
     message_id: &str,
-    action: &str,
+    action: MessageAction,
 ) -> Result<(), String> {
-    if !matches!(
-        action,
-        "archive"
-            | "trash"
-            | "untrash"
-            | "spam"
-            | "not_spam"
-            | "delete_forever"
-            | "mark_read"
-            | "mark_unread"
-            | "star"
-            | "unstar"
-    ) {
-        return Err("Unsupported message action".to_string());
-    }
     let mut cache = read(data_dir)?;
     let account_prefix = format!("{account_id}::");
     let destination_key = match action {
-        "trash" => Some(cache_key(account_id, Some("folder:TRASH"))),
-        "spam" => Some(cache_key(account_id, Some("folder:SPAM"))),
-        "untrash" | "not_spam" => Some(account_id.to_string()),
+        MessageAction::Trash => Some(cache_key(account_id, MailFolder::Trash.cache_scope())),
+        MessageAction::Spam => Some(cache_key(account_id, MailFolder::Spam.cache_scope())),
+        MessageAction::Untrash | MessageAction::NotSpam => Some(account_id.to_string()),
         _ => None,
     };
     let message_to_move = if destination_key.is_some() {
@@ -346,14 +384,14 @@ pub fn apply_message_action(
             }
             continue;
         }
-        if action == "delete_forever" {
+        if action == MessageAction::DeleteForever {
             entry
                 .page
                 .messages
                 .retain(|message| message.id != message_id);
             continue;
         }
-        if action == "archive" {
+        if action == MessageAction::Archive {
             if entry.account_id == account_id {
                 entry
                     .page
@@ -369,11 +407,11 @@ pub fn apply_message_action(
             .find(|message| message.id == message_id)
         {
             match action {
-                "mark_read" => message.unread = false,
-                "mark_unread" => message.unread = true,
-                "star" => message.starred = true,
-                "unstar" => message.starred = false,
-                _ => unreachable!("message action was validated before cache update"),
+                MessageAction::MarkRead => message.unread = false,
+                MessageAction::MarkUnread => message.unread = true,
+                MessageAction::Star => message.starred = true,
+                MessageAction::Unstar => message.starred = false,
+                _ => {}
             }
         }
     }
@@ -531,7 +569,7 @@ mod tests {
                 .as_deref(),
             Some("<p>full body</p>")
         );
-        apply_message_action(&data_dir, account_id, "message-1", "archive")
+        apply_message_action(&data_dir, account_id, "message-1", MessageAction::Archive)
             .expect("archive should update cache scopes");
         assert!(load(&data_dir, account_id)
             .expect("Inbox cache should load")
@@ -546,7 +584,7 @@ mod tests {
                 .len(),
             1
         );
-        apply_message_action(&data_dir, account_id, "message-1", "trash")
+        apply_message_action(&data_dir, account_id, "message-1", MessageAction::Trash)
             .expect("trash should move the message in cache");
         assert!(load_scope(&data_dir, account_id, Some("folder:STARRED"))
             .expect("Starred cache should load")
@@ -561,7 +599,7 @@ mod tests {
                 .len(),
             1
         );
-        apply_message_action(&data_dir, account_id, "message-1", "untrash")
+        apply_message_action(&data_dir, account_id, "message-1", MessageAction::Untrash)
             .expect("untrash should restore the message to Inbox");
         assert_eq!(
             load(&data_dir, account_id)
@@ -571,7 +609,7 @@ mod tests {
                 .len(),
             1
         );
-        apply_message_action(&data_dir, account_id, "message-1", "spam")
+        apply_message_action(&data_dir, account_id, "message-1", MessageAction::Spam)
             .expect("spam should move the message to Spam");
         assert!(load(&data_dir, account_id)
             .expect("Inbox cache should load")
@@ -586,7 +624,7 @@ mod tests {
                 .len(),
             1
         );
-        apply_message_action(&data_dir, account_id, "message-1", "not_spam")
+        apply_message_action(&data_dir, account_id, "message-1", MessageAction::NotSpam)
             .expect("not spam should restore the message to Inbox");
         assert_eq!(
             load(&data_dir, account_id)
@@ -601,8 +639,13 @@ mod tests {
             .expect("Spam cache should exist")
             .messages
             .is_empty());
-        apply_message_action(&data_dir, account_id, "message-1", "delete_forever")
-            .expect("permanent delete should remove the message from every scope");
+        apply_message_action(
+            &data_dir,
+            account_id,
+            "message-1",
+            MessageAction::DeleteForever,
+        )
+        .expect("permanent delete should remove the message from every scope");
         assert!(load(&data_dir, account_id)
             .expect("Inbox cache should load")
             .expect("Inbox cache should exist")
@@ -738,6 +781,54 @@ mod tests {
             Some("next-search-page")
         );
         fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn searches_loaded_messages_without_network() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-local-search-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        let mut matching = message("cached body");
+        matching.id = "matching-message".to_string();
+        matching.subject = "DevFest announcement".to_string();
+        let mut duplicate = matching.clone();
+        duplicate.body = "cached copy from another scope".to_string();
+        let mut unrelated = message("unrelated body");
+        unrelated.id = "unrelated-message".to_string();
+
+        save_page(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![matching.clone(), unrelated],
+                next_page_token: None,
+                history_id: None,
+            },
+            false,
+        )
+        .expect("Inbox cache should save");
+        save_page_with_scope(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![duplicate],
+                next_page_token: None,
+                history_id: None,
+            },
+            false,
+            Some("folder:SPAM"),
+        )
+        .expect("folder cache should save");
+
+        let cached_page = search_cached_messages(&data_dir, account_id, "DEVFEST")
+            .expect("local search should complete");
+        assert_eq!(cached_page.messages.len(), 1);
+        assert_eq!(cached_page.messages[0].id, matching.id);
+        assert!(cached_page.next_page_token.is_none());
+        fs::remove_dir_all(data_dir).expect("local search cache should be removable");
     }
 
     #[test]

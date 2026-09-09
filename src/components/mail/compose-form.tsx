@@ -50,24 +50,23 @@ export function ComposeForm({
 
   return (
     <form className="compose-form" onSubmit={(event) => { event.preventDefault(); void onSubmit() }}>
-      <div className="compose-form-heading">
-        <span>{t('newMessage')}</span>
-        {draftStatus !== 'idle' ? <span className="compose-draft-status" role="status">{t(draftStatus === 'saving' ? 'draftSaving' : 'draftSaved')}</span> : null}
-      </div>
-      <div className="compose-field">
-        <div className="compose-field-label-row"><label htmlFor="compose-recipient">{t('to')}</label><div className="compose-recipient-options"><button type="button" onClick={() => setIsCcOpen((current) => !current)} aria-expanded={isCcOpen}>{t('cc')}</button><button type="button" onClick={() => setIsBccOpen((current) => !current)} aria-expanded={isBccOpen}>{t('bcc')}</button></div></div>
-        <RecipientChips id="compose-recipient" value={recipient} onChange={onRecipientChange} placeholder={t('recipientPlaceholder')} removeLabel={t('removeRecipient')} invalid={hasInvalidRecipient} />
-        {hasInvalidRecipient ? <span id="compose-recipient-error" className="compose-field-error" role="alert">{t('invalidRecipient')}</span> : null}
-      </div>
-      {isCcOpen ? <div className="compose-field"><label htmlFor="compose-cc">{t('cc')}</label><RecipientChips id="compose-cc" value={cc} onChange={onCcChange} placeholder={t('recipientPlaceholder')} removeLabel={t('removeRecipient')} invalid={hasInvalidCc} />{hasInvalidCc ? <span className="compose-field-error" role="alert">{t('invalidRecipient')}</span> : null}</div> : null}
-      {isBccOpen ? <div className="compose-field"><label htmlFor="compose-bcc">{t('bcc')}</label><RecipientChips id="compose-bcc" value={bcc} onChange={onBccChange} placeholder={t('recipientPlaceholder')} removeLabel={t('removeRecipient')} invalid={hasInvalidBcc} />{hasInvalidBcc ? <span className="compose-field-error" role="alert">{t('invalidRecipient')}</span> : null}</div> : null}
-      <div className="compose-field">
-        <label htmlFor="compose-subject">{t('subject')}</label>
-        <Input id="compose-subject" value={subject} onChange={(event) => onSubjectChange(event.target.value)} placeholder={t('subjectPlaceholder')} required aria-required="true" />
-      </div>
-      <div className="compose-field compose-field-message">
-        <label htmlFor="compose-body">{t('message')}</label>
-        <Textarea id="compose-body" value={body} onChange={(event) => onBodyChange(event.target.value)} placeholder={t('messagePlaceholder')} rows={9} required aria-required="true" />
+      {draftStatus !== 'idle' ? <div className="compose-form-status" role="status">{t(draftStatus === 'saving' ? 'draftSaving' : 'draftSaved')}</div> : null}
+      <div className="compose-form-fields">
+        <div className="compose-field">
+          <div className="compose-field-label-row"><label htmlFor="compose-recipient">{t('to')}</label><div className="compose-recipient-options"><button type="button" onClick={() => setIsCcOpen((current) => !current)} aria-expanded={isCcOpen}>{t('cc')}</button><button type="button" onClick={() => setIsBccOpen((current) => !current)} aria-expanded={isBccOpen}>{t('bcc')}</button></div></div>
+          <RecipientChips id="compose-recipient" value={recipient} onChange={onRecipientChange} placeholder={t('recipientPlaceholder')} removeLabel={t('removeRecipient')} invalid={hasInvalidRecipient} />
+          {hasInvalidRecipient ? <span id="compose-recipient-error" className="compose-field-error" role="alert">{t('invalidRecipient')}</span> : null}
+        </div>
+        {isCcOpen ? <div className="compose-field"><label htmlFor="compose-cc">{t('cc')}</label><RecipientChips id="compose-cc" value={cc} onChange={onCcChange} placeholder={t('recipientPlaceholder')} removeLabel={t('removeRecipient')} invalid={hasInvalidCc} />{hasInvalidCc ? <span className="compose-field-error" role="alert">{t('invalidRecipient')}</span> : null}</div> : null}
+        {isBccOpen ? <div className="compose-field"><label htmlFor="compose-bcc">{t('bcc')}</label><RecipientChips id="compose-bcc" value={bcc} onChange={onBccChange} placeholder={t('recipientPlaceholder')} removeLabel={t('removeRecipient')} invalid={hasInvalidBcc} />{hasInvalidBcc ? <span className="compose-field-error" role="alert">{t('invalidRecipient')}</span> : null}</div> : null}
+        <div className="compose-field">
+          <label htmlFor="compose-subject">{t('subject')}</label>
+          <Input id="compose-subject" value={subject} onChange={(event) => onSubjectChange(event.target.value)} placeholder={t('subjectPlaceholder')} required aria-required="true" />
+        </div>
+        <div className="compose-field compose-field-message">
+          <label htmlFor="compose-body">{t('message')}</label>
+          <Textarea id="compose-body" value={body} onChange={(event) => onBodyChange(event.target.value)} placeholder={t('messagePlaceholder')} rows={9} required aria-required="true" />
+        </div>
       </div>
       <div className="compose-actions">
         <Button variant="ghost" type="button" onClick={onCancel} disabled={isSending}>{t('cancel')}</Button>

@@ -18,7 +18,7 @@ never written to the repository or logs.
 
 ## Flow
 
-The account dialog starts the `start_gmail_auth` Tauri command. OpenMail then binds an available loopback port, generates a one-time CSRF state and PKCE verifier, opens the authorization URL in the default browser, validates the callback, exchanges the code over HTTPS, reads the Gmail profile address, and stores the refresh token in Windows Credential Manager. Reconnecting an existing account passes its address as a non-secret OAuth login hint.
+The account dialog starts the provider-neutral `start_auth` Tauri command with `gmail`. OpenMail then resolves the Gmail authorization adapter, binds an available loopback port, generates a one-time CSRF state and PKCE verifier, opens the authorization URL in the default browser, validates the callback, exchanges the code over HTTPS, reads the Gmail profile address, and stores the refresh token in Windows Credential Manager. Reconnecting an existing account passes its address as a non-secret OAuth login hint.
 
 PKCE is used because it is recommended for installed desktop applications. Google continues to support loopback redirects for desktop applications. See the [OAuth best practices](https://developers.google.com/identity/protocols/oauth2/resources/best-practices), [loopback migration guidance](https://developers.google.com/identity/protocols/oauth2/resources/loopback-migration), and [server-side OAuth documentation](https://developers.google.com/workspace/gmail/api/auth/web-server).
 
@@ -32,7 +32,7 @@ If an account was connected before the send scope was added, reconnect it from t
 
 - Refresh tokens: Windows Credential Manager, service name `OpenMail`.
 - Account metadata: Tauri application data directory, file `accounts.json`.
-- Access tokens: memory only during the active authorization operation.
+- Access tokens: process memory only during the active application session, with an expiry-aware cache; they are not persisted to disk or Credential Manager.
 - Mail content and folder caches: Tauri application data directory, scoped per account.
 
 The Gmail OAuth client ID and client secret are configured in
@@ -46,10 +46,12 @@ Revoked, expired, or missing credentials become an account reauthorization state
 
 ## Microsoft Graph provider
 
-Outlook support is planned but is not included in the current release. The provider will use the Microsoft identity platform authorization code flow with PKCE and the system browser. A public Microsoft Entra application client ID is required for a distributed desktop build; no client secret should be embedded in OpenMail.
+Outlook, Hotmail, Live, and Microsoft 365 accounts use the Microsoft identity platform authorization code flow with PKCE and the system browser. A public Microsoft Entra application client ID is required for a distributed desktop build; no client secret is used or embedded in OpenMail.
 
-The planned delegated permissions are `User.Read`, `Mail.ReadWrite`, `Mail.Send`, and `offline_access`. The Graph adapter will use the signed-in user's `/me` profile and mail folder/message endpoints. See the [Microsoft Graph delegated access flow](https://learn.microsoft.com/en-us/graph/auth-v2-user), [authorization code flow with PKCE](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow), and [list messages](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0).
+Set `OPENMAIL_MICROSOFT_CLIENT_ID` in the build environment before compiling the desktop application. The value is a public application identifier, not a credential. Register `http://localhost` as a mobile and desktop redirect URI in the Entra app registration. The running adapter binds an available loopback port and uses the corresponding callback path.
+
+The delegated permissions are `User.Read`, `Mail.ReadWrite`, `Mail.Send`, and `offline_access`, together with the OpenID Connect scopes used during sign-in. The Graph adapter uses the signed-in user's `/me` profile and mail folder/message endpoints, stores refresh tokens in Windows Credential Manager, and keeps access tokens in the process cache with expiry-aware refresh. It uses draft-then-send for compose and reply so the sent message can be hydrated into the local cache. See the [Microsoft Graph delegated access flow](https://learn.microsoft.com/en-us/graph/auth-v2-user), [authorization code flow with PKCE](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow), [create a reply](https://learn.microsoft.com/en-us/graph/api/message-createreply?view=graph-rest-1.0), and [list messages](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0).
 
 ## Current verification boundary
 
-The Gmail OAuth flow and mailbox synchronization are compile-checked and require a real Google Cloud desktop client and an interactive Google account to verify end to end. No credentials are included in this repository. Microsoft Graph remains outside the current verification boundary until a public Microsoft Entra application client ID is configured.
+The Gmail OAuth flow and mailbox synchronization are compile-checked and require a real Google Cloud desktop client and an interactive Google account to verify end to end. The Microsoft Graph adapter is compile-checked and requires a public Microsoft Entra client ID plus an interactive Microsoft account for end-to-end verification. No refresh tokens or mailbox credentials are included in this repository.

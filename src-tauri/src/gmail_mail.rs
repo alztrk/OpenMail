@@ -1,4 +1,8 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
@@ -11,7 +15,7 @@ use serde_json::json;
 
 use crate::{
     config::GmailConfig,
-    models::{MailAttachment, MailMessage, MailThread, MessagePage},
+    models::{MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage},
     secure_store,
 };
 
@@ -19,6 +23,51 @@ const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[derive(Debug)]
+struct CachedAccessToken {
+    value: String,
+    expires_at: Instant,
+}
+
+static ACCESS_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedAccessToken>>> = OnceLock::new();
+
+fn access_token_cache() -> &'static Mutex<HashMap<String, CachedAccessToken>> {
+    ACCESS_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn load_cached_access_token(account_id: &str) -> Option<String> {
+    let now = Instant::now();
+    let mut cache = access_token_cache().lock().ok()?;
+    if let Some(entry) = cache.get(account_id) {
+        if entry.expires_at > now {
+            return Some(entry.value.clone());
+        }
+    }
+    cache.remove(account_id);
+    None
+}
+
+fn cache_access_token(account_id: &str, access_token: String, expires_in: u64) {
+    let refresh_before_expiry = if expires_in > 60 {
+        expires_in - 60
+    } else {
+        expires_in.saturating_sub(5).max(1)
+    };
+    let entry = CachedAccessToken {
+        value: access_token,
+        expires_at: Instant::now() + Duration::from_secs(refresh_before_expiry),
+    };
+    if let Ok(mut cache) = access_token_cache().lock() {
+        cache.insert(account_id.to_string(), entry);
+    }
+}
+
+pub fn invalidate_access_token(account_id: &str) {
+    if let Ok(mut cache) = access_token_cache().lock() {
+        cache.remove(account_id);
+    }
+}
 
 fn build_http_client() -> Result<Client, String> {
     Client::builder()
@@ -28,9 +77,17 @@ fn build_http_client() -> Result<Client, String> {
         .map_err(|error| format!("Unable to initialize Gmail network client: {error}"))
 }
 
+static HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+
+fn shared_http_client() -> Result<Client, String> {
+    HTTP_CLIENT.get_or_init(build_http_client).clone()
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    expires_in: Option<u64>,
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,9 +243,16 @@ pub async fn search_messages(
 
 pub async fn list_folder_messages_page(
     account_id: &str,
-    label: &str,
+    folder: MailFolder,
     page_token: Option<&str>,
 ) -> Result<MessagePage, String> {
+    let label = match folder {
+        MailFolder::Inbox => "INBOX",
+        MailFolder::Spam => "SPAM",
+        MailFolder::Sent => "SENT",
+        MailFolder::Trash => "TRASH",
+        MailFolder::Starred => "STARRED",
+    };
     list_messages_with_query(account_id, page_token, None, Some(label)).await
 }
 
@@ -202,8 +266,8 @@ async fn list_messages_with_query(
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let config = GmailConfig::embedded();
-    let access_token = refresh_access_token(&config, &refresh_token).await?;
-    let client = build_http_client()?;
+    let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
+    let client = shared_http_client()?;
     let mut request = client
         .get(format!("{GMAIL_API_URL}/messages"))
         .bearer_auth(&access_token)
@@ -253,14 +317,18 @@ async fn list_messages_with_query(
                     .map_err(|error| error.to_string())
             }
         });
-    let (responses, history_id_result) =
-        join(join_all(requests), fetch_history_id(&client, &access_token)).await;
+    let (responses, history_id) = if query.is_some() {
+        (join_all(requests).await, None)
+    } else {
+        let (responses, history_id_result) =
+            join(join_all(requests), fetch_history_id(&client, &access_token)).await;
+        (responses, Some(history_id_result?))
+    };
     let mut messages = Vec::with_capacity(responses.len());
     for response in responses {
         messages.push(to_mail_message(response?));
     }
 
-    let history_id = history_id_result?;
     log::info!(
         "Gmail list completed: messages={} duration_ms={}",
         messages.len(),
@@ -269,7 +337,7 @@ async fn list_messages_with_query(
     Ok(MessagePage {
         messages,
         next_page_token: list.next_page_token,
-        history_id: Some(history_id),
+        history_id,
     })
 }
 
@@ -297,8 +365,9 @@ pub async fn sync_messages(
 
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let access_token = refresh_access_token(&GmailConfig::embedded(), &refresh_token).await?;
-    let client = build_http_client()?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let client = shared_http_client()?;
     let mut history = fetch_history(&client, &access_token, &start_history_id).await?;
     if history.is_none() {
         return Ok(SyncOutcome {
@@ -365,8 +434,8 @@ pub async fn get_message(account_id: &str, message_id: &str) -> Result<MailMessa
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let config = GmailConfig::embedded();
-    let access_token = refresh_access_token(&config, &refresh_token).await?;
-    let client = build_http_client()?;
+    let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
+    let client = shared_http_client()?;
     let message = client
         .get(format!("{GMAIL_API_URL}/messages/{message_id}"))
         .bearer_auth(&access_token)
@@ -391,8 +460,9 @@ pub async fn get_thread(account_id: &str, thread_id: &str) -> Result<MailThread,
     let started_at = Instant::now();
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let access_token = refresh_access_token(&GmailConfig::embedded(), &refresh_token).await?;
-    let client = build_http_client()?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let client = shared_http_client()?;
     let response = client
         .get(format!("{GMAIL_API_URL}/threads/{thread_id}"))
         .bearer_auth(&access_token)
@@ -447,9 +517,10 @@ pub async fn download_attachment(
 ) -> Result<String, String> {
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let access_token = refresh_access_token(&GmailConfig::embedded(), &refresh_token).await?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
     let data = fetch_attachment_data(
-        &build_http_client()?,
+        &shared_http_client()?,
         &access_token,
         message_id,
         attachment_id,
@@ -464,8 +535,10 @@ pub async fn download_attachment(
     Ok(path.to_string_lossy().into_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_reply(
     account_id: &str,
+    _message_id: Option<&str>,
     sender: &str,
     recipient: &str,
     subject: &str,
@@ -570,7 +643,8 @@ async fn send_message_with_thread(
     };
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let access_token = refresh_access_token(&GmailConfig::embedded(), &refresh_token).await?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
     let encoded_subject = base64::engine::general_purpose::STANDARD.encode(subject.as_bytes());
     let thread_headers = in_reply_to
         .filter(|value| !value.contains(['\r', '\n']))
@@ -589,7 +663,7 @@ async fn send_message_with_thread(
     {
         request_body["threadId"] = json!(thread_id);
     }
-    build_http_client()?
+    shared_http_client()?
         .post(format!("{GMAIL_API_URL}/messages/send"))
         .bearer_auth(access_token)
         .json(&request_body)
@@ -633,15 +707,15 @@ fn plain_text_to_html(value: &str) -> String {
 pub async fn modify_message(
     account_id: &str,
     message_id: &str,
-    action: &str,
+    action: MessageAction,
 ) -> Result<(), String> {
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let config = GmailConfig::embedded();
-    let access_token = refresh_access_token(&config, &refresh_token).await?;
-    let client = build_http_client()?;
+    let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
+    let client = shared_http_client()?;
     let response = match action {
-        "archive" => {
+        MessageAction::Archive => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -649,7 +723,7 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "mark_unread" => {
+        MessageAction::MarkUnread => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -657,7 +731,7 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "mark_read" => {
+        MessageAction::MarkRead => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -665,7 +739,7 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "star" => {
+        MessageAction::Star => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -673,7 +747,7 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "unstar" => {
+        MessageAction::Unstar => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -681,7 +755,7 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "spam" => {
+        MessageAction::Spam => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -689,7 +763,7 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "not_spam" => {
+        MessageAction::NotSpam => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
                 .bearer_auth(access_token)
@@ -697,28 +771,27 @@ pub async fn modify_message(
                 .send()
                 .await
         }
-        "trash" => {
+        MessageAction::Trash => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/trash"))
                 .bearer_auth(access_token)
                 .send()
                 .await
         }
-        "untrash" => {
+        MessageAction::Untrash => {
             client
                 .post(format!("{GMAIL_API_URL}/messages/{message_id}/untrash"))
                 .bearer_auth(access_token)
                 .send()
                 .await
         }
-        "delete_forever" => {
+        MessageAction::DeleteForever => {
             client
                 .delete(format!("{GMAIL_API_URL}/messages/{message_id}"))
                 .bearer_auth(access_token)
                 .send()
                 .await
         }
-        _ => return Err("Unsupported Gmail message action".to_string()),
     };
     let response = response.map_err(|error| error.to_string())?;
     if response.status().is_success() {
@@ -729,8 +802,15 @@ pub async fn modify_message(
     Err(format_gmail_api_error(status, &body, "message action"))
 }
 
-async fn refresh_access_token(config: &GmailConfig, refresh_token: &str) -> Result<String, String> {
-    let client = build_http_client()?;
+async fn refresh_access_token(
+    account_id: &str,
+    config: &GmailConfig,
+    refresh_token: &str,
+) -> Result<String, String> {
+    if let Some(access_token) = load_cached_access_token(account_id) {
+        return Ok(access_token);
+    }
+    let client = shared_http_client()?;
     let mut form = vec![
         ("client_id", config.client_id.as_str()),
         ("refresh_token", refresh_token),
@@ -773,11 +853,17 @@ async fn refresh_access_token(config: &GmailConfig, refresh_token: &str) -> Resu
         }
         return Err(format!("Gmail token refresh failed with HTTP {status}"));
     }
-    response
+    let response = response
         .json::<TokenResponse>()
         .await
-        .map(|response| response.access_token)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Some(rotated_refresh_token) = response.refresh_token.as_deref() {
+        secure_store::save_refresh_token(account_id, rotated_refresh_token)?;
+    }
+    let expires_in = response.expires_in.unwrap_or(3600);
+    let access_token = response.access_token;
+    cache_access_token(account_id, access_token.clone(), expires_in);
+    Ok(access_token)
 }
 
 fn to_mail_message(message: GmailMessage) -> MailMessage {
@@ -1786,5 +1872,20 @@ mod tests {
             decode_base64("SGVs\n bG8=").as_deref(),
             Some(b"Hello".as_slice())
         );
+    }
+
+    #[test]
+    fn caches_and_invalidates_access_tokens() {
+        let account_id = "test:access-token-cache";
+        invalidate_access_token(account_id);
+
+        cache_access_token(account_id, "access-token".to_string(), 3600);
+        assert_eq!(
+            load_cached_access_token(account_id).as_deref(),
+            Some("access-token")
+        );
+
+        invalidate_access_token(account_id);
+        assert!(load_cached_access_token(account_id).is_none());
     }
 }

@@ -1,10 +1,11 @@
-import type { ButtonHTMLAttributes } from 'react'
+import type { ButtonHTMLAttributes, Ref } from 'react'
 import { cn } from '@/lib/utils'
 
 type ButtonVariant = 'default' | 'ghost' | 'danger'
 type ButtonSize = 'default' | 'icon'
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+  ref?: Ref<HTMLButtonElement>
   variant?: ButtonVariant
   size?: ButtonSize
 }
@@ -20,6 +21,6 @@ const sizeClasses: Record<ButtonSize, string> = {
   icon: 'button-size-icon',
 }
 
-export function Button({ className, variant = 'default', size = 'default', type = 'button', ...props }: ButtonProps) {
-  return <button className={cn('ui-button', variantClasses[variant], sizeClasses[size], className)} type={type} {...props} />
+export function Button({ className, ref, variant = 'default', size = 'default', type = 'button', ...props }: ButtonProps) {
+  return <button ref={ref} className={cn('ui-button', variantClasses[variant], sizeClasses[size], className)} type={type} {...props} />
 }
