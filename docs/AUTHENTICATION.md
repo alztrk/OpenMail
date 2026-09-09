@@ -10,11 +10,10 @@ OpenMail connects directly to provider APIs from the Windows desktop application
 4. Create an OAuth client with application type `Desktop app`.
 5. Copy the public client identifier into the Rust configuration. Do not use a `Web application` client for OpenMail.
 
-The portable release embeds the public client identifier and the configured
-OAuth client secret from `src-tauri/src/config.rs`. Desktop applications still
-use PKCE because a distributed application cannot keep a client secret
-confidential. OAuth tokens are stored in the Windows Credential Manager and are
-never written to the repository or logs.
+The portable release uses the configured public OAuth client identifier. Desktop
+applications still use PKCE because a distributed application cannot keep a
+client secret confidential. OAuth tokens are stored in the Windows Credential
+Manager and are never written to the repository or logs.
 
 ## Flow
 
@@ -35,8 +34,7 @@ If an account was connected before the send scope was added, reconnect it from t
 - Access tokens: process memory only during the active application session, with an expiry-aware cache; they are not persisted to disk or Credential Manager.
 - Mail content and folder caches: Tauri application data directory, scoped per account.
 
-The Gmail OAuth client ID and client secret are configured in
-`src-tauri/src/config.rs`. The normal build does not read local credential JSON
+The Gmail OAuth client ID is configured in `src-tauri/src/config.rs`. The normal build does not read local credential JSON
 files or environment variables. Keep credential JSON files, refresh tokens,
 access tokens, and service-account credentials out of the repository. OpenMail
 requests offline access and requires a refresh token before saving an account

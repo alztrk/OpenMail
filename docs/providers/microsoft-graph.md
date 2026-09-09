@@ -113,7 +113,7 @@ The adapter must verify whether the selected Graph id remains stable after a mov
 - A personal Outlook.com or Hotmail account can authorize without a client secret when the public client ID is configured at build time.
 - A Microsoft 365 account can authorize when tenant consent permits the delegated scopes.
 - The Inbox renders from cache before the refresh completes.
-- The adapter does not claim delta synchronization until its per-folder cursor storage is implemented.
+- The Inbox adapter uses a persisted Graph delta cursor and applies additions, updates, and removals incrementally.
 - HTML bodies, plain text bodies, and attachments render correctly.
 - Read/unread, move, delete, send, and reply update both the provider and local cache.
 - Token expiration, missing consent, throttling, invalid cursors, and offline mode have distinct recoverable states.

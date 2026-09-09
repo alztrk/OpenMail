@@ -23,7 +23,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri build -- --no-bundle
 ```
 
-The portable build reads the configured Gmail OAuth client values from
+The portable build reads the configured public Gmail OAuth client identifier from
 `src-tauri/src/config.rs` and writes the executable to
 `src-tauri/target/release/openmail.exe`.
 

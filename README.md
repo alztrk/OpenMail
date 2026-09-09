@@ -48,10 +48,9 @@ Build the Windows portable release:
 npm run tauri build -- --no-bundle
 ```
 
-The portable release is a single `openmail.exe`. Before building, set the
-`GMAIL_CLIENT_SECRET` constant in `src-tauri/src/config.rs` when using the
-configured Gmail OAuth client. The value is part of the source configuration;
-no `.env` file or release helper script is required at runtime.
+The portable release is a single `openmail.exe`. Configure the public OAuth
+client identifier in the Rust source configuration before building. No `.env`
+file or release helper script is required at runtime.
 
 ## Localization
 
