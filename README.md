@@ -4,7 +4,7 @@ OpenMail is a lightweight, local-first Windows desktop mail client for bringing 
 
 ## Project status
 
-OpenMail is under active public development. The repository currently contains the Tauri desktop shell, bilingual UI, Gmail OAuth with PKCE, local mailbox caching, incremental synchronization, HTML mail rendering, desktop notifications, Windows tray controls, and the product and design records. Microsoft account support remains a future provider milestone.
+OpenMail is under active public development. The repository currently contains the Tauri desktop shell, bilingual UI, Gmail and Microsoft account OAuth with PKCE, local mailbox caching, incremental synchronization, HTML mail rendering, desktop notifications, Windows tray controls, and the product and design records.
 
 ## Principles
 
