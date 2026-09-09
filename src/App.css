@@ -2360,6 +2360,36 @@ html[data-theme='light'] .reader-error .ui-button {
   }
 }
 
+/* Stack account identity and actions before narrow settings content can force horizontal overflow. */
+@media (max-width: 680px) {
+  .settings-section,
+  .accounts-section,
+  .account-settings-list,
+  .account-settings-row {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .account-settings-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .account-settings-identity {
+    width: 100%;
+  }
+
+  .account-settings-meta {
+    width: 100%;
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+}
+
 /* Keep account rows discoverable when pointer or keyboard focus moves through their actions. */
 .account-settings-row:hover,
 .account-settings-row:focus-within {
