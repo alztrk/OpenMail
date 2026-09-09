@@ -6,6 +6,12 @@ All notable changes to OpenMail are recorded here.
 
 ### Added
 
+- Microsoft Graph Inbox synchronization now persists and follows delta cursors, including provider-reported message removals.
+- Gmail and Microsoft provider errors now expose distinct reconnect, permission, rate-limit, and temporary-service states.
+- Provider recovery error contracts now have regression coverage for HTTP and OAuth failure categories.
+- Gmail and Microsoft mailbox reads use a single bounded `Retry-After` retry without retrying message mutations.
+- Gmail metadata failures no longer prevent successfully loaded messages from appearing in the mailbox.
+- Reader hydration no longer resets the main reading surface scroll position.
 - Single-instance Windows startup now focuses the existing OpenMail window instead of opening a second process.
 - Global search now opens a compact result surface with one clear hierarchy, provider-aware account identity, and no repeated query or scope chrome.
 - Global search now checks local mailbox cache while provider requests run concurrently, and Gmail search no longer waits for an unrelated history cursor request.
@@ -52,7 +58,6 @@ All notable changes to OpenMail are recorded here.
 - Search results are cached per account and query, including additional paging pages.
 - Gmail network requests use explicit connection and request timeouts so a stalled provider response cannot leave the mailbox UI waiting indefinitely.
 - Gmail token refresh errors now distinguish expired authorization from invalid or deleted OAuth clients without exposing token response contents.
-- Gmail token refresh can use the configured OAuth client secret from the Rust configuration for Google OAuth clients that require it.
 - Gmail message action errors now expose permission failures separately, so a failed automatic read update does not obscure message loading.
 - Message selection now loads uncached mail content before attempting the automatic read-state update.
 - Confirmed window close requests now have the required Tauri destroy permission and close the application after confirmation.
