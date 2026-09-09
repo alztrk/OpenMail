@@ -955,11 +955,13 @@ button:not(.message-row):not(:disabled):active { transform: scale(.98); }
   display: -webkit-box;
   overflow: hidden;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 1;
   margin-bottom: 8px;
-  font-size: calc(26px * var(--font-scale));
+  font-size: calc(22px * var(--font-scale));
 }
+.reader-header.is-compact .reader-title-row { gap: 10px; }
 .reader-header.is-compact .reader-avatar { width: 28px; height: 28px; }
+.reader-header.is-compact .reader-meta { gap: 8px; }
 .reader-header.is-compact .reader-star { width: 30px; height: 30px; }
 
 @media (max-width: 760px) and (min-width: 581px) {
@@ -1479,10 +1481,26 @@ html[data-theme='light'] .reader-empty-mark.error {
   font-size: var(--font-size-ui);
 }
 
+.reader-meta > div {
+  flex: 1 1 auto;
+}
+
+.reader-meta time {
+  flex: 0 1 auto;
+  min-width: 5ch;
+}
+
 .reader-meta span,
 .reader-details-toggle,
 .reader-meta time {
   font-size: var(--font-size-small);
+}
+
+.reader-meta time {
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .reader-body {
@@ -1593,6 +1611,30 @@ html[data-theme='light'] .reader-empty-mark.error {
 
   .reader-empty {
     padding: 42px 24px;
+  }
+
+  /* The reader becomes the focused surface at narrow widths; the back action keeps navigation one step away. */
+  .content-area.reader-open .main-sidebar {
+    display: none;
+  }
+
+  .reader-tool:not(.icon-only) {
+    width: 36px;
+    flex: 0 0 36px;
+    justify-content: center;
+    gap: 0;
+    padding-right: 0;
+    padding-left: 0;
+    font-size: 0;
+  }
+
+  .reader-tool:not(.icon-only) .reader-tool-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
   }
 }
 
@@ -1956,6 +1998,14 @@ html[data-theme='light'] .reader-error .ui-button {
   .search-dialog-state {
     min-height: 132px;
   }
+
+  /* Keep long subjects from pushing the actual message below the first viewport on compact windows. */
+  .reader-header:not(.is-compact) h2 {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+  }
 }
 
 @media (max-width: 680px) {
@@ -2299,6 +2349,14 @@ html[data-theme='light'] .reader-error .ui-button {
     left: 108px;
     width: auto;
     transform: translateY(-50%);
+  }
+}
+
+/* Let the mobile search dialog use the viewport instead of the transformed search field. */
+@media (max-width: 580px) {
+  .window-search-surface {
+    top: 8px;
+    transform: none;
   }
 }
 
