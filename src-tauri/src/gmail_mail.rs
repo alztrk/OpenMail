@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -16,11 +16,13 @@ use serde_json::json;
 use crate::{
     config::GmailConfig,
     models::{MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage},
+    provider::{DraftAttachment, DraftRequest, DraftSummary, MailDraft, OutgoingAttachment},
     secure_store,
 };
 
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+const MAX_GMAIL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -31,9 +33,22 @@ struct CachedAccessToken {
 }
 
 static ACCESS_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedAccessToken>>> = OnceLock::new();
+static ACCESS_TOKEN_REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 fn access_token_cache() -> &'static Mutex<HashMap<String, CachedAccessToken>> {
     ACCESS_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn access_token_refresh_lock(account_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let locks = ACCESS_TOKEN_REFRESH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| "The Gmail token refresh lock is poisoned".to_string())?;
+    Ok(locks
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
 }
 
 fn load_cached_access_token(account_id: &str) -> Option<String> {
@@ -161,7 +176,7 @@ where
             .unwrap_or(1)
             .min(5);
         log::warn!("Gmail rate limit reached during {operation}; retrying once");
-        std::thread::sleep(Duration::from_secs(retry_after));
+        tokio::time::sleep(Duration::from_secs(retry_after)).await;
         response = build_request()
             .send()
             .await
@@ -229,6 +244,24 @@ struct SendMessageResponse {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DraftListResponse {
+    drafts: Option<Vec<DraftReference>>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DraftReference {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailDraftResponse {
+    id: String,
+    message: GmailMessage,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GmailMessage {
     id: String,
@@ -238,6 +271,8 @@ struct GmailMessage {
     payload: Option<MessagePart>,
     #[serde(rename = "labelIds")]
     label_ids: Option<Vec<String>>,
+    #[serde(rename = "internalDate")]
+    internal_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -377,6 +412,12 @@ async fn list_messages_with_query(
         }
     }
 
+    if skipped_count > 0 {
+        return Err(format!(
+            "GMAIL_SYNC_INCOMPLETE: Gmail could not load {skipped_count} message metadata record(s); the cache was left unchanged"
+        ));
+    }
+
     log::info!(
         "Gmail list completed: messages={} skipped={} duration_ms={}",
         messages.len(),
@@ -433,7 +474,7 @@ pub async fn sync_messages(
     let mut added_ids = Vec::new();
     let mut changed_ids = Vec::new();
     let mut removed_ids = Vec::new();
-    let mut latest_history_id = start_history_id;
+    let mut latest_history_id = start_history_id.clone();
     while let Some(response) = history {
         latest_history_id = response.history_id;
         for entry in response.history.unwrap_or_default() {
@@ -453,7 +494,7 @@ pub async fn sync_messages(
         }
         history = match response.next_page_token {
             Some(token) => {
-                fetch_history_page(&client, &access_token, &latest_history_id, &token).await?
+                fetch_history_page(&client, &access_token, &start_history_id, &token).await?
             }
             None => None,
         };
@@ -589,6 +630,339 @@ pub async fn download_attachment(
     Ok(path.to_string_lossy().into_owned())
 }
 
+pub async fn list_drafts(account_id: &str) -> Result<Vec<DraftSummary>, String> {
+    let refresh_token = secure_store::load_refresh_token(account_id)?
+        .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let client = shared_http_client()?;
+    let mut page_token = None;
+    let mut summaries = Vec::new();
+    let mut complete = false;
+    for _ in 0..20 {
+        let mut request = client
+            .get(format!("{GMAIL_API_URL}/drafts"))
+            .bearer_auth(&access_token)
+            .query(&[("maxResults", "25")]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_gmail_api_error(status, &body, "list drafts"));
+        }
+        let list = response
+            .json::<DraftListResponse>()
+            .await
+            .map_err(|error| format!("Gmail drafts could not be decoded: {error}"))?;
+        let page_summaries = join_all(list.drafts.unwrap_or_default().into_iter().map(
+            |reference| {
+                let client = client.clone();
+                let access_token = access_token.clone();
+                async move {
+                    let draft = fetch_draft(&client, &access_token, &reference.id).await?;
+                    Ok::<DraftSummary, String>(draft_summary(&draft))
+                }
+            },
+        ))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        summaries.extend(page_summaries);
+        match list.next_page_token {
+            Some(next) => page_token = Some(next),
+            None => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    if !complete {
+        return Err("GMAIL_DRAFTS_INCOMPLETE: Gmail returned too many draft pages".to_string());
+    }
+    Ok(summaries)
+}
+
+pub async fn get_draft(account_id: &str, draft_id: &str) -> Result<MailDraft, String> {
+    let refresh_token = secure_store::load_refresh_token(account_id)?
+        .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let client = shared_http_client()?;
+    let draft = fetch_draft(&client, &access_token, draft_id).await?;
+    draft_to_mail_draft(&client, &access_token, draft).await
+}
+
+pub async fn save_draft(request: DraftRequest<'_>) -> Result<MailDraft, String> {
+    if !is_valid_email_address(request.sender) {
+        return Err("The draft sender is invalid".to_string());
+    }
+    let raw_message = build_draft_raw_message(&request)?;
+    let refresh_token = secure_store::load_refresh_token(request.account_id)?
+        .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
+    let access_token =
+        refresh_access_token(request.account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let client = shared_http_client()?;
+    let payload = json!({ "message": { "raw": URL_SAFE_NO_PAD.encode(raw_message.as_bytes()) } });
+    let response = match request.draft_id.filter(|value| !value.trim().is_empty()) {
+        Some(draft_id) => {
+            client
+                .put(format!("{GMAIL_API_URL}/drafts/{draft_id}"))
+                .bearer_auth(&access_token)
+                .json(&payload)
+                .send()
+                .await
+        }
+        None => {
+            client
+                .post(format!("{GMAIL_API_URL}/drafts"))
+                .bearer_auth(&access_token)
+                .json(&payload)
+                .send()
+                .await
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_gmail_api_error(status, &body, "save draft"));
+    }
+    let saved = response
+        .json::<GmailDraftResponse>()
+        .await
+        .map_err(|error| format!("Gmail saved draft could not be decoded: {error}"))?;
+    draft_to_mail_draft(&client, &access_token, saved).await
+}
+
+pub async fn delete_draft(account_id: &str, draft_id: &str) -> Result<(), String> {
+    let refresh_token = secure_store::load_refresh_token(account_id)?
+        .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let response = shared_http_client()?
+        .delete(format!("{GMAIL_API_URL}/drafts/{draft_id}"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format_gmail_api_error(status, &body, "delete draft"))
+}
+
+async fn fetch_draft(
+    client: &Client,
+    access_token: &str,
+    draft_id: &str,
+) -> Result<GmailDraftResponse, String> {
+    let response = client
+        .get(format!("{GMAIL_API_URL}/drafts/{draft_id}"))
+        .bearer_auth(access_token)
+        .query(&[("format", "full")])
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format_gmail_api_error(status, &body, "load draft"));
+    }
+    response
+        .json::<GmailDraftResponse>()
+        .await
+        .map_err(|error| format!("Gmail draft could not be decoded: {error}"))
+}
+
+fn draft_summary(draft: &GmailDraftResponse) -> DraftSummary {
+    let headers = draft
+        .message
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.headers.as_deref())
+        .unwrap_or_default();
+    DraftSummary {
+        id: draft.id.clone(),
+        subject: header_value(headers, "Subject")
+            .map(|value| decode_header_value(&value))
+            .unwrap_or_default(),
+        recipient: header_value(headers, "To").unwrap_or_default(),
+        updated_at: draft.message.internal_date.clone().unwrap_or_default(),
+    }
+}
+
+async fn draft_to_mail_draft(
+    client: &Client,
+    access_token: &str,
+    mut draft: GmailDraftResponse,
+) -> Result<MailDraft, String> {
+    hydrate_body_attachments(client, access_token, &mut draft.message).await?;
+    let payload = draft
+        .message
+        .payload
+        .as_ref()
+        .cloned()
+        .unwrap_or(MessagePart {
+            mime_type: None,
+            filename: None,
+            body: None,
+            parts: None,
+            headers: None,
+        });
+    let headers = payload.headers.as_deref().unwrap_or_default();
+    let body = text_body(&payload).unwrap_or_default();
+    let body_html = html_body(&payload).unwrap_or_else(|| plain_text_to_html(&body));
+    Ok(MailDraft {
+        id: draft.id,
+        subject: header_value(headers, "Subject")
+            .map(|value| decode_header_value(&value))
+            .unwrap_or_default(),
+        recipient: header_value(headers, "To")
+            .map(|value| normalize_recipient_header(&value))
+            .unwrap_or_default(),
+        cc: header_value(headers, "Cc")
+            .map(|value| normalize_recipient_header(&value))
+            .unwrap_or_default(),
+        bcc: header_value(headers, "Bcc")
+            .map(|value| normalize_recipient_header(&value))
+            .unwrap_or_default(),
+        body,
+        body_html,
+        attachments: collect_draft_attachments(&payload),
+        updated_at: draft.message.internal_date.unwrap_or_default(),
+    })
+}
+
+fn normalize_recipient_header(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|recipient| !recipient.is_empty())
+        .map(|recipient| {
+            recipient
+                .rsplit_once('<')
+                .map(|(_, address)| address.trim_end_matches('>').trim().to_string())
+                .unwrap_or_else(|| recipient.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn collect_draft_attachments(part: &MessagePart) -> Vec<DraftAttachment> {
+    let mut attachments = Vec::new();
+    collect_draft_attachments_into(part, &mut attachments);
+    attachments
+}
+
+fn collect_draft_attachments_into(part: &MessagePart, result: &mut Vec<DraftAttachment>) {
+    let is_inline = part
+        .headers
+        .as_deref()
+        .and_then(|headers| header_value(headers, "Content-ID"))
+        .is_some();
+    if !is_inline {
+        if let (Some(filename), Some(body), Some(mime_type)) = (
+            part.filename.as_ref().filter(|name| !name.is_empty()),
+            part.body.as_ref(),
+            part.mime_type.as_ref(),
+        ) {
+            if let Some(data) = body.data.as_ref().and_then(|value| decode_base64(value)) {
+                result.push(DraftAttachment {
+                    id: filename.clone(),
+                    filename: filename.clone(),
+                    mime_type: mime_type.clone(),
+                    size: data.len() as u64,
+                    data_base64: STANDARD.encode(data),
+                });
+            }
+        }
+    }
+    if let Some(parts) = part.parts.as_deref() {
+        for child in parts {
+            collect_draft_attachments_into(child, result);
+        }
+    }
+}
+
+fn build_draft_raw_message(request: &DraftRequest<'_>) -> Result<String, String> {
+    validate_attachment_size(request.attachments)?;
+    let recipients = request
+        .recipient
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if recipients.is_empty()
+        || recipients
+            .iter()
+            .any(|value| !is_valid_email_address(value))
+    {
+        return Err("The draft recipient is invalid".to_string());
+    }
+    let copies = request
+        .cc
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let blind_copies = request
+        .bcc
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if copies
+        .iter()
+        .chain(blind_copies.iter())
+        .any(|value| !is_valid_email_address(value))
+    {
+        return Err("The draft copy recipient is invalid".to_string());
+    }
+    let boundary = "OpenMailDraftAlternativeBoundary";
+    let fallback_html = plain_text_to_html(request.body);
+    let html_body = if request.body_html.trim().is_empty() {
+        fallback_html.as_str()
+    } else {
+        request.body_html
+    };
+    let alternative_body = format!(
+        "--{boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--{boundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--{boundary}--\r\n",
+        encode_mime_body(request.body),
+        encode_mime_body(html_body),
+    );
+    let (content_type, content) = if request.attachments.is_empty() {
+        (
+            format!("multipart/alternative; boundary=\"{boundary}\""),
+            alternative_body,
+        )
+    } else {
+        let attachment_parts = request
+            .attachments
+            .iter()
+            .map(build_mime_attachment)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("");
+        ("multipart/mixed; boundary=\"OpenMailMixedBoundary\"".to_string(), format!("--OpenMailMixedBoundary\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n{alternative_body}{attachment_parts}--OpenMailMixedBoundary--\r\n"))
+    };
+    let cc_header = if copies.is_empty() {
+        String::new()
+    } else {
+        format!("Cc: {}\r\n", copies.join(", "))
+    };
+    let bcc_header = if blind_copies.is_empty() {
+        String::new()
+    } else {
+        format!("Bcc: {}\r\n", blind_copies.join(", "))
+    };
+    let subject = base64::engine::general_purpose::STANDARD.encode(request.subject.as_bytes());
+    Ok(format!("From: {}\r\nTo: {}\r\n{cc_header}{bcc_header}Subject: =?UTF-8?B?{subject}?=\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}\r\n\r\n{content}", request.sender, recipients.join(", ")))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send_reply(
     account_id: &str,
@@ -611,12 +985,15 @@ pub async fn send_reply(
         recipients,
         subject,
         body,
+        &plain_text_to_html(body),
+        &[],
         thread_id,
         in_reply_to,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     account_id: &str,
     sender: &str,
@@ -625,13 +1002,26 @@ pub async fn send_message(
     bcc: &str,
     subject: &str,
     body: &str,
+    body_html: &str,
+    attachments: &[OutgoingAttachment],
 ) -> Result<String, String> {
     let recipients = RecipientHeaders {
         to: recipient,
         cc,
         bcc,
     };
-    send_message_with_thread(account_id, sender, recipients, subject, body, None, None).await
+    send_message_with_thread(
+        account_id,
+        sender,
+        recipients,
+        subject,
+        body,
+        body_html,
+        attachments,
+        None,
+        None,
+    )
+    .await
 }
 
 struct RecipientHeaders<'a> {
@@ -640,15 +1030,19 @@ struct RecipientHeaders<'a> {
     bcc: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_message_with_thread(
     account_id: &str,
     sender: &str,
     recipients: RecipientHeaders<'_>,
     subject: &str,
     body: &str,
+    body_html: &str,
+    attachments: &[OutgoingAttachment],
     thread_id: Option<&str>,
     in_reply_to: Option<&str>,
 ) -> Result<String, String> {
+    validate_attachment_size(attachments)?;
     let to_recipients = recipients
         .to
         .split([',', ';'])
@@ -706,9 +1100,29 @@ async fn send_message_with_thread(
         .unwrap_or_default();
     let boundary = "OpenMailAlternativeBoundary";
     let encoded_plain_body = encode_mime_body(body);
-    let encoded_html_body = encode_mime_body(&plain_text_to_html(body));
+    let encoded_html_body = encode_mime_body(body_html);
+    let alternative_body = format!(
+        "--{boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded_plain_body}\r\n--{boundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded_html_body}\r\n--{boundary}--\r\n"
+    );
+    let body_content_type = if attachments.is_empty() {
+        format!("multipart/alternative; boundary=\"{boundary}\"")
+    } else {
+        "multipart/mixed; boundary=\"OpenMailMixedBoundary\"".to_string()
+    };
+    let body_content = if attachments.is_empty() {
+        alternative_body
+    } else {
+        let attachment_parts = attachments
+            .iter()
+            .map(build_mime_attachment)
+            .collect::<Result<Vec<_>, String>>()?
+            .join("");
+        format!(
+            "--OpenMailMixedBoundary\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n{alternative_body}{attachment_parts}--OpenMailMixedBoundary--\r\n"
+        )
+    };
     let raw_message = format!(
-        "From: {sender}\r\nTo: {normalized_recipients}\r\n{copy_header}{blind_copy_header}Subject: =?UTF-8?B?{encoded_subject}?=\r\n{thread_headers}MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded_plain_body}\r\n--{boundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded_html_body}\r\n--{boundary}--\r\n"
+        "From: {sender}\r\nTo: {normalized_recipients}\r\n{copy_header}{blind_copy_header}Subject: =?UTF-8?B?{encoded_subject}?=\r\n{thread_headers}MIME-Version: 1.0\r\nContent-Type: {body_content_type}\r\n\r\n{body_content}"
     );
     let raw = URL_SAFE_NO_PAD.encode(raw_message.as_bytes());
     let mut request_body = json!({ "raw": raw });
@@ -743,12 +1157,62 @@ fn escape_html(value: &str) -> String {
 
 fn encode_mime_body(value: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
+    wrap_base64(&encoded)
+}
+
+fn wrap_base64(encoded: &str) -> String {
     encoded
         .as_bytes()
         .chunks(76)
         .map(String::from_utf8_lossy)
         .collect::<Vec<_>>()
         .join("\r\n")
+}
+
+fn build_mime_attachment(attachment: &OutgoingAttachment) -> Result<String, String> {
+    let bytes = STANDARD.decode(&attachment.data_base64).map_err(|error| {
+        format!(
+            "Attachment {} contains invalid base64 data: {error}",
+            attachment.filename
+        )
+    })?;
+    let filename = sanitize_mime_header(&attachment.filename, "attachment");
+    let mime_type = sanitize_mime_header(&attachment.mime_type, "application/octet-stream");
+    let encoded = wrap_base64(&STANDARD.encode(bytes));
+    Ok(format!(
+        "--OpenMailMixedBoundary\r\nContent-Type: {mime_type}; name=\"{filename}\"\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n"
+    ))
+}
+
+fn validate_attachment_size(attachments: &[OutgoingAttachment]) -> Result<(), String> {
+    let mut total_size = 0usize;
+    for attachment in attachments {
+        let bytes = STANDARD.decode(&attachment.data_base64).map_err(|error| {
+            format!(
+                "Attachment {} contains invalid base64 data: {error}",
+                attachment.filename
+            )
+        })?;
+        total_size = total_size
+            .checked_add(bytes.len())
+            .ok_or_else(|| "The total attachment size is too large".to_string())?;
+    }
+    if total_size >= MAX_GMAIL_ATTACHMENT_BYTES {
+        return Err("The combined Gmail attachment size must be under 25 MB".to_string());
+    }
+    Ok(())
+}
+
+fn sanitize_mime_header(value: &str, fallback: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '"'))
+        .collect::<String>();
+    if sanitized.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn plain_text_to_html(value: &str) -> String {
@@ -861,6 +1325,11 @@ async fn refresh_access_token(
     config: &GmailConfig,
     refresh_token: &str,
 ) -> Result<String, String> {
+    if let Some(access_token) = load_cached_access_token(account_id) {
+        return Ok(access_token);
+    }
+    let refresh_lock = access_token_refresh_lock(account_id)?;
+    let _refresh_guard = refresh_lock.lock().await;
     if let Some(access_token) = load_cached_access_token(account_id) {
         return Ok(access_token);
     }
@@ -1312,14 +1781,14 @@ async fn fetch_history(
 async fn fetch_history_page(
     client: &Client,
     access_token: &str,
-    _start_history_id: &str,
+    start_history_id: &str,
     page_token: &str,
 ) -> Result<Option<HistoryResponse>, String> {
     client
         .get(format!("{GMAIL_API_URL}/history"))
         .bearer_auth(access_token)
         .query(&[
-            ("startHistoryId", _start_history_id),
+            ("startHistoryId", start_history_id),
             ("pageToken", page_token),
         ])
         .send()
@@ -1602,6 +2071,7 @@ mod tests {
                 ]),
             }),
             label_ids: Some(vec!["INBOX".to_string(), "UNREAD".to_string()]),
+            internal_date: None,
         };
 
         let parsed = to_mail_message(message);

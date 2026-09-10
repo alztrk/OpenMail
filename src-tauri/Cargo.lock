@@ -2607,6 +2607,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tokio",
  "url",
  "webbrowser",
  "winreg",

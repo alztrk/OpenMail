@@ -18,7 +18,7 @@ Research baseline: 2026-09-08. Provider documentation and standards links in eac
 
 ## Implementation order
 
-1. [Microsoft Graph](microsoft-graph.md) for Outlook, Hotmail, Live, and Microsoft 365. The initial adapter is implemented; delta cursor persistence remains follow-up work.
+1. [Microsoft Graph](microsoft-graph.md) for Outlook, Hotmail, Live, and Microsoft 365. The adapter and persisted delta cursor path are implemented; edge-case hardening and release verification remain follow-up work.
 2. [Generic IMAP and SMTP](generic-imap-smtp.md), with verified presets for Yahoo, AOL, iCloud, GMX, mail.com, and self-hosted mail servers.
 3. [Fastmail JMAP](fastmail-jmap.md) for a native modern API integration.
 4. [Zoho Mail](zoho-mail.md) for business and personal Zoho mailboxes.

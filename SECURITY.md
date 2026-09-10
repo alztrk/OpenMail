@@ -14,7 +14,7 @@ Do not open a public issue for a suspected vulnerability. Use a private GitHub S
 - Use the smallest provider permission scopes that support the feature.
 - Treat all provider content as untrusted input.
 - Sanitize rendered HTML mail and attachments before display.
-- Keep local database and attachment paths inside the OpenMail application data directory.
+- Keep the runtime cache and provider state inside the OpenMail application data directory. User-initiated attachment downloads are written to the Windows Downloads directory and must use sanitized filenames without exposing provider credentials.
 
 ## Supported versions
 

@@ -12,10 +12,26 @@ mod secure_store;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{TrayIconBuilder, TrayIconEvent},
-    Manager,
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager,
 };
 use tauri_plugin_log::{Target, TargetKind};
+
+fn restore_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        log::warn!("Could not restore the main window because it was not found");
+        return;
+    };
+    if let Err(error) = window.show() {
+        log::warn!("Could not show the main window from the tray: {error}");
+    }
+    if let Err(error) = window.unminimize() {
+        log::warn!("Could not unminimize the main window from the tray: {error}");
+    }
+    if let Err(error) = window.set_focus() {
+        log::warn!("Could not focus the main window from the tray: {error}");
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,11 +40,7 @@ pub fn run() {
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                    }
+                    restore_main_window(app);
                 }))?;
 
             app.manage(commands::AppState::new(app.path().app_data_dir()?));
@@ -53,29 +65,32 @@ pub fn run() {
                     "../icons/icon.ico"
                 ))?)
                 .menu(&menu)
+                .tooltip("OpenMail")
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     if event.id().as_ref() == "show" {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        restore_main_window(app);
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if matches!(event, TrayIconEvent::DoubleClick { .. }) {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            ..
+                        } | TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
                         }
+                    ) {
+                        restore_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::hide_main_window,
             commands::list_accounts,
             commands::get_provider_capabilities,
             commands::list_messages,
@@ -94,6 +109,10 @@ pub fn run() {
             commands::open_external_url,
             commands::send_reply,
             commands::send_message,
+            commands::list_drafts,
+            commands::get_draft,
+            commands::save_draft,
+            commands::delete_draft,
             commands::cache_sent_message,
             commands::sync_messages,
             commands::modify_message,
@@ -104,5 +123,8 @@ pub fn run() {
             commands::set_launch_at_startup
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|error| {
+            log::error!("Error while running Tauri application: {error}");
+            std::process::exit(1);
+        });
 }

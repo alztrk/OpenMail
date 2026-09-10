@@ -12,8 +12,7 @@ impl GmailConfig {
     pub fn embedded() -> Self {
         Self {
             client_id: GMAIL_CLIENT_ID.to_string(),
-            client_secret: (!GMAIL_CLIENT_SECRET.is_empty())
-                .then(|| GMAIL_CLIENT_SECRET.to_string()),
+            client_secret: option_env!("OPENMAIL_GMAIL_CLIENT_SECRET").map(str::to_owned),
             redirect_host: "127.0.0.1".to_string(),
         }
     }

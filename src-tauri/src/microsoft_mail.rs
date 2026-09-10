@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -13,13 +13,14 @@ use crate::{
     models::{
         MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage, SyncResult,
     },
-    provider::{ReplyRequest, SendRequest},
+    provider::{DraftAttachment, DraftRequest, DraftSummary, MailDraft, ReplyRequest, SendRequest},
     secure_store,
 };
 
 const GRAPH_API_URL: &str = "https://graph.microsoft.com/v1.0";
 const GRAPH_TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 const GRAPH_SCOPES: &str = "openid profile email User.Read Mail.ReadWrite Mail.Send offline_access";
+const MAX_GRAPH_DIRECT_ATTACHMENT_BYTES: usize = 3 * 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const PAGE_SIZE: &str = "25";
@@ -31,9 +32,22 @@ struct CachedAccessToken {
 }
 
 static ACCESS_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedAccessToken>>> = OnceLock::new();
+static ACCESS_TOKEN_REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 fn access_token_cache() -> &'static Mutex<HashMap<String, CachedAccessToken>> {
     ACCESS_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn access_token_refresh_lock(account_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let locks = ACCESS_TOKEN_REFRESH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| "The Microsoft token refresh lock is poisoned".to_string())?;
+    Ok(locks
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
 }
 
 fn load_cached_access_token(account_id: &str) -> Option<String> {
@@ -171,7 +185,15 @@ struct GraphMessage {
     has_attachments: Option<bool>,
     #[serde(rename = "receivedDateTime")]
     received_date_time: Option<String>,
+    #[serde(rename = "lastModifiedDateTime")]
+    last_modified_date_time: Option<String>,
     from: Option<GraphRecipient>,
+    #[serde(rename = "toRecipients")]
+    to_recipients: Option<Vec<GraphRecipient>>,
+    #[serde(rename = "ccRecipients")]
+    cc_recipients: Option<Vec<GraphRecipient>>,
+    #[serde(rename = "bccRecipients")]
+    bcc_recipients: Option<Vec<GraphRecipient>>,
     body: Option<GraphBody>,
     attachments: Option<Vec<GraphAttachment>>,
     #[serde(rename = "@removed")]
@@ -350,6 +372,230 @@ pub async fn download_attachment(
     Ok(path.to_string_lossy().into_owned())
 }
 
+pub async fn list_drafts(account_id: &str) -> Result<Vec<DraftSummary>, String> {
+    let client = shared_http_client()?;
+    let mut url = format!("{GRAPH_API_URL}/me/mailFolders/drafts/messages");
+    let mut drafts = Vec::new();
+    let mut complete = false;
+    let mut first_request = true;
+    for _ in 0..20 {
+        let is_initial_request = first_request;
+        first_request = false;
+        let response = send_authenticated_read(account_id, "list drafts", |access_token| {
+            let mut request = client
+                .get(url.clone())
+                .bearer_auth(access_token)
+                .header("Prefer", r#"outlook.body-content-type="html""#);
+            if is_initial_request {
+                request = request
+                    .query(&[("$top", "25"), ("$expand", "attachments")])
+                    .query(&[("$select", "id,subject,toRecipients,lastModifiedDateTime")]);
+            }
+            request
+        })
+        .await?;
+        let page = response
+            .json::<GraphPage<GraphMessage>>()
+            .await
+            .map_err(|error| format!("Microsoft Graph drafts could not be decoded: {error}"))?;
+        drafts.extend(page.value.into_iter().map(draft_summary));
+        match page.next_link {
+            Some(next) => url = validate_next_link(&next)?,
+            None => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    if !complete {
+        return Err(
+            "OUTLOOK_DRAFTS_INCOMPLETE: Microsoft Graph returned too many draft pages".to_string(),
+        );
+    }
+    Ok(drafts)
+}
+
+pub async fn get_draft(account_id: &str, draft_id: &str) -> Result<MailDraft, String> {
+    let url = message_url(draft_id)?;
+    let client = shared_http_client()?;
+    let response = send_authenticated_read(account_id, "load draft", |access_token| {
+        client
+            .get(url.clone())
+            .bearer_auth(access_token)
+            .header("Prefer", r#"outlook.body-content-type="html""#)
+            .query(&[("$expand", "attachments")])
+    })
+    .await?;
+    response
+        .json::<GraphMessage>()
+        .await
+        .map(to_mail_draft)
+        .map_err(|error| format!("Microsoft Graph draft could not be decoded: {error}"))
+}
+
+pub async fn save_draft(request: DraftRequest<'_>) -> Result<MailDraft, String> {
+    if !is_valid_email_address(request.sender) {
+        return Err("The draft sender is invalid".to_string());
+    }
+    let message = build_draft_message(&request)?;
+    let client = shared_http_client()?;
+    let response = match request.draft_id.filter(|value| !value.trim().is_empty()) {
+        Some(draft_id) => {
+            let url = message_url(draft_id)?;
+            send_authenticated(request.account_id, "update draft", |access_token| {
+                client
+                    .patch(url.clone())
+                    .bearer_auth(access_token)
+                    .header("Prefer", r#"IdType="ImmutableId""#)
+                    .json(&message)
+            })
+            .await?
+        }
+        None => {
+            send_authenticated(request.account_id, "save draft", |access_token| {
+                client
+                    .post(format!("{GRAPH_API_URL}/me/messages"))
+                    .bearer_auth(access_token)
+                    .header("Prefer", r#"IdType="ImmutableId""#)
+                    .json(&message)
+            })
+            .await?
+        }
+    };
+    let draft = response
+        .json::<GraphMessageReference>()
+        .await
+        .map_err(|error| format!("Microsoft Graph saved draft could not be decoded: {error}"))?;
+    get_draft(request.account_id, &draft.id).await
+}
+
+pub async fn delete_draft(account_id: &str, draft_id: &str) -> Result<(), String> {
+    let url = message_url(draft_id)?;
+    let client = shared_http_client()?;
+    send_authenticated(account_id, "delete draft", |access_token| {
+        client.delete(url.clone()).bearer_auth(access_token)
+    })
+    .await?;
+    Ok(())
+}
+
+fn draft_summary(message: GraphMessage) -> DraftSummary {
+    DraftSummary {
+        id: message.id,
+        subject: message.subject.unwrap_or_default(),
+        recipient: graph_recipients_to_text(message.to_recipients.as_deref().unwrap_or_default()),
+        updated_at: message.last_modified_date_time.unwrap_or_default(),
+    }
+}
+
+fn to_mail_draft(message: GraphMessage) -> MailDraft {
+    let body = message
+        .body
+        .as_ref()
+        .and_then(|body| body.content.clone())
+        .unwrap_or_default();
+    let body_html = message
+        .body
+        .as_ref()
+        .and_then(|body| {
+            body.content_type
+                .as_deref()
+                .filter(|value| value.eq_ignore_ascii_case("html"))
+                .and_then(|_| body.content.clone())
+        })
+        .unwrap_or_else(|| plain_text_to_html(&body));
+    let attachments = message
+        .attachments
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|attachment| !attachment.is_inline.unwrap_or(false))
+        .map(|attachment| {
+            let data_base64 = attachment.content_bytes.unwrap_or_default();
+            let size = STANDARD
+                .decode(&data_base64)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(attachment.size.unwrap_or_default());
+            DraftAttachment {
+                id: attachment.id,
+                filename: attachment.name.unwrap_or_else(|| "attachment".to_string()),
+                mime_type: attachment
+                    .content_type
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                size,
+                data_base64,
+            }
+        })
+        .collect();
+    MailDraft {
+        id: message.id,
+        subject: message.subject.unwrap_or_default(),
+        recipient: graph_recipients_to_text(message.to_recipients.as_deref().unwrap_or_default()),
+        cc: graph_recipients_to_text(message.cc_recipients.as_deref().unwrap_or_default()),
+        bcc: graph_recipients_to_text(message.bcc_recipients.as_deref().unwrap_or_default()),
+        body,
+        body_html,
+        attachments,
+        updated_at: message
+            .last_modified_date_time
+            .or(message.received_date_time)
+            .unwrap_or_default(),
+    }
+}
+
+fn graph_recipients_to_text(recipients: &[GraphRecipient]) -> String {
+    recipients
+        .iter()
+        .filter_map(|recipient| {
+            recipient
+                .email_address
+                .as_ref()
+                .and_then(|email| email.address.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn build_draft_message(request: &DraftRequest<'_>) -> Result<serde_json::Value, String> {
+    let to_recipients = parse_recipients(request.recipient)?;
+    let cc_recipients = parse_recipients_optional(request.cc)?;
+    let bcc_recipients = parse_recipients_optional(request.bcc)?;
+    let graph_attachments = request
+        .attachments
+        .iter()
+        .map(|attachment| {
+            let bytes = STANDARD.decode(&attachment.data_base64).map_err(|error| {
+                format!(
+                    "Attachment {} contains invalid base64 data: {error}",
+                    attachment.filename
+                )
+            })?;
+            if bytes.len() >= MAX_GRAPH_DIRECT_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "The Outlook attachment {} must be under 3 MB",
+                    attachment.filename
+                ));
+            }
+            Ok(json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": sanitize_filename(&attachment.filename),
+                "contentType": attachment.mime_type,
+                "contentBytes": STANDARD.encode(bytes),
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut message = json!({
+        "subject": request.subject,
+        "body": { "contentType": "HTML", "content": request.body_html },
+        "toRecipients": to_recipients,
+        "ccRecipients": cc_recipients,
+        "bccRecipients": bcc_recipients,
+    });
+    if !graph_attachments.is_empty() {
+        message["attachments"] = json!(graph_attachments);
+    }
+    Ok(message)
+}
+
 pub async fn send_reply(request: ReplyRequest<'_>) -> Result<String, String> {
     let message_id = request
         .message_id
@@ -382,17 +628,49 @@ pub async fn send_message(request: SendRequest<'_>) -> Result<String, String> {
     if !is_valid_email_address(request.sender) {
         return Err("The message sender is invalid".to_string());
     }
-    let payload = json!({
-        "message": {
+    let graph_attachments = request
+        .attachments
+        .iter()
+        .map(|attachment| {
+            STANDARD
+                .decode(&attachment.data_base64)
+                .map_err(|error| {
+                    format!(
+                        "Attachment {} contains invalid base64 data: {error}",
+                        attachment.filename
+                    )
+                })
+                .and_then(|bytes| {
+                    if bytes.len() >= MAX_GRAPH_DIRECT_ATTACHMENT_BYTES {
+                        return Err(format!(
+                            "The Outlook attachment {} must be under 3 MB",
+                            attachment.filename
+                        ));
+                    }
+                    Ok(json!({
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": &attachment.filename,
+                        "contentType": &attachment.mime_type,
+                        "contentBytes": STANDARD.encode(bytes),
+                    }))
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut message = json!({
             "subject": request.subject,
             "body": {
                 "contentType": "HTML",
-                "content": plain_text_to_html(request.body),
+                "content": request.body_html,
             },
             "toRecipients": to_recipients,
             "ccRecipients": cc_recipients,
             "bccRecipients": bcc_recipients,
-        },
+    });
+    if !graph_attachments.is_empty() {
+        message["attachments"] = json!(graph_attachments);
+    }
+    let payload = json!({
+        "message": message,
         "saveToSentItems": true,
     });
     let client = shared_http_client()?;
@@ -435,22 +713,23 @@ pub async fn sync_messages(
     if let Some(cached_page) = cached_page.as_ref() {
         if let Some(delta_link) = cached_page.history_id.as_deref() {
             if delta_link.starts_with("https://graph.microsoft.com/") {
-                return sync_from_delta(account_id, cached_page, delta_link).await;
+                match sync_from_delta(account_id, cached_page, delta_link).await {
+                    Ok(result) => return Ok(result),
+                    Err(error) if is_invalid_delta_error(&error) => {
+                        log::info!("Outlook delta cursor expired; starting a fresh mailbox sync");
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
-    if cached_page.is_none() {
-        let initial_page = MessagePage {
-            messages: Vec::new(),
-            next_page_token: None,
-            history_id: None,
-        };
-        let initial_url = format!(
-            "{GRAPH_API_URL}/me/mailFolders/inbox/messages/delta?$select=id,conversationId,internetMessageId,subject,from,receivedDateTime,isRead,flag,bodyPreview,hasAttachments&$top={PAGE_SIZE}"
-        );
-        let mut result = sync_from_delta(account_id, &initial_page, &initial_url).await?;
-        result.new_message_count = 0;
-        return Ok(result);
+    if cached_page.is_none()
+        || cached_page
+            .as_ref()
+            .and_then(|page| page.history_id.as_deref())
+            .is_some_and(|value| value.starts_with("https://graph.microsoft.com/"))
+    {
+        return initial_delta_sync(account_id).await;
     }
     let previous_ids = cached_page
         .as_ref()
@@ -477,6 +756,24 @@ pub async fn sync_messages(
     })
 }
 
+async fn initial_delta_sync(account_id: &str) -> Result<SyncResult, String> {
+    let initial_page = MessagePage {
+        messages: Vec::new(),
+        next_page_token: None,
+        history_id: None,
+    };
+    let initial_url = format!(
+        "{GRAPH_API_URL}/me/mailFolders/inbox/messages/delta?$select=id,conversationId,internetMessageId,subject,from,receivedDateTime,isRead,flag,bodyPreview,hasAttachments&$top={PAGE_SIZE}"
+    );
+    let mut result = sync_from_delta(account_id, &initial_page, &initial_url).await?;
+    result.new_message_count = 0;
+    Ok(result)
+}
+
+fn is_invalid_delta_error(error: &str) -> bool {
+    error.starts_with("OUTLOOK_DELTA_CURSOR_INVALID:") || error.contains("HTTP 410")
+}
+
 async fn sync_from_delta(
     account_id: &str,
     cached_page: &MessagePage,
@@ -484,9 +781,10 @@ async fn sync_from_delta(
 ) -> Result<SyncResult, String> {
     let client = shared_http_client()?;
     let mut url = validate_next_link(delta_link)?;
-    let mut changed = Vec::new();
-    let mut removed = Vec::new();
+    let mut changed = HashMap::new();
+    let mut removed = HashSet::new();
     let mut cursor = None;
+    let mut reached_delta_link = false;
     for _ in 0..100 {
         let response = send_authenticated_read(account_id, "sync messages", |access_token| {
             client.get(&url).bearer_auth(access_token)
@@ -500,9 +798,12 @@ async fn sync_from_delta(
             })?;
         for message in page.value {
             if message.removed.is_some() {
-                removed.push(message.id);
+                removed.insert(message.id.clone());
+                changed.remove(&message.id);
             } else {
-                changed.push(to_mail_message(message));
+                let mapped = to_mail_message(message);
+                removed.remove(&mapped.id);
+                changed.insert(mapped.id.clone(), mapped);
             }
         }
         if let Some(next) = page.next_link {
@@ -510,24 +811,37 @@ async fn sync_from_delta(
             continue;
         }
         cursor = page.delta_link;
+        reached_delta_link = cursor.is_some();
         break;
     }
+    if !reached_delta_link {
+        return Err(
+            "OUTLOOK_SYNC_INCOMPLETE: Microsoft Graph did not return a complete delta cursor"
+                .to_string(),
+        );
+    }
     let mut messages = cached_page.messages.clone();
-    let removed_set: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
-    messages.retain(|message| !removed_set.contains(message.id.as_str()));
-    let previous_ids: std::collections::HashSet<&str> =
-        messages.iter().map(|m| m.id.as_str()).collect();
+    messages.retain(|message| !removed.contains(&message.id));
+    let previous_ids: HashSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
     let new_message_count = changed
         .iter()
-        .filter(|message| !previous_ids.contains(message.id.as_str()))
+        .filter(|(id, _)| !previous_ids.contains(id.as_str()))
         .count();
-    for message in changed {
+    for message in changed.into_values() {
         if let Some(existing) = messages.iter_mut().find(|item| item.id == message.id) {
             *existing = message;
         } else {
             messages.push(message);
         }
     }
+    messages.sort_by(|left, right| {
+        right
+            .time
+            .cmp(&left.time)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let mut removed_message_ids = removed.into_iter().collect::<Vec<_>>();
+    removed_message_ids.sort();
     Ok(SyncResult {
         page: MessagePage {
             messages,
@@ -535,7 +849,7 @@ async fn sync_from_delta(
             history_id: cursor,
         },
         new_message_count,
-        removed_message_ids: removed,
+        removed_message_ids,
     })
 }
 
@@ -667,7 +981,7 @@ where
             .unwrap_or(1)
             .min(5);
         log::warn!("Microsoft Graph rate limit reached during {operation}; retrying once");
-        std::thread::sleep(Duration::from_secs(retry_after));
+        tokio::time::sleep(Duration::from_secs(retry_after)).await;
         response = build_request(&access_token).send().await.map_err(|error| {
             format!("Microsoft Graph {operation} rate-limit retry failed: {error}")
         })?;
@@ -681,6 +995,11 @@ where
 }
 
 async fn refresh_access_token(account_id: &str) -> Result<String, String> {
+    if let Some(access_token) = load_cached_access_token(account_id) {
+        return Ok(access_token);
+    }
+    let refresh_lock = access_token_refresh_lock(account_id)?;
+    let _refresh_guard = refresh_lock.lock().await;
     if let Some(access_token) = load_cached_access_token(account_id) {
         return Ok(access_token);
     }
@@ -785,6 +1104,11 @@ fn format_graph_error(status: StatusCode, body: &str, operation: &str) -> String
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
         return format!("OUTLOOK_RATE_LIMITED: Microsoft Graph {operation} was rate limited");
+    }
+    if status == StatusCode::GONE || code.eq_ignore_ascii_case("InvalidDeltaToken") {
+        return format!(
+            "OUTLOOK_DELTA_CURSOR_INVALID: Microsoft Graph delta cursor is no longer valid during {operation}"
+        );
     }
     if status.is_server_error() {
         return format!(
@@ -899,6 +1223,7 @@ fn is_valid_email_address(value: &str) -> bool {
     !local.is_empty() && !domain.is_empty() && !domain.contains('@')
 }
 
+#[allow(dead_code)]
 fn plain_text_to_html(value: &str) -> String {
     format!(
         "<!doctype html><html><body><div style=\"white-space:pre-wrap;overflow-wrap:anywhere\">{}</div></body></html>",
@@ -906,6 +1231,7 @@ fn plain_text_to_html(value: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -951,12 +1277,16 @@ mod tests {
             }),
             has_attachments: Some(false),
             received_date_time: Some("2026-09-08T12:00:00Z".to_string()),
+            last_modified_date_time: None,
             from: Some(GraphRecipient {
                 email_address: Some(GraphEmailAddress {
                     address: Some("sender@example.com".to_string()),
                     name: Some("Sender".to_string()),
                 }),
             }),
+            to_recipients: None,
+            cc_recipients: None,
+            bcc_recipients: None,
             body: Some(GraphBody {
                 content_type: Some("html".to_string()),
                 content: Some("<p>Hello</p>".to_string()),
@@ -989,5 +1319,16 @@ mod tests {
             format_graph_error(StatusCode::INTERNAL_SERVER_ERROR, "", "list messages")
                 .starts_with("OUTLOOK_TEMPORARY_ERROR:")
         );
+        assert!(format_graph_error(StatusCode::GONE, "", "sync messages")
+            .starts_with("OUTLOOK_DELTA_CURSOR_INVALID:"));
+        assert!(is_invalid_delta_error(
+            "OUTLOOK_DELTA_CURSOR_INVALID: stale cursor"
+        ));
+        assert!(is_invalid_delta_error(
+            "Microsoft Graph sync messages failed with HTTP 410"
+        ));
+        assert!(!is_invalid_delta_error(
+            "OUTLOOK_PERMISSION_REQUIRED: denied"
+        ));
     }
 }

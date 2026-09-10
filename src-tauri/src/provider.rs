@@ -122,6 +122,19 @@ pub trait MailProviderAdapter: Send + Sync {
 
     fn send_message<'a>(&'a self, request: SendRequest<'a>) -> ProviderFuture<'a, String>;
 
+    fn list_drafts<'a>(&'a self, account_id: &'a str) -> ProviderFuture<'a, Vec<DraftSummary>>;
+
+    fn get_draft<'a>(
+        &'a self,
+        account_id: &'a str,
+        draft_id: &'a str,
+    ) -> ProviderFuture<'a, MailDraft>;
+
+    fn save_draft<'a>(&'a self, request: DraftRequest<'a>) -> ProviderFuture<'a, MailDraft>;
+
+    fn delete_draft<'a>(&'a self, account_id: &'a str, draft_id: &'a str)
+        -> ProviderFuture<'a, ()>;
+
     fn sync_messages<'a>(
         &'a self,
         account_id: &'a str,
@@ -155,6 +168,62 @@ pub struct SendRequest<'a> {
     pub bcc: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
+    pub body_html: &'a str,
+    pub attachments: &'a [OutgoingAttachment],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftAttachment {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftSummary {
+    pub id: String,
+    pub subject: String,
+    pub recipient: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailDraft {
+    pub id: String,
+    pub subject: String,
+    pub recipient: String,
+    pub cc: String,
+    pub bcc: String,
+    pub body: String,
+    pub body_html: String,
+    pub attachments: Vec<DraftAttachment>,
+    pub updated_at: String,
+}
+
+pub struct DraftRequest<'a> {
+    pub account_id: &'a str,
+    pub draft_id: Option<&'a str>,
+    pub sender: &'a str,
+    pub recipient: &'a str,
+    pub cc: &'a str,
+    pub bcc: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub body_html: &'a str,
+    pub attachments: &'a [OutgoingAttachment],
 }
 
 struct GmailAdapter;
@@ -258,7 +327,33 @@ impl MailProviderAdapter for GmailAdapter {
             request.bcc,
             request.subject,
             request.body,
+            request.body_html,
+            request.attachments,
         ))
+    }
+
+    fn list_drafts<'a>(&'a self, account_id: &'a str) -> ProviderFuture<'a, Vec<DraftSummary>> {
+        Box::pin(gmail_mail::list_drafts(account_id))
+    }
+
+    fn get_draft<'a>(
+        &'a self,
+        account_id: &'a str,
+        draft_id: &'a str,
+    ) -> ProviderFuture<'a, MailDraft> {
+        Box::pin(gmail_mail::get_draft(account_id, draft_id))
+    }
+
+    fn save_draft<'a>(&'a self, request: DraftRequest<'a>) -> ProviderFuture<'a, MailDraft> {
+        Box::pin(gmail_mail::save_draft(request))
+    }
+
+    fn delete_draft<'a>(
+        &'a self,
+        account_id: &'a str,
+        draft_id: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(gmail_mail::delete_draft(account_id, draft_id))
     }
 
     fn sync_messages<'a>(
@@ -375,6 +470,30 @@ impl MailProviderAdapter for OutlookAdapter {
 
     fn send_message<'a>(&'a self, request: SendRequest<'a>) -> ProviderFuture<'a, String> {
         Box::pin(microsoft_mail::send_message(request))
+    }
+
+    fn list_drafts<'a>(&'a self, account_id: &'a str) -> ProviderFuture<'a, Vec<DraftSummary>> {
+        Box::pin(microsoft_mail::list_drafts(account_id))
+    }
+
+    fn get_draft<'a>(
+        &'a self,
+        account_id: &'a str,
+        draft_id: &'a str,
+    ) -> ProviderFuture<'a, MailDraft> {
+        Box::pin(microsoft_mail::get_draft(account_id, draft_id))
+    }
+
+    fn save_draft<'a>(&'a self, request: DraftRequest<'a>) -> ProviderFuture<'a, MailDraft> {
+        Box::pin(microsoft_mail::save_draft(request))
+    }
+
+    fn delete_draft<'a>(
+        &'a self,
+        account_id: &'a str,
+        draft_id: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(microsoft_mail::delete_draft(account_id, draft_id))
     }
 
     fn sync_messages<'a>(

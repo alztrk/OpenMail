@@ -20,7 +20,7 @@ OpenMail is a lightweight, self-hosted, local-first Windows mail client that kee
 
 ## Operating Context
 
-The application starts with Windows or on user request and can remain active in the system tray. Gmail is the first provider; Microsoft Live/Outlook follows. Synchronization runs at short intervals and produces a Windows notification when a new message is found.
+The application starts with Windows or on user request and can remain active in the system tray. Gmail and Microsoft Graph mailboxes share the same reading, composing, and synchronization surface. Synchronization runs at short intervals and produces a Windows notification when a new message is found.
 
 ## Capabilities and Constraints
 
@@ -29,7 +29,7 @@ The application starts with Windows or on user request and can remain active in 
 - No OpenMail backend or OpenMail-hosted mail storage.
 - Mail content and attachments are stored on the user's device.
 - OAuth 2.0 + PKCE; OpenMail never receives the user's mailbox password.
-- Gmail is the first provider.
+- Gmail and Microsoft Graph are the currently implemented providers.
 - The first MVP includes a unified inbox, reading, sending, replying, read/unread state, archive, delete, basic search, and Windows notifications.
 - Synchronization runs while the application or its tray service is active.
 - Without a publicly reachable provider push endpoint, notifications while the application is fully stopped are not guaranteed.
@@ -58,7 +58,7 @@ No real mailbox content or additional brand assets have been supplied. The inter
 - Mail metadata and loaded message pages use local JSON cache files.
 - Refresh tokens are stored in Windows Credential Manager.
 - HTML mail rendering, attachments, incremental synchronization, desktop notifications, tray controls, and launch-at-startup are implemented.
-- Outlook support remains planned and is not available in the current release.
+- Microsoft Graph support is implemented in source. Live-provider and portable-release verification remains part of release hardening.
 
 ## Accessibility & Inclusion
 

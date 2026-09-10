@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::{
     account_store, message_cache,
@@ -17,6 +17,16 @@ use crate::{
 pub struct AppState {
     pub app_data_dir: std::path::PathBuf,
     pub auth_state: Arc<Mutex<AuthState>>,
+}
+
+#[tauri::command]
+pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window is unavailable".to_string())?;
+    window
+        .hide()
+        .map_err(|error| format!("Could not hide the main window: {error}"))
 }
 
 impl AppState {
@@ -267,6 +277,8 @@ pub async fn send_message(
     bcc: String,
     subject: String,
     body: String,
+    body_html: String,
+    attachments: Vec<provider::OutgoingAttachment>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
@@ -279,8 +291,72 @@ pub async fn send_message(
             bcc: &bcc,
             subject: &subject,
             body: &body,
+            body_html: &body_html,
+            attachments: &attachments,
         })
         .await
+}
+
+#[tauri::command]
+pub async fn list_drafts(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<provider::DraftSummary>, String> {
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter.list_drafts(&account_id).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn get_draft(
+    account_id: String,
+    draft_id: String,
+    state: State<'_, AppState>,
+) -> Result<provider::MailDraft, String> {
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter.get_draft(&account_id, &draft_id).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn save_draft(
+    account_id: String,
+    sender: String,
+    draft_id: Option<String>,
+    recipient: String,
+    cc: String,
+    bcc: String,
+    subject: String,
+    body: String,
+    body_html: String,
+    attachments: Vec<provider::OutgoingAttachment>,
+    state: State<'_, AppState>,
+) -> Result<provider::MailDraft, String> {
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter
+        .save_draft(provider::DraftRequest {
+            account_id: &account_id,
+            draft_id: draft_id.as_deref(),
+            sender: &sender,
+            recipient: &recipient,
+            cc: &cc,
+            bcc: &bcc,
+            subject: &subject,
+            body: &body,
+            body_html: &body_html,
+            attachments: &attachments,
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn delete_draft(
+    account_id: String,
+    draft_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    adapter.delete_draft(&account_id, &draft_id).await
 }
 
 #[tauri::command]

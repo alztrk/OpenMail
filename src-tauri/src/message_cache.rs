@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +11,11 @@ use crate::models::{MailFolder, MailMessage, MessageAction, MessagePage};
 
 const MAX_SEARCH_CACHE_ENTRIES: usize = 20;
 const MAX_LOCAL_SEARCH_RESULTS: usize = 100;
+const SENT_CACHE_SCOPE: &str = "folder:SENT";
+
+type CacheLock = Arc<Mutex<()>>;
+
+static CACHE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, CacheLock>>> = OnceLock::new();
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CacheFile {
@@ -30,22 +40,22 @@ pub fn load_thread(
     if thread_id.trim().is_empty() {
         return Ok(None);
     }
-    let cache = read(data_dir)?;
-    let account_prefix = format!("{account_id}::");
-    let mut messages: Vec<MailMessage> = Vec::new();
-    for entry in cache.accounts {
-        if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix) {
-            continue;
-        }
-        for message in entry.page.messages {
-            if message.thread_id.as_deref() == Some(thread_id)
-                && !messages.iter().any(|cached| cached.id == message.id)
-            {
-                messages.push(message);
+    with_cache_lock(data_dir, || {
+        let cache = read(data_dir)?;
+        let account_prefix = format!("{account_id}::");
+        let mut messages: Vec<MailMessage> = Vec::new();
+        for entry in cache.accounts {
+            if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix) {
+                continue;
+            }
+            for message in entry.page.messages {
+                if message.thread_id.as_deref() == Some(thread_id) {
+                    upsert_message(&mut messages, message);
+                }
             }
         }
-    }
-    Ok((!messages.is_empty()).then_some(messages))
+        Ok((!messages.is_empty()).then_some(messages))
+    })
 }
 
 pub fn load_scope(
@@ -53,13 +63,15 @@ pub fn load_scope(
     account_id: &str,
     scope: Option<&str>,
 ) -> Result<Option<MessagePage>, String> {
-    let cache = read(data_dir)?;
-    let cache_key = cache_key(account_id, scope);
-    Ok(cache
-        .accounts
-        .into_iter()
-        .find(|entry| entry.account_id == cache_key)
-        .map(|entry| entry.page))
+    with_cache_lock(data_dir, || {
+        let cache = read(data_dir)?;
+        let cache_key = cache_key(account_id, scope);
+        Ok(cache
+            .accounts
+            .into_iter()
+            .find(|entry| entry.account_id == cache_key)
+            .map(|entry| entry.page))
+    })
 }
 
 pub fn search_cached_messages(
@@ -72,33 +84,28 @@ pub fn search_cached_messages(
         return Err("Search query is too short".to_string());
     }
 
-    let cache = read(data_dir)?;
-    let account_prefix = format!("{account_id}::");
-    let mut messages = Vec::new();
-    for entry in cache.accounts {
-        if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix) {
-            continue;
-        }
-        for message in entry.page.messages {
-            if !message_contains_query(&message, &query) {
+    with_cache_lock(data_dir, || {
+        let cache = read(data_dir)?;
+        let account_prefix = format!("{account_id}::");
+        let mut messages = Vec::new();
+        for entry in cache.accounts {
+            if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix) {
                 continue;
             }
-            if messages
-                .iter()
-                .any(|cached: &MailMessage| cached.id == message.id)
-            {
-                continue;
+            for message in entry.page.messages {
+                if message_contains_query(&message, &query) {
+                    upsert_message(&mut messages, message);
+                }
             }
-            messages.push(message);
         }
-    }
 
-    messages.sort_by(|left, right| right.time.cmp(&left.time));
-    messages.truncate(MAX_LOCAL_SEARCH_RESULTS);
-    Ok(MessagePage {
-        messages,
-        next_page_token: None,
-        history_id: None,
+        messages.sort_by(|left, right| right.time.cmp(&left.time));
+        messages.truncate(MAX_LOCAL_SEARCH_RESULTS);
+        Ok(MessagePage {
+            messages,
+            next_page_token: None,
+            history_id: None,
+        })
     })
 }
 
@@ -130,59 +137,70 @@ pub fn save_page_with_scope(
     append: bool,
     scope: Option<&str>,
 ) -> Result<MessagePage, String> {
+    with_cache_lock(data_dir, || {
+        save_page_with_scope_locked(data_dir, account_id, page, append, scope)
+    })
+}
+
+fn save_page_with_scope_locked(
+    data_dir: &Path,
+    account_id: &str,
+    page: MessagePage,
+    append: bool,
+    scope: Option<&str>,
+) -> Result<MessagePage, String> {
     let mut cache = read(data_dir)?;
+    let merged_page = merge_page_into_cache(&mut cache, account_id, page, append, scope);
+    write(data_dir, &cache)?;
+    Ok(merged_page)
+}
+
+fn merge_page_into_cache(
+    cache: &mut CacheFile,
+    account_id: &str,
+    page: MessagePage,
+    append: bool,
+    scope: Option<&str>,
+) -> MessagePage {
     let cache_key = cache_key(account_id, scope);
     let is_search_scope = scope
         .map(|value| value.starts_with("search:"))
         .unwrap_or(false);
-    let had_existing_entry = cache
+    let existing_page = cache
         .accounts
         .iter()
-        .any(|entry| entry.account_id == cache_key);
-    let mut merged_page = if append {
-        if let Some(entry) = cache
-            .accounts
-            .iter_mut()
-            .find(|entry| entry.account_id == cache_key)
-        {
-            let mut messages = entry.page.messages.clone();
-            for message in page.messages {
-                if let Some(existing) = messages.iter_mut().find(|item| item.id == message.id) {
-                    let existing_details = existing.clone();
-                    *existing = merge_message_details(&existing_details, &message);
-                } else {
-                    messages.push(message);
-                }
-            }
-            MessagePage {
-                messages,
-                next_page_token: page
-                    .next_page_token
-                    .or_else(|| entry.page.next_page_token.clone()),
-                history_id: page.history_id.or_else(|| entry.page.history_id.clone()),
-            }
-        } else {
-            page
-        }
-    } else {
-        page
-    };
+        .find(|entry| entry.account_id == cache_key)
+        .map(|entry| entry.page.clone());
+    let had_existing_entry = existing_page.is_some();
+    let mut merged_page = page;
 
-    if !append {
-        if let Some(entry) = cache
-            .accounts
-            .iter()
-            .find(|entry| entry.account_id == cache_key)
-        {
+    if let Some(existing_page) = existing_page.as_ref() {
+        if append {
+            let mut messages = existing_page.messages.clone();
+            let preserve_sent_token = is_sent_detail_append(&merged_page, scope);
+            for message in std::mem::take(&mut merged_page.messages) {
+                upsert_message(&mut messages, message);
+            }
+            merged_page = MessagePage {
+                messages,
+                next_page_token: if preserve_sent_token {
+                    existing_page.next_page_token.clone()
+                } else {
+                    merged_page.next_page_token
+                },
+                history_id: merged_page
+                    .history_id
+                    .clone()
+                    .or_else(|| existing_page.history_id.clone()),
+            };
+        } else {
             for message in &mut merged_page.messages {
-                if let Some(existing) = entry
-                    .page
+                if let Some(existing) = existing_page
                     .messages
                     .iter()
                     .find(|item| item.id == message.id)
                 {
-                    let existing_details = existing.clone();
-                    *message = merge_message_details(&existing_details, message);
+                    *message = merge_message_details(existing, message);
                 }
             }
         }
@@ -222,12 +240,29 @@ pub fn save_page_with_scope(
             cache.accounts.remove(index);
         }
     }
-    write(data_dir, &cache)?;
-    Ok(merged_page)
+    merged_page
 }
 
 fn merge_message_details(existing: &MailMessage, incoming: &MailMessage) -> MailMessage {
     let mut merged = incoming.clone();
+    if merged.thread_id.is_none() {
+        merged.thread_id = existing.thread_id.clone();
+    }
+    if merged.message_id_header.is_none() {
+        merged.message_id_header = existing.message_id_header.clone();
+    }
+    if merged.sender.is_empty() {
+        merged.sender = existing.sender.clone();
+    }
+    if merged.address.is_empty() {
+        merged.address = existing.address.clone();
+    }
+    if merged.subject.is_empty() {
+        merged.subject = existing.subject.clone();
+    }
+    if merged.preview.is_empty() {
+        merged.preview = existing.preview.clone();
+    }
     if merged.body.is_empty() {
         merged.body = existing.body.clone();
     }
@@ -244,38 +279,69 @@ fn merge_message_details(existing: &MailMessage, incoming: &MailMessage) -> Mail
     merged
 }
 
+fn upsert_message(messages: &mut Vec<MailMessage>, incoming: MailMessage) {
+    if let Some(existing) = messages.iter_mut().find(|item| item.id == incoming.id) {
+        *existing = merge_message_details(existing, &incoming);
+    } else {
+        messages.push(incoming);
+    }
+}
+
+fn is_sent_detail_append(page: &MessagePage, scope: Option<&str>) -> bool {
+    scope == Some(SENT_CACHE_SCOPE)
+        && page.next_page_token.is_none()
+        && page.messages.len() == 1
+        && page.messages.first().is_some_and(is_hydrated_message)
+}
+
+fn is_hydrated_message(message: &MailMessage) -> bool {
+    !message.body.is_empty() || message.body_html.is_some() || !message.attachments.is_empty()
+}
+
 pub fn save_sync(
     data_dir: &Path,
     account_id: &str,
     page: MessagePage,
     removed_message_ids: &[String],
 ) -> Result<MessagePage, String> {
-    let existing_page = load(data_dir, account_id)?.unwrap_or(MessagePage {
-        messages: Vec::new(),
-        next_page_token: None,
-        history_id: None,
-    });
-    let removed_ids: std::collections::HashSet<&str> =
-        removed_message_ids.iter().map(String::as_str).collect();
-    let incoming_ids: std::collections::HashSet<String> = page
-        .messages
-        .iter()
-        .map(|message| message.id.clone())
-        .collect();
-    let mut messages = page.messages;
-    messages.extend(existing_page.messages.into_iter().filter(|message| {
-        !incoming_ids.contains(&message.id) && !removed_ids.contains(message.id.as_str())
-    }));
-    save_page(
-        data_dir,
-        account_id,
-        MessagePage {
-            messages,
-            next_page_token: page.next_page_token,
-            history_id: page.history_id,
-        },
-        false,
-    )
+    with_cache_lock(data_dir, || {
+        let existing_page = read(data_dir)?
+            .accounts
+            .into_iter()
+            .find(|entry| entry.account_id == account_id)
+            .map(|entry| entry.page)
+            .unwrap_or(MessagePage {
+                messages: Vec::new(),
+                next_page_token: None,
+                history_id: None,
+            });
+        let removed_ids: std::collections::HashSet<&str> =
+            removed_message_ids.iter().map(String::as_str).collect();
+        let MessagePage {
+            messages: incoming_messages,
+            next_page_token,
+            history_id,
+        } = page;
+        let incoming_ids: std::collections::HashSet<String> = incoming_messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
+        let mut messages = incoming_messages;
+        messages.extend(existing_page.messages.into_iter().filter(|message| {
+            !incoming_ids.contains(&message.id) && !removed_ids.contains(message.id.as_str())
+        }));
+        save_page_with_scope_locked(
+            data_dir,
+            account_id,
+            MessagePage {
+                messages,
+                next_page_token,
+                history_id,
+            },
+            false,
+            None,
+        )
+    })
 }
 
 pub fn update_message(
@@ -294,52 +360,67 @@ pub fn update_messages(
     if messages.is_empty() {
         return Ok(());
     }
-    let mut cache = read(data_dir)?;
-    let account_prefix = format!("{account_id}::");
-    let mut new_messages = Vec::new();
-    for message in messages {
-        let mut updated = false;
-        for entry in &mut cache.accounts {
-            if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix) {
-                continue;
+    with_cache_lock(data_dir, || {
+        let mut cache = read(data_dir)?;
+        let account_prefix = format!("{account_id}::");
+        let mut new_messages = Vec::new();
+        for message in messages {
+            let mut updated = false;
+            for entry in &mut cache.accounts {
+                if entry.account_id != account_id && !entry.account_id.starts_with(&account_prefix)
+                {
+                    continue;
+                }
+                if let Some(cached_message) = entry
+                    .page
+                    .messages
+                    .iter_mut()
+                    .find(|item| item.id == message.id)
+                {
+                    *cached_message = merge_message_details(cached_message, &message);
+                    updated = true;
+                }
             }
-            if let Some(cached_message) = entry
-                .page
-                .messages
+            if !updated {
+                new_messages.push(message);
+            }
+        }
+        if !new_messages.is_empty() {
+            if let Some(entry) = cache
+                .accounts
                 .iter_mut()
-                .find(|item| item.id == message.id)
+                .find(|entry| entry.account_id == account_id)
             {
-                *cached_message = message.clone();
-                updated = true;
+                for message in new_messages {
+                    upsert_message(&mut entry.page.messages, message);
+                }
+            } else {
+                cache.accounts.push(CachedAccountMessages {
+                    account_id: account_id.to_string(),
+                    page: MessagePage {
+                        messages: new_messages,
+                        next_page_token: None,
+                        history_id: None,
+                    },
+                });
             }
         }
-        if !updated {
-            new_messages.push(message);
-        }
-    }
-    if !new_messages.is_empty() {
-        if let Some(entry) = cache
-            .accounts
-            .iter_mut()
-            .find(|entry| entry.account_id == account_id)
-        {
-            entry.page.messages.extend(new_messages);
-        } else {
-            cache.accounts.push(CachedAccountMessages {
-                account_id: account_id.to_string(),
-                page: MessagePage {
-                    messages: new_messages,
-                    next_page_token: None,
-                    history_id: None,
-                },
-            });
-        }
-    }
-    write(data_dir, &cache)?;
-    Ok(())
+        write(data_dir, &cache)
+    })
 }
 
 pub fn apply_message_action(
+    data_dir: &Path,
+    account_id: &str,
+    message_id: &str,
+    action: MessageAction,
+) -> Result<(), String> {
+    with_cache_lock(data_dir, || {
+        apply_message_action_locked(data_dir, account_id, message_id, action)
+    })
+}
+
+fn apply_message_action_locked(
     data_dir: &Path,
     account_id: &str,
     message_id: &str,
@@ -439,6 +520,10 @@ pub fn apply_message_action(
 }
 
 pub fn remove_account(data_dir: &Path, account_id: &str) -> Result<(), String> {
+    with_cache_lock(data_dir, || remove_account_locked(data_dir, account_id))
+}
+
+fn remove_account_locked(data_dir: &Path, account_id: &str) -> Result<(), String> {
     let mut cache = read(data_dir)?;
     cache.accounts.retain(|entry| {
         entry.account_id != account_id && !entry.account_id.starts_with(&format!("{account_id}::"))
@@ -455,6 +540,26 @@ fn cache_key(account_id: &str, scope: Option<&str>) -> String {
 
 fn path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("messages-cache.json")
+}
+
+fn with_cache_lock<T, F>(data_dir: &Path, operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    let locks = CACHE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut cache_locks = locks
+            .lock()
+            .map_err(|_| "The message cache lock is poisoned".to_string())?;
+        cache_locks
+            .entry(path(data_dir))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock
+        .lock()
+        .map_err(|_| "The message cache lock is poisoned".to_string())?;
+    operation()
 }
 
 fn read(data_dir: &Path) -> Result<CacheFile, String> {
@@ -693,6 +798,93 @@ mod tests {
 
         assert_eq!(merged_page.next_page_token.as_deref(), Some("next-page"));
         assert_eq!(merged_page.messages.len(), 2);
+        fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn appending_a_final_page_clears_the_previous_paging_token() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-cache-exhausted-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        save_page_with_scope(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![message("first page")],
+                next_page_token: Some("next-page".to_string()),
+                history_id: None,
+            },
+            false,
+            Some("folder:SPAM"),
+        )
+        .expect("initial folder cache should save");
+
+        let merged_page = save_page_with_scope(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![message("final page")],
+                next_page_token: None,
+                history_id: None,
+            },
+            true,
+            Some("folder:SPAM"),
+        )
+        .expect("final folder page should save");
+
+        assert!(merged_page.next_page_token.is_none());
+        assert_eq!(
+            load_scope(&data_dir, account_id, Some("folder:SPAM"))
+                .expect("folder cache should load")
+                .expect("folder cache should exist")
+                .next_page_token,
+            None
+        );
+        fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn serializes_concurrent_cache_writes_for_one_cache_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir =
+            std::env::temp_dir().join(format!("openmail-cache-concurrency-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        let workers = (0..8)
+            .map(|index| {
+                let data_dir = data_dir.clone();
+                std::thread::spawn(move || {
+                    let mut cached_message = message(&format!("message-{index}"));
+                    cached_message.id = format!("message-{index}");
+                    save_page_with_scope(
+                        &data_dir,
+                        account_id,
+                        MessagePage {
+                            messages: vec![cached_message],
+                            next_page_token: None,
+                            history_id: None,
+                        },
+                        true,
+                        Some("folder:SENT"),
+                    )
+                    .expect("concurrent cache write should succeed");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("cache worker should finish");
+        }
+
+        let page = load_scope(&data_dir, account_id, Some("folder:SENT"))
+            .expect("Sent cache should load")
+            .expect("Sent cache should exist");
+        assert_eq!(page.messages.len(), 8);
         fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
     }
 

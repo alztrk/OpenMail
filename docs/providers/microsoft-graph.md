@@ -2,13 +2,13 @@
 
 ## Scope
 
-Add support for Outlook.com, Hotmail, Live, and Microsoft 365 mailboxes through Microsoft Graph. This is the first provider-specific milestone after Gmail because one adapter covers both personal Microsoft accounts and work or school accounts.
+Support Outlook.com, Hotmail, Live, and Microsoft 365 mailboxes through Microsoft Graph. One adapter covers both personal Microsoft accounts and work or school accounts.
 
-Status: implemented in the Rust adapter. Initial release requires a Microsoft Entra public client ID at build time. Priority: P1.
+Status: implemented in the Rust adapter. Initial release requires a Microsoft Entra public client ID at build time. Live-provider and portable-release verification remain release checks. Priority: P1.
 
 ## Provider capabilities
 
-Microsoft Graph represents messages inside mail folders and provides delegated access for the signed-in user. The planned OpenMail surface is:
+Microsoft Graph represents messages inside mail folders and provides delegated access for the signed-in user. The OpenMail surface is:
 
 - List folders and messages.
 - Read full text or HTML message bodies and attachments.
@@ -81,13 +81,15 @@ Use `$select` for list rows and fetch the full body only for the selected messag
 
 Graph delta is a per-folder operation. The initial sync should enumerate the mailbox folders, then run a full delta round for Inbox and the folders OpenMail exposes. Persist the returned `@odata.nextLink` while a round is incomplete and persist `@odata.deltaLink` when the round finishes.
 
-The adapter initializes and persists the Microsoft Graph Inbox delta link in the local message cache. Subsequent syncs follow the provider-issued delta cursor and apply changed and removed message entries without refreshing the complete Inbox. Subsequent implementation work should:
+The adapter initializes and persists the Microsoft Graph Inbox delta link in the local message cache. Subsequent syncs follow the provider-issued delta cursor and apply changed and removed message entries without refreshing the complete Inbox. If Graph invalidates an old cursor, the adapter starts a fresh delta round and keeps the existing cache until that round succeeds.
 
 - Reuse the saved delta link for each folder.
 - Apply additions, updates, and deletions transactionally to the local cache.
 - Fetch full message content lazily when the user opens a message.
 - Refresh the visible folder immediately after a user action.
 - Poll while the app or tray service is active because Graph change notifications require a reachable notification URL and OpenMail has no backend.
+
+Small Outlook attachments are sent inline. The current compose limit is under 3 MB per file and in total; larger files require the Graph upload-session flow and remain a separate follow-up capability.
 
 The adapter must verify whether the selected Graph id remains stable after a move. If the default id changes, use Graph's immutable id support or store a provider-native id mapping before finalizing the cache contract. Do not silently treat a new id as a new message.
 
@@ -96,6 +98,7 @@ The adapter must verify whether the selected Graph id remains stable after a mov
 - `401`: refresh the access token once, retry the original request once, then expose a reconnect state.
 - `403`: expose missing delegated permission or organization consent, not a generic network error.
 - `404`: invalidate the local message or folder reference and run a targeted delta refresh.
+- `410` or `InvalidDeltaToken`: discard the stale cursor and start a fresh delta round without treating existing cached mail as lost.
 - `429`: honor `Retry-After` and keep the cached view visible.
 - `5xx` and transport errors: retain cache, apply bounded retry backoff, and show sync status.
 - Unsupported shared mailboxes: keep them outside the initial scope unless the required shared permissions are explicitly implemented.
@@ -113,7 +116,7 @@ The adapter must verify whether the selected Graph id remains stable after a mov
 - A personal Outlook.com or Hotmail account can authorize without a client secret when the public client ID is configured at build time.
 - A Microsoft 365 account can authorize when tenant consent permits the delegated scopes.
 - The Inbox renders from cache before the refresh completes.
-- The Inbox adapter uses a persisted Graph delta cursor and applies additions, updates, and removals incrementally.
+- The Inbox adapter uses a persisted Graph delta cursor and applies additions, updates, and removals incrementally. Invalid cursors trigger a fresh round; throttling behavior and portable-release verification remain release-hardening work.
 - HTML bodies, plain text bodies, and attachments render correctly.
 - Read/unread, move, delete, send, and reply update both the provider and local cache.
 - Token expiration, missing consent, throttling, invalid cursors, and offline mode have distinct recoverable states.

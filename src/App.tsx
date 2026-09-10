@@ -1,7 +1,7 @@
 import { type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode, type RefObject, type UIEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
-import { IconAlertTriangle, IconChevronDown, IconDownload, IconInbox, IconMaximize, IconMinus, IconPaperclip, IconPencil, IconRefresh, IconSearch, IconSend, IconSettings, IconStar, IconTrash, IconX, IconRestore } from '@tabler/icons-react'
+import { IconAlertTriangle, IconChevronDown, IconDownload, IconFileText, IconInbox, IconMaximize, IconMinus, IconPaperclip, IconPencil, IconRefresh, IconSearch, IconSend, IconSettings, IconStar, IconTrash, IconX, IconRestore } from '@tabler/icons-react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
@@ -21,6 +21,10 @@ import { ReaderToolbar } from '@/components/mail/reader-toolbar'
 import { ReplyComposer } from '@/components/mail/reply-composer'
 import { ThreadMessageCard } from '@/components/mail/thread-message-card'
 import { ComposeForm } from '@/components/mail/compose-form'
+import type { ComposeAttachment } from '@/components/mail/attachment-dropzone'
+import { DraftsPanel, type DraftListItem } from '@/components/mail/drafts-panel'
+import type { SavedRecipient } from '@/components/mail/recipient-input'
+import { loadSavedRecipients, saveRecipient } from '@/lib/saved-recipients'
 import { Toast } from '@/components/ui/toast'
 import { Dialog } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -88,6 +92,11 @@ type MailAttachment = {
   size: number
 }
 
+const attachmentLimits = {
+  gmail: { maxFileSize: 25 * 1024 * 1024, maxTotalSize: 25 * 1024 * 1024 },
+  outlook: { maxFileSize: 3 * 1024 * 1024, maxTotalSize: 3 * 1024 * 1024 },
+} as const
+
 type MessagePage = {
   messages: MailMessage[]
   next_page_token: string | null
@@ -99,23 +108,19 @@ type SyncResult = {
   new_message_count: number
 }
 
-type AccountSyncStatus = 'idle' | 'syncing' | 'error'
-
-type ComposeDraft = {
-  recipient: string
-  cc?: string
-  bcc?: string
+type MailDraft = {
+  id: string
   subject: string
+  recipient: string
+  cc: string
+  bcc: string
   body: string
+  bodyHtml: string
+  attachments: ComposeAttachment[]
+  updatedAt: string
 }
 
-function isComposeDraft(value: unknown): value is ComposeDraft {
-  if (typeof value !== 'object' || value === null) return false
-  const draft = value as Record<string, unknown>
-  return typeof draft.recipient === 'string'
-    && typeof draft.subject === 'string'
-    && typeof draft.body === 'string'
-}
+type AccountSyncStatus = 'idle' | 'syncing' | 'error'
 
 function isQuietHours(settings: AppSettings): boolean {
   if (!settings.quietHoursEnabled) return false
@@ -146,7 +151,7 @@ function formatFileSize(size: number): string {
 }
 
 function formatMessageTime(value: string, settings: AppSettings, locale: string): string {
-  const date = new Date(value)
+  const date = new Date(/^\d+$/.test(value) ? Number(value) : value)
   if (Number.isNaN(date.getTime())) return value
   const dateStyle = settings.dateFormat === 'short' ? 'short' : settings.dateFormat === 'long' ? 'long' : undefined
   return new Intl.DateTimeFormat(locale, {
@@ -219,11 +224,13 @@ const providerLogos = {
   outlook: outlookLogo,
 } as const
 
-const foregroundSyncIntervalMs = 30000
-const backgroundSyncIntervalMs = 120000
+const foregroundSyncIntervalMs = 15000
+const backgroundSyncIntervalMs = 60000
 
 type WindowHeaderProps = {
   onRequestClose: () => void
+  onWindowActionError: (error: unknown) => void
+  onHideToTray: () => Promise<void>
   minimizeToTray: boolean
   searchQuery: string
   searchDisabled: boolean
@@ -238,7 +245,7 @@ type WindowHeaderProps = {
   children?: ReactNode
 }
 
-function WindowHeader({ onRequestClose, minimizeToTray, searchQuery, searchDisabled, searchLabel, searchCompactLabel, searchOpen, searchInputRef, onSearchQueryChange, onSearchFocus, onSearchKeyDown, onClearSearch, children }: WindowHeaderProps) {
+function WindowHeader({ onRequestClose, onWindowActionError, onHideToTray, minimizeToTray, searchQuery, searchDisabled, searchLabel, searchCompactLabel, searchOpen, searchInputRef, onSearchQueryChange, onSearchFocus, onSearchKeyDown, onClearSearch, children }: WindowHeaderProps) {
   const { t } = useTranslation()
   const [isMaximized, setIsMaximized] = useState(false)
 
@@ -257,7 +264,7 @@ function WindowHeader({ onRequestClose, minimizeToTray, searchQuery, searchDisab
     if (!isTauriRuntime()) return
     const window = getCurrentWindow()
     if (minimizeToTray) {
-      await window.hide()
+      await onHideToTray()
       return
     }
     await window.minimize()
@@ -286,10 +293,10 @@ function WindowHeader({ onRequestClose, minimizeToTray, searchQuery, searchDisab
         </div>
       </div>
       <div className="window-controls" data-tauri-drag-region="false">
-        <button className="window-control" type="button" aria-label={t('minimize')} title={t('minimize')} disabled={!isTauriRuntime()} onClick={() => void minimize()}>
+        <button className="window-control" type="button" aria-label={t('minimize')} title={t('minimize')} disabled={!isTauriRuntime()} onClick={() => { void minimize().catch(onWindowActionError) }}>
           <IconMinus aria-hidden="true" size={16} stroke={1.8} />
         </button>
-        <button className="window-control" type="button" aria-label={t(isMaximized ? 'restore' : 'maximize')} title={t(isMaximized ? 'restore' : 'maximize')} disabled={!isTauriRuntime()} onClick={() => void toggleMaximize()}>
+        <button className="window-control" type="button" aria-label={t(isMaximized ? 'restore' : 'maximize')} title={t(isMaximized ? 'restore' : 'maximize')} disabled={!isTauriRuntime()} onClick={() => { void toggleMaximize().catch(onWindowActionError) }}>
           {isMaximized ? <IconRestore aria-hidden="true" size={15} stroke={1.8} /> : <IconMaximize aria-hidden="true" size={15} stroke={1.8} />}
         </button>
         <button className="window-control close-control" type="button" aria-label={t('close')} title={t('close')} disabled={!isTauriRuntime()} onClick={onRequestClose}>
@@ -386,9 +393,12 @@ function App() {
     if (message.startsWith('AUTH_REQUIRED:')) return t('gmailReauthorizationRequired')
     if (message.startsWith('GMAIL_CLIENT_CONFIG:')) return t('gmailClientConfigurationRequired')
     if (message.startsWith('GMAIL_PERMISSION_REQUIRED:')) return t('gmailPermissionRequired')
+    if (message.startsWith('GMAIL_SYNC_INCOMPLETE:')) return t('gmailSyncIncomplete')
+    if (message.startsWith('GMAIL_DRAFTS_INCOMPLETE:')) return t('gmailDraftsIncomplete')
     if (message.startsWith('GMAIL_RATE_LIMITED:')) return t('gmailRateLimited')
     if (message.startsWith('OUTLOOK_REAUTH_REQUIRED:')) return t('outlookReauthorizationRequired')
     if (message.startsWith('OUTLOOK_PERMISSION_REQUIRED:')) return t('outlookPermissionRequired')
+    if (message.startsWith('OUTLOOK_SYNC_INCOMPLETE:')) return t('outlookSyncIncomplete')
     if (message.startsWith('OUTLOOK_RATE_LIMITED:')) return t('outlookRateLimited')
     if (message.startsWith('OUTLOOK_TEMPORARY_ERROR:')) return t('outlookTemporaryError')
     if (message === 'EMPTY_CONVERSATION') return t('emptyConversation')
@@ -437,6 +447,13 @@ function App() {
   const [settings, setSettings] = useState<AppSettings>(loadSettings)
   const [defaultAccountId, setDefaultAccountId] = useState('')
   const [toastMessage, setToastMessage] = useState('')
+  const handleWindowActionError = useCallback((error: unknown) => {
+    setToastMessage(getDisplayError(error))
+  }, [getDisplayError, setToastMessage])
+  const hideToTray = useCallback(async () => {
+    if (!isTauriRuntime()) return
+    await invoke('hide_main_window')
+  }, [])
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [pendingPermanentDeleteId, setPendingPermanentDeleteId] = useState<string | null>(null)
   const [pendingArchiveId, setPendingArchiveId] = useState<string | null>(null)
@@ -450,26 +467,34 @@ function App() {
   const [composeBcc, setComposeBcc] = useState('')
   const [composeSubject, setComposeSubject] = useState('')
   const [composeBody, setComposeBody] = useState('')
+  const [composeBodyHtml, setComposeBodyHtml] = useState('')
+  const [composeAttachments, setComposeAttachments] = useState<ComposeAttachment[]>([])
   const [draftStatus, setDraftStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
+  const [composeAccountId, setComposeAccountId] = useState<string | null>(null)
+  const [composeDraftId, setComposeDraftId] = useState<string | null>(null)
+  const [composeDrafts, setComposeDrafts] = useState<DraftListItem[]>([])
+  const [isDraftsPanelOpen, setIsDraftsPanelOpen] = useState(false)
+  const [isLoadingDrafts, setIsLoadingDrafts] = useState(false)
+  const [savedRecipients, setSavedRecipients] = useState<SavedRecipient[]>(loadSavedRecipients)
   const [isSendingMessage, setIsSendingMessage] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [messageActionInFlightId, setMessageActionInFlightId] = useState<string | null>(null)
   const [providerCapabilities, setProviderCapabilities] = useState<ProviderCapabilities | null>(null)
   const [providerCapabilitiesAccountId, setProviderCapabilitiesAccountId] = useState<string | null>(null)
-  const syncInFlightRef = useRef(false)
+  const syncInFlightAccountsRef = useRef(new Set<string>())
   const searchInputRef = useRef<HTMLInputElement>(null)
   const suppressSearchFocusRef = useRef(false)
   const searchRequestIdRef = useRef(0)
   const allowWindowCloseRef = useRef(false)
   const [isCloseConfirmationOpen, setIsCloseConfirmationOpen] = useState(false)
-  const composeDraftStorageKey = activeAccountId ? `openmail.compose-draft.${activeAccountId}` : null
   const activeProviderCapabilities = providerCapabilitiesAccountId === activeAccountId ? providerCapabilities : null
+  const composeOpenSequenceRef = useRef(0)
 
-  const updateComposeRecipient = (value: string) => { setComposeRecipient(value); setDraftStatus('saving') }
-  const updateComposeCc = (value: string) => { setComposeCc(value); setDraftStatus('saving') }
-  const updateComposeBcc = (value: string) => { setComposeBcc(value); setDraftStatus('saving') }
-  const updateComposeSubject = (value: string) => { setComposeSubject(value); setDraftStatus('saving') }
-  const updateComposeBody = (value: string) => { setComposeBody(value); setDraftStatus('saving') }
+  const updateComposeRecipient = (value: string) => { setComposeRecipient(value); setDraftStatus('idle') }
+  const updateComposeCc = (value: string) => { setComposeCc(value); setDraftStatus('idle') }
+  const updateComposeBcc = (value: string) => { setComposeBcc(value); setDraftStatus('idle') }
+  const updateComposeSubject = (value: string) => { setComposeSubject(value); setDraftStatus('idle') }
+  const updateComposeBody = (value: string) => { setComposeBody(value); setDraftStatus('idle') }
 
   const selectableMessages = useMemo(
     () => activeView === 'mail'
@@ -516,21 +541,6 @@ function App() {
   useEffect(() => {
     selectableMessagesRef.current = selectableMessages
   }, [selectableMessages])
-
-  useEffect(() => {
-    if (!isComposing || !composeDraftStorageKey) return
-    const draft = { recipient: composeRecipient, cc: composeCc, bcc: composeBcc, subject: composeSubject, body: composeBody }
-    const timeoutId = window.setTimeout(() => {
-      if (!draft.recipient.trim() && !draft.subject.trim() && !draft.body.trim()) {
-        window.localStorage.removeItem(composeDraftStorageKey)
-        setDraftStatus('saved')
-        return
-      }
-      window.localStorage.setItem(composeDraftStorageKey, JSON.stringify(draft))
-      setDraftStatus('saved')
-    }, 250)
-    return () => window.clearTimeout(timeoutId)
-  }, [composeBcc, composeBody, composeCc, composeDraftStorageKey, composeRecipient, composeSubject, isComposing])
 
   const loadAccounts = useCallback(() => {
     if (!isTauriRuntime()) return
@@ -617,9 +627,10 @@ function App() {
       return
     }
     let cancelled = false
+    let networkSyncCompleted = false
     void invoke<MessagePage | null>('get_cached_messages', { accountId: activeAccountId })
       .then((cachedPage) => {
-        if (cancelled || !cachedPage) return
+        if (cancelled || networkSyncCompleted || !cachedPage) return
         setMessages(cachedPage.messages)
         setNextPageToken(cachedPage.next_page_token)
         setMessagesAccountId(activeAccountId)
@@ -632,72 +643,112 @@ function App() {
           setToastMessage(getDisplayError(error))
         }
       })
-    void invoke<SyncResult>('sync_messages', { accountId: activeAccountId })
+    const requestedAccountId = activeAccountId
+    const shouldStartSync = !syncInFlightAccountsRef.current.has(requestedAccountId)
+    if (!shouldStartSync) return () => { cancelled = true }
+    syncInFlightAccountsRef.current.add(requestedAccountId)
+    void invoke<SyncResult>('sync_messages', { accountId: requestedAccountId })
       .then(({ page }) => {
-        setAccountSyncStatus((current) => ({ ...current, [activeAccountId]: 'idle' }))
         if (cancelled) return
+        networkSyncCompleted = true
+        setAccountSyncStatus((current) => ({ ...current, [requestedAccountId]: 'idle' }))
         setMessages((current) => mergeMessageLists(current, page.messages))
         setNextPageToken(page.next_page_token)
-        setMessagesAccountId(activeAccountId)
+        setMessagesAccountId(requestedAccountId)
         setMailboxLoadError(false)
       })
       .catch((error: unknown) => {
-        setAccountSyncStatus((current) => ({ ...current, [activeAccountId]: 'error' }))
+        setAccountSyncStatus((current) => ({ ...current, [requestedAccountId]: 'error' }))
         if (!cancelled) {
           setMailboxLoadError(true)
           setToastMessage(getDisplayError(error))
         }
       })
-      .finally(() => { if (!cancelled) setIsLoadingMessages(false) })
+      .finally(() => {
+        syncInFlightAccountsRef.current.delete(requestedAccountId)
+        if (!cancelled) setIsLoadingMessages(false)
+      })
     return () => { cancelled = true }
   }, [activeAccountId, activeView, getDisplayError])
 
   useEffect(() => {
     if (accounts.length === 0) return
     let cancelled = false
+    let nativeWindowFocused = true
     const sync = () => {
-      if (syncInFlightRef.current) return
-      syncInFlightRef.current = true
-      setAccountSyncStatus((current) => accounts.reduce((next, account) => ({ ...next, [account.id]: 'syncing' as const }), current))
-      void Promise.allSettled(accounts.map((account) => invoke<SyncResult>('sync_messages', { accountId: account.id })))
+      const accountsToSync = accounts.filter((account) => !syncInFlightAccountsRef.current.has(account.id))
+      if (accountsToSync.length === 0) return
+      accountsToSync.forEach((account) => syncInFlightAccountsRef.current.add(account.id))
+      setAccountSyncStatus((current) => accountsToSync.reduce((next, account) => ({ ...next, [account.id]: 'syncing' as const }), current))
+      void Promise.allSettled(accountsToSync.map((account) => invoke<SyncResult>('sync_messages', { accountId: account.id })))
         .then(async (results) => {
           if (cancelled) return
           const notificationTargets: Array<{ accountId: string; count: number }> = []
           results.forEach((result, index) => {
             if (result.status === 'rejected') {
-              setAccountSyncStatus((current) => ({ ...current, [accounts[index].id]: 'error' }))
+              setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'error' }))
               setToastMessage(getDisplayError(result.reason))
               return
             }
-            setAccountSyncStatus((current) => ({ ...current, [accounts[index].id]: 'idle' }))
-            if (result.value.new_message_count > 0) notificationTargets.push({ accountId: accounts[index].id, count: result.value.new_message_count })
-            if (!cancelled && accounts[index].id === activeAccountId) {
+            setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'idle' }))
+            if (result.value.new_message_count > 0) notificationTargets.push({ accountId: accountsToSync[index].id, count: result.value.new_message_count })
+            if (!cancelled && accountsToSync[index].id === activeAccountId) {
               setMessages((current) => mergeMessageLists(current, result.value.page.messages))
               setNextPageToken(result.value.page.next_page_token)
               setMessagesAccountId(activeAccountId)
+              setIsLoadingMessages(false)
+              setMailboxLoadError(false)
             }
           })
           if (cancelled || notificationTargets.length === 0 || !settings.notificationsEnabled || isQuietHours(settings)) return
           let permissionGranted = await isPermissionGranted()
           if (!permissionGranted) permissionGranted = (await requestPermission()) === 'granted'
           if (permissionGranted) {
-            notificationTargets.forEach(({ accountId, count }) => sendNotification({
+            const notificationResults = await Promise.allSettled(notificationTargets.map(({ accountId, count }) => sendNotification({
               title: t('newMailNotificationTitle'),
               body: t('newMailNotificationBody', { count }),
               sound: getNotificationSound(settings),
               extra: { accountId },
               autoCancel: true,
-            }))
+            })))
+            const notificationFailure = notificationResults.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+            if (notificationFailure && !cancelled) setToastMessage(getDisplayError(notificationFailure.reason))
           }
         })
-        .finally(() => { syncInFlightRef.current = false })
+        .catch((error: unknown) => {
+          if (!cancelled) setToastMessage(getDisplayError(error))
+        })
+        .finally(() => {
+          accountsToSync.forEach((account) => syncInFlightAccountsRef.current.delete(account.id))
+        })
     }
     let intervalId = window.setInterval(sync, document.visibilityState === 'visible' ? foregroundSyncIntervalMs : backgroundSyncIntervalMs)
     const scheduleNextSync = () => {
       window.clearInterval(intervalId)
-      intervalId = window.setInterval(sync, document.visibilityState === 'visible' ? foregroundSyncIntervalMs : backgroundSyncIntervalMs)
+      const isForeground = document.visibilityState === 'visible' && nativeWindowFocused
+      intervalId = window.setInterval(sync, isForeground ? foregroundSyncIntervalMs : backgroundSyncIntervalMs)
     }
-    const handleWindowFocus = () => sync()
+    const handleWindowFocus = () => {
+      nativeWindowFocused = true
+      scheduleNextSync()
+      sync()
+    }
+    let removeTauriFocusListener: (() => void) | undefined
+    if (isTauriRuntime()) {
+      void getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        nativeWindowFocused = focused
+        scheduleNextSync()
+        if (!cancelled && focused) sync()
+      }).then((removeListener) => {
+        if (cancelled) {
+          removeListener()
+          return
+        }
+        removeTauriFocusListener = removeListener
+      }).catch((error: unknown) => {
+        if (!cancelled) setToastMessage(getDisplayError(error))
+      })
+    }
     const handleVisibilityChange = () => {
       scheduleNextSync()
       if (document.visibilityState === 'visible') sync()
@@ -709,6 +760,7 @@ function App() {
       window.clearInterval(intervalId)
       window.removeEventListener('focus', handleWindowFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
+      removeTauriFocusListener?.()
     }
   }, [accounts, activeAccountId, activeView, getDisplayError, settings, t])
 
@@ -775,10 +827,13 @@ function App() {
   useEffect(() => {
     if (!activeAccountId || activeFolder === 'inbox' || activeView !== 'mail') return
     let cancelled = false
+    let networkCompleted = false
+    let hasCachedPage = false
     const folder = activeFolder
     void invoke<MessagePage | null>('get_cached_folder_messages', { accountId: activeAccountId, folder })
       .then((cachedPage) => {
-        if (cancelled || !cachedPage) return
+        if (cancelled || networkCompleted || !cachedPage) return
+        hasCachedPage = true
         setFolderMessages(cachedPage.messages)
         setFolderNextPageToken(cachedPage.next_page_token)
         setIsLoadingFolder(false)
@@ -793,6 +848,7 @@ function App() {
     void invoke<MessagePage>('list_folder_messages', { accountId: activeAccountId, folder })
       .then((page) => {
         if (!cancelled) {
+          networkCompleted = true
           setFolderMessages((current) => mergeMessageLists(current, page.messages))
           setFolderNextPageToken(page.next_page_token)
           setMailboxLoadError(false)
@@ -802,7 +858,7 @@ function App() {
         }
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
+        if (!cancelled && !hasCachedPage) {
           setMailboxLoadError(true)
           setToastMessage(getDisplayError(error))
         }
@@ -835,10 +891,13 @@ function App() {
         }
       })
       .catch((error: unknown) => {
+        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
         setMailboxLoadError(true)
         setToastMessage(getDisplayError(error))
       })
-      .finally(() => setIsLoadingMore(false))
+      .finally(() => {
+        if (requestedAccountId === activeAccountId && requestedFolder === activeFolder) setIsLoadingMore(false)
+      })
   }
 
   useEffect(() => {
@@ -928,7 +987,7 @@ function App() {
     const unlisten = window.onCloseRequested((event) => {
       if (settings.closeToTray) {
         event.preventDefault()
-        void window.hide()
+        void hideToTray().catch(handleWindowActionError)
         return
       }
       if (allowWindowCloseRef.current || !settings.confirmOnClose) return
@@ -936,7 +995,7 @@ function App() {
       setIsCloseConfirmationOpen(true)
     })
     return () => { void unlisten.then((removeListener) => removeListener()) }
-  }, [settings.closeToTray, settings.confirmOnClose])
+  }, [handleWindowActionError, hideToTray, settings.closeToTray, settings.confirmOnClose])
 
   useEffect(() => {
     if (!toastMessage) return
@@ -945,6 +1004,7 @@ function App() {
   }, [toastMessage])
 
   const activeAccount = accounts.find((account) => account.id === activeAccountId) ?? accounts[0]
+  const activeAttachmentLimits = activeAccount?.provider === 'outlook' ? attachmentLimits.outlook : attachmentLimits.gmail
   const visibleMessages = selectableMessages
   const visibleNextPageToken = activeView === 'mail'
     ? activeFolder === 'inbox' && messagesAccountId === activeAccountId ? nextPageToken : activeFolder !== 'inbox' ? folderNextPageToken : null
@@ -1019,6 +1079,10 @@ function App() {
   }
 
   const selectAccount = (accountId: string) => {
+    if (isComposing && accountId !== activeAccountId) {
+      setToastMessage(t('closeComposerToSwitchAccount'))
+      return
+    }
     const accountChanged = accountId !== activeAccountId
     clearReaderSelection()
     clearSearch()
@@ -1224,6 +1288,12 @@ function App() {
     runMessageAction(messageId, 'mark_read', () => updateMessage(messageId, { unread: false }))
   }, [runMessageAction, updateMessage])
 
+  useEffect(() => {
+    if (!selectedMessageId || !activeAccountId || !selectedMessage?.unread || !activeProviderCapabilities?.can_mark_read) return
+    const timeoutId = window.setTimeout(() => markMessageRead(selectedMessageId), 0)
+    return () => window.clearTimeout(timeoutId)
+  }, [activeAccountId, activeProviderCapabilities?.can_mark_read, markMessageRead, messageActionInFlightId, selectedMessage?.unread, selectedMessageId])
+
   const markMessageReadFromContext = (messageId: string) => {
     runMessageAction(messageId, 'mark_read', () => {
       updateMessage(messageId, { unread: false })
@@ -1291,11 +1361,11 @@ function App() {
   }
 
   const refreshMailbox = async () => {
-    if (!activeAccountId || isRefreshing || syncInFlightRef.current) return
+    if (!activeAccountId || isRefreshing || syncInFlightAccountsRef.current.has(activeAccountId)) return
     const requestedAccountId = activeAccountId
     const requestedFolder = activeFolder
     setIsRefreshing(true)
-    syncInFlightRef.current = true
+    syncInFlightAccountsRef.current.add(requestedAccountId)
     try {
       if (activeFolder === 'inbox') {
         const result = await invoke<SyncResult>('sync_messages', { accountId: activeAccountId })
@@ -1315,7 +1385,7 @@ function App() {
     } catch (error: unknown) {
       setToastMessage(getDisplayError(error))
     } finally {
-      syncInFlightRef.current = false
+      syncInFlightAccountsRef.current.delete(requestedAccountId)
       setIsRefreshing(false)
     }
   }
@@ -1323,7 +1393,7 @@ function App() {
   const requestWindowClose = () => {
     if (!isTauriRuntime()) return
     if (settings.closeToTray) {
-      void getCurrentWindow().hide()
+      void hideToTray().catch(handleWindowActionError)
       return
     }
     if (settings.confirmOnClose) {
@@ -1338,6 +1408,12 @@ function App() {
     allowWindowCloseRef.current = true
     setIsCloseConfirmationOpen(false)
     void getCurrentWindow().close()
+  }
+
+  const minimizeWindowToTray = () => {
+    if (!isTauriRuntime()) return
+    setIsCloseConfirmationOpen(false)
+    void hideToTray().catch(handleWindowActionError)
   }
 
   const removeAccount = (accountId: string) => {
@@ -1582,58 +1658,129 @@ function App() {
 
   const closeComposer = () => {
     if (isSendingMessage) return
+    composeOpenSequenceRef.current += 1
     setIsComposing(false)
+    setIsDraftsPanelOpen(false)
+    setComposeAccountId(null)
+    setComposeDraftId(null)
     setComposeRecipient('')
     setComposeCc('')
     setComposeBcc('')
     setComposeSubject('')
     setComposeBody('')
+    setComposeBodyHtml('')
     setDraftStatus('idle')
   }
 
-  const persistComposeDraft = () => {
-    if (!composeDraftStorageKey) return
-    const draft = { recipient: composeRecipient, cc: composeCc, bcc: composeBcc, subject: composeSubject, body: composeBody }
-    if (!draft.recipient.trim() && !draft.cc.trim() && !draft.bcc.trim() && !draft.subject.trim() && !draft.body.trim()) return
-    window.localStorage.setItem(composeDraftStorageKey, JSON.stringify(draft))
-    setDraftStatus('saved')
-  }
-
-  const openComposer = () => {
-    if (!activeProviderCapabilities?.can_send) return
-    if (composeDraftStorageKey) {
-      const storedDraft = window.localStorage.getItem(composeDraftStorageKey)
-      if (storedDraft) {
-        try {
-          const parsedDraft: unknown = JSON.parse(storedDraft)
-          if (isComposeDraft(parsedDraft)) {
-            setComposeRecipient(parsedDraft.recipient)
-            setComposeCc(parsedDraft.cc ?? '')
-            setComposeBcc(parsedDraft.bcc ?? '')
-            setComposeSubject(parsedDraft.subject)
-            setComposeBody(parsedDraft.body)
-          }
-        } catch {
-          window.localStorage.removeItem(composeDraftStorageKey)
-        }
-      }
-    }
-    setIsComposing(true)
-    setDraftStatus('idle')
-  }
-
-  const submitMessage = async () => {
-    if (!activeAccount?.address || !activeProviderCapabilities?.can_send || !areValidEmailAddresses(composeRecipient) || (composeCc.trim() && !areValidEmailAddresses(composeCc)) || (composeBcc.trim() && !areValidEmailAddresses(composeBcc)) || !composeSubject.trim() || !composeBody.trim() || isSendingMessage) return
-    setIsSendingMessage(true)
+  const refreshComposeDrafts = async (accountId = composeAccountId ?? activeAccountId) => {
+    if (!accountId || !isTauriRuntime()) return
+    setIsLoadingDrafts(true)
     try {
-      const sentMessageId = await invoke<string>('send_message', {
-        accountId: activeAccountId,
-        sender: activeAccount.address,
+      setComposeDrafts(await invoke<DraftListItem[]>('list_drafts', { accountId }))
+    } catch (error) {
+      setToastMessage(`${t('draftLoadFailed')} ${getDisplayError(error)}`)
+    } finally {
+      setIsLoadingDrafts(false)
+    }
+  }
+
+  const saveCurrentComposeDraft = async () => {
+    const accountId = composeAccountId ?? activeAccountId
+    const composeAccount = accounts.find((account) => account.id === accountId)
+    if (!composeAccount?.address || !accountId || isSendingMessage) return
+    const hasContent = [composeRecipient, composeCc, composeBcc, composeSubject, composeBody].some((value) => value.trim().length > 0) || composeAttachments.length > 0
+    if (!hasContent) return
+    setDraftStatus('saving')
+    try {
+      const draft = await invoke<MailDraft>('save_draft', {
+        accountId,
+        sender: composeAccount.address,
+        draftId: composeDraftId,
         recipient: splitEmailAddresses(composeRecipient).join(', '),
         cc: splitEmailAddresses(composeCc).join(', '),
         bcc: splitEmailAddresses(composeBcc).join(', '),
         subject: composeSubject.trim(),
         body: composeBody,
+        bodyHtml: composeBodyHtml,
+        attachments: composeAttachments.map(({ filename, mimeType, dataBase64 }) => ({ filename, mimeType, dataBase64 })),
+      })
+      setComposeDraftId(draft.id)
+      setComposeAttachments(draft.attachments)
+      await refreshComposeDrafts()
+      setDraftStatus('saved')
+      setToastMessage(t('draftSaved'))
+    } catch {
+      setDraftStatus('idle')
+      setToastMessage(t('draftSaveFailed'))
+    }
+  }
+
+  const deleteComposeDraft = async (draft: DraftListItem) => {
+    const accountId = composeAccountId ?? activeAccountId
+    try {
+      await invoke('delete_draft', { accountId, draftId: draft.id })
+      setComposeDrafts((current) => current.filter((item) => item.id !== draft.id))
+      if (composeDraftId === draft.id) {
+        setComposeDraftId(null)
+        setDraftStatus('idle')
+      }
+    } catch {
+      setToastMessage(t('draftDeleteFailed'))
+    }
+  }
+
+  const selectComposeDraft = async (draft: DraftListItem) => {
+    if (isSendingMessage) return
+    const accountId = composeAccountId ?? activeAccountId
+    try {
+      const loadedDraft = await invoke<MailDraft>('get_draft', { accountId, draftId: draft.id })
+      setComposeDraftId(loadedDraft.id)
+      setComposeRecipient(loadedDraft.recipient)
+      setComposeCc(loadedDraft.cc)
+      setComposeBcc(loadedDraft.bcc)
+      setComposeSubject(loadedDraft.subject)
+      setComposeBody(loadedDraft.body)
+      setComposeBodyHtml(loadedDraft.bodyHtml)
+      setComposeAttachments(loadedDraft.attachments)
+      setDraftStatus('saved')
+      setIsDraftsPanelOpen(false)
+    } catch {
+      setToastMessage(t('draftLoadFailed'))
+    }
+  }
+
+  const saveComposeRecipient = (email: string) => {
+    setSavedRecipients(saveRecipient(email))
+    setToastMessage(t('recipientSaved'))
+  }
+
+  const openComposer = async () => {
+    if (!activeProviderCapabilities?.can_send) return
+    composeOpenSequenceRef.current += 1
+    const accountId = activeAccountId
+    setComposeAccountId(accountId)
+    setComposeDraftId(null)
+    setIsDraftsPanelOpen(false)
+    setComposeAttachments([])
+    void refreshComposeDrafts(accountId)
+    setIsComposing(true)
+    setDraftStatus('idle')
+  }
+
+  const submitMessage = async (attachments: ComposeAttachment[]) => {
+    if (!activeAccount?.address || !activeProviderCapabilities?.can_send || !areValidEmailAddresses(composeRecipient) || (composeCc.trim() && !areValidEmailAddresses(composeCc)) || (composeBcc.trim() && !areValidEmailAddresses(composeBcc)) || !composeSubject.trim() || !composeBody.trim() || isSendingMessage) return
+    setIsSendingMessage(true)
+    try {
+      const sentMessageId = await invoke<string>('send_message', {
+        accountId: composeAccountId ?? activeAccountId,
+        sender: accounts.find((account) => account.id === (composeAccountId ?? activeAccountId))?.address ?? activeAccount.address,
+        recipient: splitEmailAddresses(composeRecipient).join(', '),
+        cc: splitEmailAddresses(composeCc).join(', '),
+        bcc: splitEmailAddresses(composeBcc).join(', '),
+        subject: composeSubject.trim(),
+        body: composeBody,
+        bodyHtml: composeBodyHtml,
+        attachments: attachments.map(({ filename, mimeType, dataBase64 }) => ({ filename, mimeType, dataBase64 })),
       })
       setIsComposing(false)
       setComposeRecipient('')
@@ -1641,11 +1788,17 @@ function App() {
       setComposeBcc('')
       setComposeSubject('')
       setComposeBody('')
-      if (composeDraftStorageKey) window.localStorage.removeItem(composeDraftStorageKey)
+      setComposeBodyHtml('')
+      setComposeAttachments([])
+      if (composeDraftId) {
+        void invoke('delete_draft', { accountId: composeAccountId ?? activeAccountId, draftId: composeDraftId }).catch((error: unknown) => setToastMessage(`${t('draftDeleteFailed')} ${getDisplayError(error)}`))
+        setComposeDrafts((current) => current.filter((item) => item.id !== composeDraftId))
+      }
+      setComposeDraftId(null)
+      setIsDraftsPanelOpen(false)
       setToastMessage(t('messageSent'))
       void cacheSentMessage(sentMessageId)
     } catch (error) {
-      persistComposeDraft()
       setToastMessage(`${t('messageSendFailed')} ${getDisplayError(error)}`)
     } finally {
       setIsSendingMessage(false)
@@ -1685,7 +1838,6 @@ function App() {
     setIsReaderScrolled(false)
     setLoadingMessageId(needsBody ? nextMessage.id : null)
     setContextMenu(null)
-    if (nextMessage.unread && !needsBody) markMessageRead(nextMessage.id)
   }
 
   const selectSearchResult = (result: MailSearchResult) => {
@@ -1731,6 +1883,8 @@ function App() {
     <main className="app-shell" onContextMenu={handleContextMenu} onClick={() => setContextMenu(null)}>
       <WindowHeader
         onRequestClose={requestWindowClose}
+        onWindowActionError={handleWindowActionError}
+        onHideToTray={hideToTray}
         minimizeToTray={settings.minimizeToTray}
         searchQuery={searchQuery}
         searchDisabled={isLoadingAccounts || accounts.length === 0}
@@ -1796,7 +1950,6 @@ function App() {
             </div>
             {activeAccount ? <div className="mail-sidebar-actions"><Button className="mail-refresh-button" variant="ghost" size="icon" type="button" disabled={isRefreshing} aria-busy={isRefreshing} aria-label={t('refreshMail')} title={t('refreshMail')} onClick={() => { void refreshMailbox() }}><IconRefresh className={isRefreshing ? 'is-spinning' : undefined} aria-hidden="true" size={16} stroke={1.8} /></Button></div> : null}
           </div>
-          <div className="mail-sidebar-compose"><Button className="compose-button" type="button" disabled={!activeAccount || !activeProviderCapabilities?.can_send} aria-describedby={!activeAccount ? 'mail-account-status' : undefined} onClick={openComposer}><IconPencil aria-hidden="true" size={15} stroke={1.8} />{t('compose')}</Button></div>
           <nav className="mail-folder-nav" aria-labelledby="mail-folders-label">
             <span className="mail-section-label" id="mail-folders-label">{t('mailFolders')}</span>
             {[
@@ -1918,6 +2071,19 @@ function App() {
         </section>
         {activeView === 'settings' ? <section className="settings-page" aria-labelledby="settings-title"><SettingsPanel settings={settings} onChange={updateSetting} accounts={accounts} providerLogos={providerLogos} defaultAccountId={defaultAccountId} onSetDefault={setDefaultAccount} onRemoveAccount={removeAccount} onStartAuth={startAuth} onError={(error: unknown) => setToastMessage(getDisplayError(error))} onBackToMail={() => { setOpenAddAccount(false); setActiveView('mail'); clearSearch(); window.requestAnimationFrame(() => settingsButtonRef.current?.focus()) }} isAddAccountOpen={openAddAccount} onAddAccountOpenChange={setOpenAddAccount} /></section> : null}
       </section>
+      {isComposing ? <section className="compose-page" aria-labelledby="compose-title">
+        <header className="compose-page-header">
+          <h1 id="compose-title">{t('newMessage')}</h1>
+          {draftStatus !== 'idle' ? <span className="compose-draft-status" role="status">{t(draftStatus === 'saving' ? 'draftSaving' : 'draftSaved')}</span> : null}
+          <div className="compose-header-actions">
+            <Button variant="ghost" size="icon" type="button" aria-label={t('drafts')} title={t('drafts')} aria-expanded={isDraftsPanelOpen} onClick={() => { setIsDraftsPanelOpen((current) => !current); refreshComposeDrafts() }} disabled={isSendingMessage}><IconFileText aria-hidden="true" size={17} stroke={1.8} /></Button>
+            {isDraftsPanelOpen ? <DraftsPanel drafts={composeDrafts} currentDraftId={composeDraftId} canSave={[composeRecipient, composeCc, composeBcc, composeSubject, composeBody].some((value) => value.trim().length > 0) || composeAttachments.length > 0} isSaving={draftStatus === 'saving'} isLoading={isLoadingDrafts} formatTime={(value) => formatMessageTime(value, settings, i18n.language)} title={t('drafts')} savingLabel={t('draftSaving')} loadingLabel={t('draftLoading')} saveLabel={t('saveDraft')} emptyLabel={t('noDrafts')} untitledLabel={t('untitledDraft')} noRecipientsLabel={t('noRecipients')} deleteLabel={t('deleteDraft')} onSave={() => { void saveCurrentComposeDraft() }} onSelect={(draft) => { void selectComposeDraft(draft) }} onDelete={(draft) => { void deleteComposeDraft(draft) }} /> : null}
+          </div>
+          <Button variant="ghost" size="icon" type="button" aria-label={t('closeDialog')} title={t('closeDialog')} onClick={closeComposer} disabled={isSendingMessage}><IconX aria-hidden="true" size={18} stroke={1.8} /></Button>
+        </header>
+        <ComposeForm recipient={composeRecipient} cc={composeCc} bcc={composeBcc} subject={composeSubject} body={composeBody} bodyHtml={composeBodyHtml} attachments={composeAttachments} attachmentLimits={activeAttachmentLimits} isSending={isSendingMessage} savedRecipients={savedRecipients} onSaveRecipient={saveComposeRecipient} onRecipientChange={updateComposeRecipient} onCcChange={updateComposeCc} onBccChange={updateComposeBcc} onSubjectChange={updateComposeSubject} onBodyChange={updateComposeBody} onBodyHtmlChange={(value) => { setComposeBodyHtml(value); setDraftStatus('idle') }} onAttachmentsChange={(attachments) => { setComposeAttachments(attachments); setDraftStatus('idle') }} onCancel={closeComposer} onSubmit={submitMessage} />
+      </section> : null}
+      {activeView === 'mail' && activeAccount && activeProviderCapabilities?.can_send && !isComposing ? <Button className="floating-compose-button" size="icon" type="button" aria-label={t('compose')} title={t('compose')} onClick={() => { void openComposer() }}><IconPencil aria-hidden="true" size={19} stroke={1.8} /></Button> : null}
        {contextMenu ? <MailContextMenu x={contextMenu.x} y={contextMenu.y} menuLabel={t('mailActions')} disabled={messageActionInFlightId !== null} disabledActions={{ markUnread: !isActionAvailable((selectableMessages.find((message) => message.id === contextMenu.messageId)?.unread ?? false) ? 'mark_read' : 'mark_unread'), star: !isActionAvailable((selectableMessages.find((message) => message.id === contextMenu.messageId)?.starred ?? false) ? 'unstar' : 'star'), spam: !isActionAvailable('spam'), archive: !isActionAvailable(readerArchiveAction), delete: !isActionAvailable(readerDeleteAction) }} showSpam={activeFolder !== 'spam' && activeFolder !== 'trash'} returnFocusElement={contextMenu.returnFocusElement} labels={{ markUnread: (selectableMessages.find((message) => message.id === contextMenu.messageId)?.unread ?? false) ? t('markRead') : t('markUnread'), star: t('starMail'), archive: activeFolder === 'trash' ? t('restore') : activeFolder === 'spam' ? t('notSpam') : t('archive'), delete: t('delete'), reportSpam: t('reportSpam') }} onClose={() => setContextMenu(null)} onMarkUnread={() => { const message = selectableMessages.find((item) => item.id === contextMenu.messageId); if (message?.unread) markMessageReadFromContext(contextMenu.messageId); else markMessageUnread(contextMenu.messageId) }} onStar={() => starMessage(contextMenu.messageId)} onSpam={() => moveMessageToSpam(contextMenu.messageId)} onArchive={() => activeFolder === 'trash' || activeFolder === 'spam' ? restoreMessage(contextMenu.messageId) : requestArchiveMessage(contextMenu.messageId)} onDelete={() => requestDeleteMessage(contextMenu.messageId)} /> : null}
       <Dialog open={pendingArchiveId !== null} title={t('confirmArchiveTitle')} closeLabel={t('closeDialog')} onClose={cancelArchiveMessage}>
         <div className="confirm-dialog-content"><p>{t('confirmArchiveDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" onClick={cancelArchiveMessage}>{t('cancel')}</Button><Button onClick={confirmArchiveMessage}>{t('archive')}</Button></div></div>
@@ -1928,11 +2094,8 @@ function App() {
       <Dialog open={pendingPermanentDeleteId !== null} title={t('confirmPermanentDeleteTitle')} closeLabel={t('closeDialog')} onClose={cancelPermanentDeleteMessage}>
         <div className="confirm-dialog-content"><p>{t('confirmPermanentDeleteDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" onClick={cancelPermanentDeleteMessage}>{t('cancel')}</Button><Button variant="danger" onClick={() => { if (pendingPermanentDeleteId) permanentlyDeleteMessage(pendingPermanentDeleteId) }}>{t('delete')}</Button></div></div>
       </Dialog>
-      <Dialog open={isComposing} title={t('compose')} closeLabel={t('closeDialog')} onClose={closeComposer}>
-        <ComposeForm recipient={composeRecipient} cc={composeCc} bcc={composeBcc} subject={composeSubject} body={composeBody} draftStatus={draftStatus} isSending={isSendingMessage} onRecipientChange={updateComposeRecipient} onCcChange={updateComposeCc} onBccChange={updateComposeBcc} onSubjectChange={updateComposeSubject} onBodyChange={updateComposeBody} onCancel={closeComposer} onSubmit={submitMessage} />
-      </Dialog>
       <Dialog open={isCloseConfirmationOpen} title={t('confirmCloseTitle')} closeLabel={t('closeDialog')} onClose={() => setIsCloseConfirmationOpen(false)}>
-        <div className="confirm-dialog-content"><p>{t('confirmCloseDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" type="button" onClick={() => setIsCloseConfirmationOpen(false)}>{t('cancel')}</Button><Button variant="danger" type="button" onClick={confirmWindowClose}>{t('close')}</Button></div></div>
+        <div className="confirm-dialog-content"><p>{t('confirmCloseDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" type="button" onClick={() => setIsCloseConfirmationOpen(false)}>{t('cancel')}</Button><Button type="button" onClick={minimizeWindowToTray}><IconMinus aria-hidden="true" size={15} stroke={1.8} />{t('minimizeToTrayNow')}</Button><Button variant="danger" type="button" onClick={confirmWindowClose}>{t('close')}</Button></div></div>
       </Dialog>
       <Toast open={toastMessage.length > 0}>{toastMessage}</Toast>
     </main>
