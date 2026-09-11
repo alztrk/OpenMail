@@ -4,7 +4,7 @@ OpenMail is a lightweight, local-first Windows desktop mail client for bringing 
 
 ## Project status
 
-OpenMail is under active public development. The repository currently contains the Tauri desktop shell, bilingual UI, Gmail and Microsoft account OAuth with PKCE, local mailbox caching, incremental synchronization, HTML mail rendering, desktop notifications, Windows tray controls, and the product and design records.
+OpenMail is under active development. The repository currently contains the Tauri desktop shell, bilingual UI, Gmail and Microsoft account OAuth with PKCE, local mailbox caching, incremental synchronization, HTML mail rendering, desktop notifications, Windows tray controls, and the product and design records.
 
 ## Principles
 
@@ -48,9 +48,10 @@ Build the Windows portable release:
 npm run tauri build -- --no-bundle
 ```
 
-The portable release is a single `openmail.exe`. Configure the public OAuth
-client identifier in the Rust source configuration before building. No `.env`
-file or release helper script is required at runtime.
+The portable release is a single `openmail.exe`. Copy `.env.example` to `.env`,
+fill in the Gmail OAuth client ID and secret, and place the file next to the
+executable. OpenMail loads these values at runtime, so they are not embedded in
+the binary. Never commit the real `.env` file.
 
 ## Localization
 

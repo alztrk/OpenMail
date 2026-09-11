@@ -102,6 +102,9 @@ pub fn start(
 }
 
 fn build_client(config: &GmailConfig, redirect_uri: &str) -> Result<GmailClient, String> {
+    if config.client_id.trim().is_empty() {
+        return Err("GMAIL_CLIENT_CONFIG: OPENMAIL_GMAIL_CLIENT_ID is not configured".to_string());
+    }
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
         .map_err(|error| error.to_string())?;
     let token_url = TokenUrl::new("https://oauth2.googleapis.com/token".to_string())

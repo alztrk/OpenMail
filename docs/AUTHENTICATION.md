@@ -8,12 +8,20 @@ OpenMail connects directly to provider APIs from the Windows desktop application
 2. Enable the Gmail API for that project.
 3. Configure the OAuth consent screen and add the test user used during development.
 4. Create an OAuth client with application type `Desktop app`.
-5. Copy the public client identifier into the Rust configuration. Do not use a `Web application` client for OpenMail.
+5. Copy the client identifier and client secret into a local `.env` file. Do not use a `Web application` client for OpenMail.
 
-The portable release uses the configured public OAuth client identifier. Desktop
-applications still use PKCE because a distributed application cannot keep a
-client secret confidential. OAuth tokens are stored in the Windows Credential
-Manager and are never written to the repository or logs.
+OpenMail loads the Gmail OAuth settings at runtime from `.env`. Put the file in
+the project working directory during development or next to `OpenMail.exe` for
+a portable release:
+
+```env
+OPENMAIL_GMAIL_CLIENT_ID=your-google-client-id
+OPENMAIL_GMAIL_CLIENT_SECRET=your-google-client-secret
+```
+
+Desktop applications still use PKCE. The local secret is not committed, logged,
+or embedded in the executable. OAuth tokens are stored in Windows Credential
+Manager.
 
 ## Flow
 
@@ -34,8 +42,9 @@ If an account was connected before the send scope was added, reconnect it from t
 - Access tokens: process memory only during the active application session, with an expiry-aware cache; they are not persisted to disk or Credential Manager.
 - Mail content and folder caches: Tauri application data directory, scoped per account.
 
-The Gmail OAuth client ID is configured in `src-tauri/src/config.rs`. The normal build does not read local credential JSON
-files or environment variables. Keep credential JSON files, refresh tokens,
+The Gmail OAuth client ID and secret are loaded from the runtime environment.
+The normal build does not read local credential JSON files. Keep credential JSON
+files, `.env`, refresh tokens,
 access tokens, and service-account credentials out of the repository. OpenMail
 requests offline access and requires a refresh token before saving an account
 locally.

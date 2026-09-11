@@ -23,9 +23,10 @@ cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri build -- --no-bundle
 ```
 
-The portable build reads the configured public Gmail OAuth client identifier from
-`src-tauri/src/config.rs` and writes the executable to
-`src-tauri/target/release/openmail.exe`.
+The portable build reads the Gmail OAuth client ID and secret from a `.env` file
+next to the executable at runtime. Microsoft Graph reads its public client ID
+from the `OPENMAIL_MICROSOFT_CLIENT_ID` build environment. The executable is
+written to `src-tauri/target/release/openmail.exe`.
 
 ## Diagnostics
 
