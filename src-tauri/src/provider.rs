@@ -17,6 +17,13 @@ use crate::{
 
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkMessageActionResult {
+    pub succeeded_message_ids: Vec<String>,
+    pub failed_message_ids: Vec<String>,
+    pub error: Option<String>,
+}
+
 pub trait AuthProviderAdapter: Send + Sync {
     fn start(
         &self,
@@ -147,6 +154,13 @@ pub trait MailProviderAdapter: Send + Sync {
         message_id: &'a str,
         action: MessageAction,
     ) -> ProviderFuture<'a, ()>;
+
+    fn modify_messages<'a>(
+        &'a self,
+        account_id: &'a str,
+        message_ids: &'a [String],
+        action: MessageAction,
+    ) -> ProviderFuture<'a, BulkMessageActionResult>;
 }
 
 pub struct ReplyRequest<'a> {
@@ -379,6 +393,15 @@ impl MailProviderAdapter for GmailAdapter {
     ) -> ProviderFuture<'a, ()> {
         Box::pin(gmail_mail::modify_message(account_id, message_id, action))
     }
+
+    fn modify_messages<'a>(
+        &'a self,
+        account_id: &'a str,
+        message_ids: &'a [String],
+        action: MessageAction,
+    ) -> ProviderFuture<'a, BulkMessageActionResult> {
+        Box::pin(gmail_mail::modify_messages(account_id, message_ids, action))
+    }
 }
 
 static GMAIL_ADAPTER: GmailAdapter = GmailAdapter;
@@ -512,6 +535,19 @@ impl MailProviderAdapter for OutlookAdapter {
     ) -> ProviderFuture<'a, ()> {
         Box::pin(microsoft_mail::modify_message(
             account_id, message_id, action,
+        ))
+    }
+
+    fn modify_messages<'a>(
+        &'a self,
+        account_id: &'a str,
+        message_ids: &'a [String],
+        action: MessageAction,
+    ) -> ProviderFuture<'a, BulkMessageActionResult> {
+        Box::pin(microsoft_mail::modify_messages(
+            account_id,
+            message_ids,
+            action,
         ))
     }
 }

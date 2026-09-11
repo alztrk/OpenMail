@@ -116,6 +116,7 @@ pub fn run() {
             commands::cache_sent_message,
             commands::sync_messages,
             commands::modify_message,
+            commands::modify_messages,
             commands::get_auth_status,
             commands::start_auth,
             commands::remove_account,

@@ -428,6 +428,33 @@ pub async fn modify_message(
 }
 
 #[tauri::command]
+pub async fn modify_messages(
+    account_id: String,
+    message_ids: Vec<String>,
+    action: MessageAction,
+    state: State<'_, AppState>,
+) -> Result<provider::BulkMessageActionResult, String> {
+    if message_ids.is_empty() {
+        return Ok(provider::BulkMessageActionResult {
+            succeeded_message_ids: Vec::new(),
+            failed_message_ids: Vec::new(),
+            error: None,
+        });
+    }
+    let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    if !provider::supports_message_action(adapter.capabilities(), action) {
+        return Err("The selected provider does not support this message action".to_string());
+    }
+    let result = adapter
+        .modify_messages(&account_id, &message_ids, action)
+        .await?;
+    for message_id in &result.succeeded_message_ids {
+        message_cache::apply_message_action(&state.app_data_dir, &account_id, message_id, action)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 pub fn get_auth_status(state: State<'_, AppState>) -> Result<AuthState, String> {
     state
         .auth_state

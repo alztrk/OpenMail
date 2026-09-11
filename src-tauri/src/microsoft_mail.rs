@@ -5,6 +5,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures::{stream, StreamExt};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -23,7 +24,8 @@ const GRAPH_SCOPES: &str = "openid profile email User.Read Mail.ReadWrite Mail.S
 const MAX_GRAPH_DIRECT_ATTACHMENT_BYTES: usize = 3 * 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const PAGE_SIZE: &str = "25";
+const PAGE_SIZE: &str = "100";
+const BULK_ACTION_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 struct CachedAccessToken {
@@ -899,6 +901,45 @@ pub async fn modify_message(
             ensure_success(response, "change flag state").await
         }
     }
+}
+
+pub async fn modify_messages(
+    account_id: &str,
+    message_ids: &[String],
+    action: MessageAction,
+) -> Result<crate::provider::BulkMessageActionResult, String> {
+    let results = stream::iter(message_ids.iter().cloned())
+        .map(|message_id| async move {
+            let result = modify_message(account_id, &message_id, action).await;
+            (message_id, result)
+        })
+        .buffer_unordered(BULK_ACTION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut succeeded_message_ids = Vec::new();
+    let mut failed_message_ids = Vec::new();
+    for (message_id, result) in results {
+        if result.is_ok() {
+            succeeded_message_ids.push(message_id);
+        } else {
+            failed_message_ids.push(message_id);
+        }
+    }
+    if failed_message_ids.is_empty() {
+        return Ok(crate::provider::BulkMessageActionResult {
+            succeeded_message_ids,
+            failed_message_ids,
+            error: None,
+        });
+    }
+    Ok(crate::provider::BulkMessageActionResult {
+        succeeded_message_ids,
+        error: Some(format!(
+            "{} Microsoft Graph bulk action(s) failed",
+            failed_message_ids.len()
+        )),
+        failed_message_ids,
+    })
 }
 
 async fn move_message(

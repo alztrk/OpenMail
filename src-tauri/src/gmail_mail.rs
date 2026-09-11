@@ -341,27 +341,36 @@ async fn list_messages_with_query(
     let config = GmailConfig::embedded();
     let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
     let client = shared_http_client()?;
-    let mut request = client
-        .get(format!("{GMAIL_API_URL}/messages"))
-        .bearer_auth(&access_token)
-        .query(&[("maxResults", "25")]);
-    if let Some(label) = label {
-        request = request.query(&[("labelIds", label)]);
-    } else if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
-        request = request.query(&[("q", query)]);
-    }
-    if let Some(token) = page_token {
-        request = request.query(&[("pageToken", token)]);
-    }
-    let list = request
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<MessageListResponse>()
-        .await
-        .map_err(|error| error.to_string())?;
+    let list_response = send_gmail_read_with_retry(
+        || {
+            let mut request = client
+                .get(format!("{GMAIL_API_URL}/messages"))
+                .bearer_auth(&access_token)
+                // Fetch a larger metadata page while keeping full message bodies lazy.
+                .query(&[("maxResults", "100")]);
+            if let Some(label) = label {
+                request = request.query(&[("labelIds", label)]);
+            } else if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
+                request = request.query(&[("q", query)]);
+            }
+            if let Some(token) = page_token {
+                request = request.query(&[("pageToken", token)]);
+            }
+            request
+        },
+        "list messages",
+    )
+    .await?;
+    let list = if list_response.status().is_success() {
+        list_response
+            .json::<MessageListResponse>()
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        let status = list_response.status();
+        let body = list_response.text().await.unwrap_or_default();
+        return Err(format_gmail_api_error(status, &body, "list messages"));
+    };
 
     let requests = list
         .messages
@@ -461,7 +470,20 @@ pub async fn sync_messages(
     let access_token =
         refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
     let client = shared_http_client()?;
-    let mut history = fetch_history(&client, &access_token, &start_history_id).await?;
+    let mut history = match fetch_history(&client, &access_token, &start_history_id).await {
+        Ok(history) => history,
+        Err(error) if error.starts_with("GMAIL_HISTORY_UNAVAILABLE:") => {
+            log::warn!(
+                "Gmail history sync unavailable; falling back to full metadata sync: {error}"
+            );
+            return Ok(SyncOutcome {
+                page: list_messages(account_id, None).await?,
+                new_message_count: 0,
+                removed_message_ids: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     if history.is_none() {
         return Ok(SyncOutcome {
             page: list_messages(account_id, None).await?,
@@ -494,7 +516,18 @@ pub async fn sync_messages(
         }
         history = match response.next_page_token {
             Some(token) => {
-                fetch_history_page(&client, &access_token, &start_history_id, &token).await?
+                match fetch_history_page(&client, &access_token, &start_history_id, &token).await {
+                    Ok(page) => page,
+                    Err(error) if error.starts_with("GMAIL_HISTORY_UNAVAILABLE:") => {
+                        log::warn!("Gmail history page became unavailable; falling back to full metadata sync: {error}");
+                        return Ok(SyncOutcome {
+                            page: list_messages(account_id, None).await?,
+                            new_message_count: 0,
+                            removed_message_ids: Vec::new(),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             None => None,
         };
@@ -1320,11 +1353,74 @@ pub async fn modify_message(
     Err(format_gmail_api_error(status, &body, "message action"))
 }
 
+pub async fn modify_messages(
+    account_id: &str,
+    message_ids: &[String],
+    action: MessageAction,
+) -> Result<crate::provider::BulkMessageActionResult, String> {
+    if message_ids.is_empty() {
+        return Ok(crate::provider::BulkMessageActionResult {
+            succeeded_message_ids: Vec::new(),
+            failed_message_ids: Vec::new(),
+            error: None,
+        });
+    }
+    let (add_label_ids, remove_label_ids) = match action {
+        MessageAction::Archive => (Vec::new(), vec!["INBOX"]),
+        MessageAction::MarkUnread => (vec!["UNREAD"], Vec::new()),
+        MessageAction::MarkRead => (Vec::new(), vec!["UNREAD"]),
+        MessageAction::Trash => (vec!["TRASH"], vec!["INBOX"]),
+        _ => return Err("This Gmail action cannot be applied in bulk".to_string()),
+    };
+    let refresh_token = secure_store::load_refresh_token(account_id)?
+        .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
+    let access_token =
+        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let client = shared_http_client()?;
+    let mut succeeded_message_ids = Vec::new();
+    for (chunk_index, message_chunk) in message_ids.chunks(1000).enumerate() {
+        let response = client
+            .post(format!("{GMAIL_API_URL}/messages/batchModify"))
+            .bearer_auth(&access_token)
+            .json(&json!({
+                "ids": message_chunk,
+                "addLabelIds": add_label_ids,
+                "removeLabelIds": remove_label_ids,
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status().is_success() {
+            succeeded_message_ids.extend(message_chunk.iter().cloned());
+            continue;
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Ok(crate::provider::BulkMessageActionResult {
+            succeeded_message_ids,
+            failed_message_ids: message_ids
+                .iter()
+                .skip(chunk_index * 1000)
+                .cloned()
+                .collect(),
+            error: Some(format_gmail_api_error(status, &body, "bulk message action")),
+        });
+    }
+    Ok(crate::provider::BulkMessageActionResult {
+        succeeded_message_ids,
+        failed_message_ids: Vec::new(),
+        error: None,
+    })
+}
+
 async fn refresh_access_token(
     account_id: &str,
     config: &GmailConfig,
     refresh_token: &str,
 ) -> Result<String, String> {
+    if config.client_id.trim().is_empty() {
+        return Err("GMAIL_CLIENT_CONFIG: OPENMAIL_GMAIL_CLIENT_ID is not configured".to_string());
+    }
     if let Some(access_token) = load_cached_access_token(account_id) {
         return Ok(access_token);
     }
@@ -1364,8 +1460,12 @@ async fn refresh_access_token(
                 "invalid_grant" => {
                     Err("AUTH_REQUIRED: Gmail authorization expired or was revoked".to_string())
                 }
-                "invalid_client" | "deleted_client" => Err(format!(
-                    "GMAIL_CLIENT_CONFIG: Gmail OAuth client is invalid ({})",
+                "invalid_client" => Err(format!(
+                    "GMAIL_CLIENT_CONFIG: Gmail OAuth client credentials were rejected ({})",
+                    description
+                )),
+                "deleted_client" => Err(format!(
+                    "GMAIL_CLIENT_CONFIG: Gmail OAuth client was deleted ({})",
                     description
                 )),
                 _ => Err(format!(
@@ -1759,19 +1859,31 @@ async fn fetch_history(
     access_token: &str,
     start_history_id: &str,
 ) -> Result<Option<HistoryResponse>, String> {
-    let response = client
-        .get(format!("{GMAIL_API_URL}/history"))
-        .bearer_auth(access_token)
-        .query(&[("startHistoryId", start_history_id)])
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = send_gmail_read_with_retry(
+        || {
+            client
+                .get(format!("{GMAIL_API_URL}/history"))
+                .bearer_auth(access_token)
+                .query(&[("startHistoryId", start_history_id)])
+        },
+        "history sync",
+    )
+    .await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(format!(
+                "GMAIL_HISTORY_UNAVAILABLE: {}",
+                format_gmail_api_error(status, &body, "history sync")
+            ));
+        }
+        return Err(format_gmail_api_error(status, &body, "history sync"));
+    }
     response
-        .error_for_status()
-        .map_err(|error| error.to_string())?
         .json::<HistoryResponse>()
         .await
         .map(Some)
@@ -1784,18 +1896,31 @@ async fn fetch_history_page(
     start_history_id: &str,
     page_token: &str,
 ) -> Result<Option<HistoryResponse>, String> {
-    client
-        .get(format!("{GMAIL_API_URL}/history"))
-        .bearer_auth(access_token)
-        .query(&[
-            ("startHistoryId", start_history_id),
-            ("pageToken", page_token),
-        ])
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
+    let response = send_gmail_read_with_retry(
+        || {
+            client
+                .get(format!("{GMAIL_API_URL}/history"))
+                .bearer_auth(access_token)
+                .query(&[
+                    ("startHistoryId", start_history_id),
+                    ("pageToken", page_token),
+                ])
+        },
+        "history page sync",
+    )
+    .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(format!(
+                "GMAIL_HISTORY_UNAVAILABLE: {}",
+                format_gmail_api_error(status, &body, "history page sync")
+            ));
+        }
+        return Err(format_gmail_api_error(status, &body, "history page sync"));
+    }
+    response
         .json::<HistoryResponse>()
         .await
         .map(Some)
