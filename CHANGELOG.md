@@ -38,6 +38,9 @@ All notable changes to OpenMail are recorded here.
 - Theme-aware scrollbars and native form control color schemes now keep light and dark surfaces visually consistent.
 - Mail context menus now support complete keyboard navigation with arrow, Home, End, and Escape keys.
 - Mail row accessibility names now announce unread state directly instead of relying on a decorative status dot.
+- Bulk mailbox actions now operate only on visible filtered messages and report partial provider failures without hiding successful updates.
+- Microsoft Graph bulk actions now use bounded concurrency to avoid unbounded mutation requests.
+- Settings is lazy-loaded, the production bundle is split, and the Tauri policy blocks unnecessary embedded content and form submissions.
 - Gmail synchronization logs now include completed message counts, new-message counts, and elapsed time.
 - Background synchronization now preserves previously cached paging results instead of replacing them with the current page.
 - Persisted settings are now validated and normalized on startup so malformed local values cannot break the interface.
