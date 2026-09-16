@@ -1,67 +1,18 @@
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
-static ENV_LOADED: OnceLock<()> = OnceLock::new();
+use crate::{
+    models::{MailProvider, OAuthCredentialStatus, OAuthProviderCredentialStatus},
+    secure_store,
+};
 
 fn non_empty_trimmed(value: String) -> Option<String> {
     let trimmed = value.trim().to_string();
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-pub fn load_runtime_environment() {
-    ENV_LOADED.get_or_init(|| {
-        let mut paths = Vec::new();
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(parent) = executable.parent() {
-                let mut directory = Some(parent);
-                for _ in 0..5 {
-                    if let Some(path) = directory {
-                        paths.push(PathBuf::from(path).join(".env"));
-                        directory = path.parent();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        if let Ok(current_dir) = std::env::current_dir() {
-            let mut directory = Some(current_dir.as_path());
-            for _ in 0..5 {
-                if let Some(path) = directory {
-                    let candidate = PathBuf::from(path).join(".env");
-                    if !paths.iter().any(|existing| existing == &candidate) {
-                        paths.push(candidate);
-                    }
-                    directory = path.parent();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        for path in paths {
-            match dotenvy::from_path_override(&path) {
-                Ok(_) => {
-                    log::info!("Loaded OpenMail runtime environment");
-                    break;
-                }
-                Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    log::warn!("Could not load OpenMail runtime environment file: {error}");
-                }
-            }
-        }
-    });
-}
-
 pub fn microsoft_client_id() -> Result<String, String> {
-    load_runtime_environment();
-    std::env::var("OPENMAIL_MICROSOFT_CLIENT_ID")
-        .ok()
-        .or_else(|| option_env!("OPENMAIL_MICROSOFT_CLIENT_ID").map(str::to_owned))
+    secure_store::load_oauth_client_id(MailProvider::Outlook)?
         .and_then(non_empty_trimmed)
         .ok_or_else(|| {
-            "OUTLOOK_CLIENT_CONFIG: OPENMAIL_MICROSOFT_CLIENT_ID is not configured".to_string()
+            "OUTLOOK_CLIENT_CONFIG: Microsoft client ID is not configured in Settings".to_string()
         })
 }
 
@@ -73,20 +24,47 @@ pub struct GmailConfig {
 }
 
 impl GmailConfig {
-    pub fn embedded() -> Self {
-        load_runtime_environment();
+    pub fn from_settings() -> Result<Self, String> {
+        let client_id = secure_store::load_oauth_client_id(MailProvider::Gmail)?
+            .and_then(non_empty_trimmed)
+            .ok_or_else(|| {
+                "GMAIL_CLIENT_CONFIG: Gmail client ID is not configured in Settings".to_string()
+            })?;
+        let client_secret = secure_store::load_gmail_client_secret()?
+            .and_then(non_empty_trimmed)
+            .ok_or_else(|| {
+                "GMAIL_CLIENT_CONFIG: Gmail client secret is not configured in Settings".to_string()
+            })?;
 
-        Self {
-            client_id: std::env::var("OPENMAIL_GMAIL_CLIENT_ID")
-                .ok()
-                .and_then(non_empty_trimmed)
-                .unwrap_or_default(),
-            client_secret: std::env::var("OPENMAIL_GMAIL_CLIENT_SECRET")
-                .ok()
-                .and_then(non_empty_trimmed),
+        Ok(Self {
+            client_id,
+            client_secret: Some(client_secret),
             redirect_host: "127.0.0.1".to_string(),
-        }
+        })
     }
+}
+
+pub fn oauth_credential_status() -> Result<OAuthCredentialStatus, String> {
+    let gmail_client_id = secure_store::load_oauth_client_id(MailProvider::Gmail)?
+        .and_then(non_empty_trimmed)
+        .is_some();
+    let gmail_client_secret = secure_store::load_gmail_client_secret()?
+        .and_then(non_empty_trimmed)
+        .is_some();
+    let outlook_client_id = secure_store::load_oauth_client_id(MailProvider::Outlook)?
+        .and_then(non_empty_trimmed)
+        .is_some();
+
+    Ok(OAuthCredentialStatus {
+        gmail: OAuthProviderCredentialStatus {
+            client_id: gmail_client_id,
+            client_secret: gmail_client_secret,
+        },
+        outlook: OAuthProviderCredentialStatus {
+            client_id: outlook_client_id,
+            client_secret: false,
+        },
+    })
 }
 
 #[cfg(test)]

@@ -79,6 +79,18 @@ pub enum MailProvider {
     Outlook,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthProviderCredentialStatus {
+    pub client_id: bool,
+    pub client_secret: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthCredentialStatus {
+    pub gmail: OAuthProviderCredentialStatus,
+    pub outlook: OAuthProviderCredentialStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MailFolder {

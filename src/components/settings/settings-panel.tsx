@@ -1,6 +1,7 @@
-import { type KeyboardEvent, type ReactNode, useId, useRef, useState } from 'react'
+import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useId, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { IconAdjustmentsHorizontal, IconArrowLeft, IconBell, IconChevronRight, IconLanguage, IconMailPlus, IconPalette, IconRefresh, IconTrash, IconUser } from '@tabler/icons-react'
+import { IconAdjustmentsHorizontal, IconArrowLeft, IconBell, IconChevronRight, IconKey, IconLanguage, IconMailPlus, IconPalette, IconRefresh, IconTrash, IconUser } from '@tabler/icons-react'
+import { invoke } from '@tauri-apps/api/core'
 import type { AppSettings, ClockFormat, Density, ThemeMode } from '@/settings'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
@@ -29,6 +30,16 @@ type SettingsPanelProps = {
 }
 
 type NotificationPermissionState = 'unknown' | 'granted' | 'denied' | 'requesting'
+
+type OAuthProviderCredentialStatus = {
+  client_id: boolean
+  client_secret: boolean
+}
+
+type OAuthCredentialStatus = {
+  gmail: OAuthProviderCredentialStatus
+  outlook: OAuthProviderCredentialStatus
+}
 
 type MailAccount = {
   id: string
@@ -82,14 +93,85 @@ function SettingRow({ label, description, value, children }: SettingRowProps) {
 
 export function SettingsPanel({ settings, onChange, accounts, providerLogos, defaultAccountId, onSetDefault, onRemoveAccount, onStartAuth, onError, onBackToMail, isAddAccountOpen, onAddAccountOpenChange, isAccountMutationInFlight, notificationPermission, onRequestNotificationPermission }: SettingsPanelProps) {
   const { t, i18n } = useTranslation()
-  const [activeTab, setActiveTab] = useState<'general' | 'appearance' | 'language' | 'notifications' | 'accounts'>(accounts.length === 0 ? 'accounts' : 'general')
+  const [activeTab, setActiveTab] = useState<'general' | 'appearance' | 'language' | 'notifications' | 'accounts' | 'oauth'>(accounts.length === 0 ? 'accounts' : 'general')
   const [accountToRemoveId, setAccountToRemoveId] = useState<string | null>(null)
   const [reconnectingAccountId, setReconnectingAccountId] = useState<string | null>(null)
   const [isAddingAccount, setIsAddingAccount] = useState(false)
   const [addingProvider, setAddingProvider] = useState<MailAccount['provider'] | null>(null)
+  const [oauthCredentialStatus, setOauthCredentialStatus] = useState<OAuthCredentialStatus | null>(null)
+  const [oauthStatusError, setOauthStatusError] = useState(false)
+  const [gmailClientId, setGmailClientId] = useState('')
+  const [gmailClientSecret, setGmailClientSecret] = useState('')
+  const [outlookClientId, setOutlookClientId] = useState('')
+  const [savingOAuthProvider, setSavingOAuthProvider] = useState<MailAccount['provider'] | null>(null)
+  const [oauthNotice, setOauthNotice] = useState('')
   const addAccountButtonRef = useRef<HTMLButtonElement>(null)
   const firstProviderButtonRef = useRef<HTMLButtonElement>(null)
   const isAuthInFlight = isAddingAccount || reconnectingAccountId !== null || isAccountMutationInFlight
+  const isTauriRuntime = '__TAURI_INTERNALS__' in window
+
+  const refreshOAuthCredentialStatus = useCallback(async () => {
+    if (!isTauriRuntime) return
+    try {
+      const status = await invoke<OAuthCredentialStatus>('get_oauth_credential_status')
+      setOauthCredentialStatus(status)
+      setOauthStatusError(false)
+    } catch (error: unknown) {
+      setOauthStatusError(true)
+      onError(error)
+    }
+  }, [isTauriRuntime, onError])
+
+  useEffect(() => {
+    // Credential Manager is an external system, so its status must be synchronized after mount.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void refreshOAuthCredentialStatus()
+  }, [refreshOAuthCredentialStatus])
+
+  const isOAuthProviderConfigured = (provider: MailAccount['provider']) => {
+    if (!oauthCredentialStatus) return false
+    const status = oauthCredentialStatus[provider]
+    return status.client_id && (provider === 'outlook' || status.client_secret)
+  }
+
+  const handleSaveOAuthCredentials = async (provider: MailAccount['provider']) => {
+    const clientId = provider === 'gmail' ? gmailClientId.trim() : outlookClientId.trim()
+    const clientSecret = provider === 'gmail' ? gmailClientSecret.trim() : null
+    if (!clientId || (provider === 'gmail' && !clientSecret)) {
+      onError(new Error(provider === 'gmail' ? 'OPENMAIL_GMAIL_CLIENT_SECRET_REQUIRED' : 'OPENMAIL_OAUTH_CLIENT_ID_REQUIRED'))
+      return
+    }
+    setSavingOAuthProvider(provider)
+    setOauthNotice('')
+    try {
+      const status = await invoke<OAuthCredentialStatus>('save_oauth_credentials', {
+        provider,
+        clientId,
+        clientSecret,
+      })
+      setOauthCredentialStatus(status)
+      setOauthNotice(t('oauthCredentialsSaved'))
+      if (provider === 'gmail') setGmailClientSecret('')
+    } catch (error: unknown) {
+      onError(error)
+    } finally {
+      setSavingOAuthProvider(null)
+    }
+  }
+
+  const handleClearOAuthCredentials = async (provider: MailAccount['provider']) => {
+    setSavingOAuthProvider(provider)
+    setOauthNotice('')
+    try {
+      const status = await invoke<OAuthCredentialStatus>('clear_oauth_credentials', { provider })
+      setOauthCredentialStatus(status)
+      setOauthNotice(t('oauthCredentialsRemoved'))
+    } catch (error: unknown) {
+      onError(error)
+    } finally {
+      setSavingOAuthProvider(null)
+    }
+  }
   const notificationPermissionLabel = notificationPermission === 'granted'
     ? t('notificationPermissionGranted')
     : notificationPermission === 'denied'
@@ -143,6 +225,7 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
     { id: 'language' as const, label: t('languageSettings'), description: t('settingsLanguageDescription'), icon: IconLanguage },
     { id: 'notifications' as const, label: t('notificationSettings'), description: t('settingsNotificationsDescription'), icon: IconBell },
     { id: 'accounts' as const, label: t('accountsSettings'), description: t('accountsSettingsDescription'), icon: IconUser },
+    { id: 'oauth' as const, label: t('oauthSettings'), description: t('oauthSettingsDescription'), icon: IconKey },
   ]
   const activeTabDetails = tabs.find((tab) => tab.id === activeTab) ?? tabs[0]
   const ActiveTabIcon = activeTabDetails.icon
@@ -206,6 +289,28 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
         <SettingRow label={t('quietHours')} description={t('quietHoursDescription')}>{({ labelId, descriptionId }) => <Switch className="setting-toggle" aria-labelledby={labelId} aria-describedby={descriptionId} checked={settings.quietHoursEnabled} onChange={(e) => onChange('quietHoursEnabled', e.target.checked)} />}</SettingRow>
         {settings.quietHoursEnabled ? <div className="time-range"><label>{t('quietHoursStart')}<Input type="time" value={settings.quietHoursStart} onChange={(e) => onChange('quietHoursStart', e.target.value)} /></label><label>{t('quietHoursEnd')}<Input type="time" value={settings.quietHoursEnd} onChange={(e) => onChange('quietHoursEnd', e.target.value)} /></label></div> : null}
       </section> : null}
+      {activeTab === 'oauth' ? <section className="settings-section oauth-settings-section">
+        <div className="settings-group-heading"><strong>{t('oauthCredentialsGroup')}</strong><span>{t('oauthCredentialsGroupDescription')}</span></div>
+        <div className="oauth-security-note" role="note"><IconKey aria-hidden="true" size={18} stroke={1.8} /><span>{t('oauthCredentialsStorageNote')}</span></div>
+        <div className="oauth-provider-settings">
+          <article className="oauth-provider-settings-card">
+            <header><span className="oauth-provider-settings-identity"><span className="account-settings-logo"><img src={providerLogos.gmail} alt="" /></span><span><strong>{t('gmail')}</strong><small>{t('gmailOAuthCredentialsDescription')}</small></span></span><span className={`oauth-credential-status ${oauthCredentialStatus?.gmail.client_id && oauthCredentialStatus.gmail.client_secret ? 'configured' : 'missing'}`}>{oauthStatusError ? t('oauthCredentialsUnavailable') : oauthCredentialStatus?.gmail.client_id && oauthCredentialStatus.gmail.client_secret ? t('oauthCredentialsConfigured') : t('oauthCredentialsMissing')}</span></header>
+            <div className="oauth-credential-fields">
+              <label>{t('oauthClientId')}<Input value={gmailClientId} onChange={(event) => setGmailClientId(event.target.value)} autoComplete="off" placeholder={t('oauthClientIdPlaceholder')} /></label>
+              <label>{t('oauthClientSecret')}<Input type="password" value={gmailClientSecret} onChange={(event) => setGmailClientSecret(event.target.value)} autoComplete="new-password" placeholder={t('oauthClientSecretPlaceholder')} /></label>
+            </div>
+            <footer><span>{t('oauthSecretNotShown')}</span><div><Button variant="ghost" disabled={!isOAuthProviderConfigured('gmail') || savingOAuthProvider !== null} onClick={() => { void handleClearOAuthCredentials('gmail') }}>{t('removeSavedCredentials')}</Button><Button disabled={savingOAuthProvider !== null} onClick={() => { void handleSaveOAuthCredentials('gmail') }}>{savingOAuthProvider === 'gmail' ? t('saving') : t('saveCredentials')}</Button></div></footer>
+          </article>
+          <article className="oauth-provider-settings-card">
+            <header><span className="oauth-provider-settings-identity"><span className="account-settings-logo"><img src={providerLogos.outlook} alt="" /></span><span><strong>{t('outlook')}</strong><small>{t('outlookOAuthCredentialsDescription')}</small></span></span><span className={`oauth-credential-status ${oauthCredentialStatus?.outlook.client_id ? 'configured' : 'missing'}`}>{oauthStatusError ? t('oauthCredentialsUnavailable') : oauthCredentialStatus?.outlook.client_id ? t('oauthCredentialsConfigured') : t('oauthCredentialsMissing')}</span></header>
+            <div className="oauth-credential-fields single">
+              <label>{t('oauthClientId')}<Input value={outlookClientId} onChange={(event) => setOutlookClientId(event.target.value)} autoComplete="off" placeholder={t('oauthClientIdPlaceholder')} /></label>
+            </div>
+            <footer><span>{t('outlookPublicClientNote')}</span><div><Button variant="ghost" disabled={!isOAuthProviderConfigured('outlook') || savingOAuthProvider !== null} onClick={() => { void handleClearOAuthCredentials('outlook') }}>{t('removeSavedCredentials')}</Button><Button disabled={savingOAuthProvider !== null} onClick={() => { void handleSaveOAuthCredentials('outlook') }}>{savingOAuthProvider === 'outlook' ? t('saving') : t('saveCredentials')}</Button></div></footer>
+          </article>
+        </div>
+        {oauthNotice ? <div className="oauth-credential-notice" role="status">{oauthNotice}</div> : null}
+      </section> : null}
       {activeTab === 'accounts' ? <section className="settings-section accounts-section">
         <div className="settings-group-heading settings-accounts-heading"><div><strong>{t('connectedAccountsGroup')}</strong><span>{t('connectedAccountsGroupDescription')}</span></div><output>{t('connectedAccountsCount', { count: accounts.length })}</output></div>
         <div className="account-settings-list">
@@ -230,6 +335,7 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
       </div>
     </div>
     <Dialog open={isAddAccountOpen} title={t('addAccount')} closeLabel={t('closeDialog')} returnFocusRef={addAccountButtonRef} initialFocusRef={firstProviderButtonRef} onClose={() => onAddAccountOpenChange(false)}>
+      {oauthCredentialStatus && (!isOAuthProviderConfigured('gmail') || !isOAuthProviderConfigured('outlook')) ? <div className="oauth-dialog-notice"><span>{t('oauthCredentialsRequiredForAccount')}</span><Button variant="ghost" onClick={() => { onAddAccountOpenChange(false); setActiveTab('oauth') }}>{t('openOAuthSettings')}</Button></div> : null}
       <div className="provider-action-cards" role="group" aria-label={t('accountProviderTabs')}>
         {(['gmail', 'outlook'] as const).map((provider, index) => (
           <button
@@ -237,7 +343,7 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
             ref={index === 0 ? firstProviderButtonRef : undefined}
             className="provider-action-card"
             type="button"
-            disabled={isAddingAccount}
+            disabled={isAddingAccount || !isOAuthProviderConfigured(provider)}
             aria-busy={isAddingAccount && addingProvider === provider}
             onClick={() => { void handleStartAuth(provider) }}
           >
@@ -246,7 +352,7 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
             </span>
             <span className="provider-action-content">
               <strong>{t(provider)}</strong>
-              <span>{t(provider === 'gmail' ? 'continueWithGmail' : 'continueWithOutlook')}</span>
+              <span>{isOAuthProviderConfigured(provider) ? t(provider === 'gmail' ? 'continueWithGmail' : 'continueWithOutlook') : t('configureOAuthCredentials')}</span>
             </span>
             {isAddingAccount && addingProvider === provider ? (
               <span className="provider-action-status">{t('connecting')}</span>

@@ -348,7 +348,7 @@ async fn list_messages_with_query(
     let started_at = Instant::now();
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let config = GmailConfig::embedded();
+    let config = GmailConfig::from_settings()?;
     let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
     let client = shared_http_client()?;
     let list_response = send_gmail_read_with_retry(
@@ -534,7 +534,7 @@ pub async fn sync_messages(
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let client = shared_http_client()?;
     let mut history = match fetch_history(&client, &access_token, &start_history_id).await {
         Ok(history) => history,
@@ -629,7 +629,7 @@ pub async fn get_message(account_id: &str, message_id: &str) -> Result<MailMessa
     let started_at = Instant::now();
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let config = GmailConfig::embedded();
+    let config = GmailConfig::from_settings()?;
     let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
     let client = shared_http_client()?;
     let message_url = gmail_message_url(message_id)?;
@@ -661,7 +661,7 @@ pub async fn get_thread(account_id: &str, thread_id: &str) -> Result<MailThread,
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let client = shared_http_client()?;
     let thread_url = gmail_thread_url(thread_id)?;
     let response = send_gmail_read_with_retry(
@@ -724,7 +724,7 @@ pub async fn download_attachment(
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let data = fetch_attachment_data(
         &shared_http_client()?,
         &access_token,
@@ -741,7 +741,7 @@ pub async fn list_drafts(account_id: &str) -> Result<Vec<DraftSummary>, String> 
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let client = shared_http_client()?;
     let mut page_token = None;
     let mut summaries = Vec::new();
@@ -798,7 +798,7 @@ pub async fn get_draft(account_id: &str, draft_id: &str) -> Result<MailDraft, St
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let client = shared_http_client()?;
     let draft = fetch_draft(&client, &access_token, draft_id).await?;
     draft_to_mail_draft(&client, &access_token, draft).await
@@ -811,8 +811,12 @@ pub async fn save_draft(request: DraftRequest<'_>) -> Result<MailDraft, String> 
     let raw_message = build_draft_raw_message(&request)?;
     let refresh_token = secure_store::load_refresh_token(request.account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let access_token =
-        refresh_access_token(request.account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let access_token = refresh_access_token(
+        request.account_id,
+        &GmailConfig::from_settings()?,
+        &refresh_token,
+    )
+    .await?;
     let client = shared_http_client()?;
     let payload = json!({ "message": { "raw": URL_SAFE_NO_PAD.encode(raw_message.as_bytes()) } });
     let response = match request.draft_id.filter(|value| !value.trim().is_empty()) {
@@ -851,7 +855,7 @@ pub async fn delete_draft(account_id: &str, draft_id: &str) -> Result<(), String
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let draft_url = gmail_draft_url(draft_id)?;
     let response = shared_http_client()?
         .delete(draft_url)
@@ -1211,7 +1215,7 @@ async fn send_message_with_thread(
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let encoded_subject = base64::engine::general_purpose::STANDARD.encode(subject.as_bytes());
     let thread_headers = in_reply_to
         .filter(|value| !value.contains(['\r', '\n']))
@@ -1357,7 +1361,7 @@ pub async fn modify_message(
 ) -> Result<(), String> {
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
-    let config = GmailConfig::embedded();
+    let config = GmailConfig::from_settings()?;
     let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
     let client = shared_http_client()?;
     let message_url = gmail_message_url(message_id)?;
@@ -1471,7 +1475,7 @@ pub async fn modify_messages(
     let refresh_token = secure_store::load_refresh_token(account_id)?
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
-        refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+        refresh_access_token(account_id, &GmailConfig::from_settings()?, &refresh_token).await?;
     let client = shared_http_client()?;
     let mut succeeded_message_ids = Vec::new();
     for (chunk_index, message_chunk) in message_ids.chunks(1000).enumerate() {
@@ -1514,8 +1518,11 @@ async fn refresh_access_token(
     config: &GmailConfig,
     refresh_token: &str,
 ) -> Result<String, String> {
-    if config.client_id.trim().is_empty() {
-        return Err("GMAIL_CLIENT_CONFIG: OPENMAIL_GMAIL_CLIENT_ID is not configured".to_string());
+    if config.client_id.trim().is_empty() || config.client_secret.as_deref().is_none() {
+        return Err(
+            "GMAIL_CLIENT_CONFIG: Gmail OAuth credentials are not configured in Settings"
+                .to_string(),
+        );
     }
     if let Some(access_token) = load_cached_access_token(account_id) {
         return Ok(access_token);

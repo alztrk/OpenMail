@@ -5,7 +5,12 @@ use aes_gcm::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use keyring::Entry;
 
+use crate::models::MailProvider;
+
 const SERVICE_NAME: &str = "OpenMail";
+const GMAIL_CLIENT_ID_ACCOUNT: &str = "oauth:gmail:client-id";
+const GMAIL_CLIENT_SECRET_ACCOUNT: &str = "oauth:gmail:client-secret";
+const OUTLOOK_CLIENT_ID_ACCOUNT: &str = "oauth:outlook:client-id";
 #[cfg(not(test))]
 const STORAGE_KEY_ACCOUNT: &str = "local-storage-encryption-key";
 
@@ -41,6 +46,69 @@ pub fn restore_refresh_token(account_id: &str, previous_token: Option<&str>) -> 
     match previous_token {
         Some(token) => save_refresh_token(account_id, token),
         None => delete_refresh_token(account_id),
+    }
+}
+
+fn oauth_client_id_account(provider: MailProvider) -> &'static str {
+    match provider {
+        MailProvider::Gmail => GMAIL_CLIENT_ID_ACCOUNT,
+        MailProvider::Outlook => OUTLOOK_CLIENT_ID_ACCOUNT,
+    }
+}
+
+pub fn save_oauth_client_id(provider: MailProvider, client_id: &str) -> Result<(), String> {
+    Entry::new(SERVICE_NAME, oauth_client_id_account(provider))
+        .map_err(|error| error.to_string())?
+        .set_password(client_id)
+        .map_err(|error| error.to_string())
+}
+
+pub fn load_oauth_client_id(provider: MailProvider) -> Result<Option<String>, String> {
+    match Entry::new(SERVICE_NAME, oauth_client_id_account(provider))
+        .map_err(|error| error.to_string())?
+        .get_password()
+    {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn delete_oauth_client_id(provider: MailProvider) -> Result<(), String> {
+    match Entry::new(SERVICE_NAME, oauth_client_id_account(provider))
+        .map_err(|error| error.to_string())?
+        .delete_credential()
+    {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn save_gmail_client_secret(client_secret: &str) -> Result<(), String> {
+    Entry::new(SERVICE_NAME, GMAIL_CLIENT_SECRET_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .set_password(client_secret)
+        .map_err(|error| error.to_string())
+}
+
+pub fn load_gmail_client_secret() -> Result<Option<String>, String> {
+    match Entry::new(SERVICE_NAME, GMAIL_CLIENT_SECRET_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .get_password()
+    {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn delete_gmail_client_secret() -> Result<(), String> {
+    match Entry::new(SERVICE_NAME, GMAIL_CLIENT_SECRET_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .delete_credential()
+    {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 

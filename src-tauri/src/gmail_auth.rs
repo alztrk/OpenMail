@@ -39,7 +39,7 @@ pub fn start(
     auth_state: Arc<Mutex<AuthState>>,
     login_hint: Option<String>,
 ) -> Result<String, String> {
-    let config = GmailConfig::embedded();
+    let config = GmailConfig::from_settings()?;
     log::debug!("Gmail OAuth configuration loaded");
     let listener =
         TcpListener::bind((config.redirect_host.as_str(), 0)).map_err(|error| error.to_string())?;
@@ -106,8 +106,11 @@ pub fn start(
 }
 
 fn build_client(config: &GmailConfig, redirect_uri: &str) -> Result<GmailClient, String> {
-    if config.client_id.trim().is_empty() {
-        return Err("GMAIL_CLIENT_CONFIG: OPENMAIL_GMAIL_CLIENT_ID is not configured".to_string());
+    if config.client_id.trim().is_empty() || config.client_secret.as_deref().is_none() {
+        return Err(
+            "GMAIL_CLIENT_CONFIG: Gmail OAuth credentials are not configured in Settings"
+                .to_string(),
+        );
     }
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
         .map_err(|error| error.to_string())?;
@@ -120,9 +123,10 @@ fn build_client(config: &GmailConfig, redirect_uri: &str) -> Result<GmailClient,
         .set_token_uri(token_url)
         .set_redirect_uri(redirect_url);
 
-    if let Some(client_secret) = config.client_secret.as_deref() {
-        client = client.set_client_secret(ClientSecret::new(client_secret.to_string()));
-    }
+    let client_secret = config.client_secret.as_deref().ok_or_else(|| {
+        "GMAIL_CLIENT_CONFIG: Gmail client secret is not configured in Settings".to_string()
+    })?;
+    client = client.set_client_secret(ClientSecret::new(client_secret.to_string()));
 
     Ok(client)
 }

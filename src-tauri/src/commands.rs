@@ -10,7 +10,7 @@ use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
-    account_store, message_cache,
+    account_store, config, message_cache,
     models::{
         AuthState, MailAccount, MailFolder, MailMessage, MailProvider, MessageAction, MessagePage,
         SyncResult,
@@ -679,11 +679,77 @@ pub fn get_auth_status(state: State<'_, AppState>) -> Result<AuthState, String> 
 }
 
 #[tauri::command]
+pub fn get_oauth_credential_status() -> Result<crate::models::OAuthCredentialStatus, String> {
+    config::oauth_credential_status()
+}
+
+#[tauri::command]
+pub fn save_oauth_credentials(
+    provider: MailProvider,
+    client_id: String,
+    client_secret: Option<String>,
+) -> Result<crate::models::OAuthCredentialStatus, String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return Err("OPENMAIL_OAUTH_CLIENT_ID_REQUIRED".to_string());
+    }
+
+    match provider {
+        MailProvider::Gmail => {
+            let client_secret = client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "OPENMAIL_GMAIL_CLIENT_SECRET_REQUIRED".to_string())?;
+            secure_store::save_oauth_client_id(MailProvider::Gmail, client_id)?;
+            secure_store::save_gmail_client_secret(client_secret)?;
+        }
+        MailProvider::Outlook => {
+            if client_secret
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err("OPENMAIL_OUTLOOK_CLIENT_SECRET_UNSUPPORTED".to_string());
+            }
+            secure_store::save_oauth_client_id(MailProvider::Outlook, client_id)?;
+        }
+    }
+    config::oauth_credential_status()
+}
+
+#[tauri::command]
+pub fn clear_oauth_credentials(
+    provider: MailProvider,
+) -> Result<crate::models::OAuthCredentialStatus, String> {
+    secure_store::delete_oauth_client_id(provider.clone())?;
+    if matches!(provider, MailProvider::Gmail) {
+        secure_store::delete_gmail_client_secret()?;
+    }
+    config::oauth_credential_status()
+}
+
+#[tauri::command]
 pub fn start_auth(
     provider: MailProvider,
     login_hint: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let status = config::oauth_credential_status()?;
+    let configured = match provider {
+        MailProvider::Gmail => status.gmail.client_id && status.gmail.client_secret,
+        MailProvider::Outlook => status.outlook.client_id,
+    };
+    if !configured {
+        return Err(match provider {
+            MailProvider::Gmail => {
+                "GMAIL_CLIENT_CONFIG: Configure the Gmail client ID and client secret in Settings"
+                    .to_string()
+            }
+            MailProvider::Outlook => {
+                "OUTLOOK_CLIENT_CONFIG: Configure the Microsoft client ID in Settings".to_string()
+            }
+        });
+    }
     log::info!("Starting authorization flow for selected provider");
     provider::auth_adapter_for(provider)?.start(
         state.app_data_dir.clone(),
