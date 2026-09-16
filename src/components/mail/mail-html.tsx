@@ -26,7 +26,46 @@ export function MailHtml({ html, title, fontScale, onLinkClick }: MailHtmlProps)
       document.documentElement.dir = 'auto'
       cleanupRef.current?.()
       const responsiveStyle = document.createElement('style')
-      responsiveStyle.textContent = `html { zoom: ${normalizedFontScale} !important; } html, body { width: 100%; max-width: 100%; min-height: 100%; margin: 0; padding: 0; overflow-x: hidden; } body { background: #fff; color: #202124; } img { max-width: 100% !important; height: auto; } table { max-width: 100% !important; } pre { max-width: 100%; white-space: pre-wrap !important; overflow-wrap: anywhere; }`
+      responsiveStyle.textContent = `
+        :root { color-scheme: light; }
+        html { zoom: ${normalizedFontScale} !important; background: #ffffff !important; }
+        html, body { width: 100%; max-width: 100%; min-height: 100%; margin: 0; overflow-x: hidden; }
+        body {
+          box-sizing: border-box;
+          width: min(100%, 760px) !important;
+          margin: 0 auto !important;
+          padding: 34px clamp(20px, 5vw, 48px) 56px !important;
+          background: #ffffff !important;
+          color: #27364a !important;
+          font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif !important;
+          font-size: 15px !important;
+          line-height: 1.65 !important;
+        }
+        body, body * { box-sizing: border-box; }
+        body *:not(img):not(svg) { font-family: inherit !important; }
+        body > table,
+        body > center,
+        body > div,
+        body > main,
+        body > section { width: 100% !important; max-width: 100% !important; margin-right: auto !important; margin-left: auto !important; }
+        table { max-width: 100% !important; }
+        td, th { max-width: 100%; line-height: inherit !important; }
+        h1, h2, h3, h4, h5, h6 {
+          color: #172b42 !important;
+          font-weight: 700 !important;
+          letter-spacing: -0.02em !important;
+          line-height: 1.2 !important;
+        }
+        h1 { font-size: 30px !important; }
+        h2 { font-size: 24px !important; }
+        h3 { font-size: 19px !important; }
+        h4, h5, h6 { font-size: 16px !important; }
+        p, li { line-height: 1.65 !important; }
+        a { color: #2e638f !important; }
+        hr { border: 0 !important; border-top: 1px solid #dbe5ef !important; }
+        img { display: block; max-width: 100% !important; height: auto !important; }
+        pre { max-width: 100%; white-space: pre-wrap !important; overflow-wrap: anywhere; }
+      `
       document.head.append(responsiveStyle)
       let resizeFrameId: number | null = null
       const resize = () => {

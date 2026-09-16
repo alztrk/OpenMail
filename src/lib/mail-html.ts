@@ -11,9 +11,18 @@ export function sanitizeMailHtml(value: string): string {
     FORBID_TAGS: ['base', 'embed', 'form', 'iframe', 'input', 'object', 'script', 'textarea'],
   })
   const document = new DOMParser().parseFromString(sanitized, 'text/html')
-  document.querySelectorAll('img, source, video, audio').forEach((element) => {
+  document.querySelectorAll('img').forEach((element) => {
     const source = element.getAttribute('src')
-    if (!source || !safeImageDataUrl.test(source)) element.removeAttribute('src')
+    if (!source || !isSafeMailImageSource(source)) {
+      element.removeAttribute('src')
+    } else {
+      element.setAttribute('loading', 'eager')
+      element.setAttribute('referrerpolicy', 'no-referrer')
+    }
+    element.removeAttribute('srcset')
+  })
+  document.querySelectorAll('source, video, audio').forEach((element) => {
+    element.removeAttribute('src')
     element.removeAttribute('srcset')
     element.removeAttribute('poster')
   })
@@ -32,4 +41,16 @@ export function sanitizeMailHtml(value: string): string {
     element.removeAttribute('background-image')
   })
   return document.body.innerHTML
+}
+
+function isSafeMailImageSource(source: string): boolean {
+  const normalizedSource = source.trim()
+  if (safeImageDataUrl.test(normalizedSource)) return true
+
+  try {
+    const url = new URL(normalizedSource)
+    return url.protocol === 'https:' && url.hostname.length > 0 && !url.username && !url.password
+  } catch {
+    return false
+  }
 }
