@@ -46,8 +46,8 @@ pnpm screenshots -- --headed
 ```
 
 The portable build reads OAuth credentials from Windows Credential Manager after
-they are entered in Settings. No provider credential is read from a `.env`
-file or build environment. The executable is written to
+they are entered in Settings. No provider credential is required during the
+build. The executable is written to
 `src-tauri/target/release/openmail.exe`.
 
 The live verification target for this release cycle is Gmail. Outlook/Microsoft

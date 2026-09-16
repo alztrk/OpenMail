@@ -37,7 +37,7 @@ If an account was connected before the send scope was added, reconnect it from t
 
 The Gmail OAuth client ID and secret are loaded from the OAuth credentials page
 in Settings. The normal build does not read local credential JSON files. Keep credential JSON
-files, `.env`, refresh tokens,
+files, legacy environment files, refresh tokens,
 access tokens, and service-account credentials out of the repository. OpenMail
 requests offline access and requires a refresh token before saving an account
 locally.

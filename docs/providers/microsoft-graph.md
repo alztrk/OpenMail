@@ -119,7 +119,7 @@ The adapter must verify whether the selected Graph id remains stable after a mov
 
 ## Acceptance criteria
 
-- A personal Outlook.com or Hotmail account can authorize without a client secret when the public client ID is configured in the runtime `.env` file or at build time.
+- A personal Outlook.com or Hotmail account can authorize without a client secret when the public client ID is configured in Settings.
 - A Microsoft 365 account can authorize when tenant consent permits the delegated scopes.
 - The Inbox renders from cache before the refresh completes.
 - The Inbox adapter uses a persisted Graph delta cursor and applies additions, updates, and removals incrementally. Invalid cursors trigger a fresh round, and read throttling honors `Retry-After` with one bounded retry. Portable-release and live-provider verification remain release-hardening work.

@@ -15,7 +15,6 @@ artifacts/screenshots
 *.local
 .env
 .env.*
-!.env.example
 client_secret_*.json
 
 # Editor directories and files
