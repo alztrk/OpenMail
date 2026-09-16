@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{
@@ -35,6 +35,8 @@ const MAX_GMAIL_HISTORY_PAGES: usize = 100;
 const MAX_GMAIL_FULL_SYNC_PAGES: usize = 1_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_GMAIL_READ_RETRIES: usize = 5;
+const MAX_GMAIL_RETRY_DELAY: Duration = Duration::from_secs(64);
 
 #[derive(Debug)]
 struct CachedAccessToken {
@@ -147,6 +149,9 @@ fn format_gmail_api_error(status: reqwest::StatusCode, body: &str, operation: &s
         return "GMAIL_PERMISSION_REQUIRED: Gmail permissions are incomplete. Reconnect the account."
             .to_string();
     }
+    if matches!(reason, Some("rateLimitExceeded" | "userRateLimitExceeded")) {
+        return format!("GMAIL_RATE_LIMITED: Gmail rate limited {operation}. Try again shortly.");
+    }
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return format!("AUTH_REQUIRED: Gmail authorization expired during {operation}");
     }
@@ -173,26 +178,88 @@ async fn send_gmail_read_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
-    let mut response = build_request()
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+    for retry_number in 0..=MAX_GMAIL_READ_RETRIES {
+        let response = build_request()
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+
+        if status == StatusCode::FORBIDDEN {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let body = response.text().await.unwrap_or_default();
+            if !is_retryable_quota_error(&body) {
+                return Err(format_gmail_api_error(status, &body, operation));
+            }
+            if retry_number == MAX_GMAIL_READ_RETRIES {
+                return Err(format_gmail_api_error(status, &body, operation));
+            }
+            log::warn!(
+                "Gmail quota limit reached during {operation}; retry {}/{}",
+                retry_number + 1,
+                MAX_GMAIL_READ_RETRIES
+            );
+            sleep_before_gmail_retry(retry_number, retry_after).await;
+            continue;
+        }
+
+        if !is_retryable_gmail_status(status) || retry_number == MAX_GMAIL_READ_RETRIES {
+            return Ok(response);
+        }
+
         let retry_after = response
             .headers()
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(1)
-            .min(5);
-        log::warn!("Gmail rate limit reached during {operation}; retrying once");
-        tokio::time::sleep(Duration::from_secs(retry_after)).await;
-        response = build_request()
-            .send()
-            .await
-            .map_err(|error| format!("Gmail rate-limit retry failed: {error}"))?;
+            .and_then(|value| value.parse::<u64>().ok());
+        log::warn!(
+            "Gmail transient error during {operation}; retry {}/{}",
+            retry_number + 1,
+            MAX_GMAIL_READ_RETRIES
+        );
+        sleep_before_gmail_retry(retry_number, retry_after).await;
     }
-    Ok(response)
+
+    Err("Gmail retry loop ended unexpectedly".to_string())
+}
+
+fn is_retryable_gmail_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn is_retryable_quota_error(body: &str) -> bool {
+    let parsed = serde_json::from_str::<GmailApiErrorResponse>(body).ok();
+    parsed
+        .as_ref()
+        .and_then(|response| response.error.errors.as_ref())
+        .is_some_and(|errors| {
+            errors
+                .iter()
+                .filter_map(|error| error.reason.as_deref())
+                .any(|reason| matches!(reason, "rateLimitExceeded" | "userRateLimitExceeded"))
+        })
+}
+
+async fn sleep_before_gmail_retry(retry_number: usize, retry_after_secs: Option<u64>) {
+    let exponential_secs = 1_u64 << retry_number.min(6);
+    let requested_secs = retry_after_secs.unwrap_or(0).max(exponential_secs);
+    let delay = Duration::from_secs(requested_secs).min(MAX_GMAIL_RETRY_DELAY);
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_millis()) % 1_001)
+        .unwrap_or(0);
+    tokio::time::sleep(delay + Duration::from_millis(jitter_ms)).await;
 }
 
 #[derive(Debug, Deserialize)]

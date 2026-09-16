@@ -8,6 +8,41 @@ fn non_empty_trimmed(value: String) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+pub fn validate_oauth_credentials(
+    provider: &MailProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
+) -> Result<(), String> {
+    if client_id.trim().is_empty() {
+        return Err("OPENMAIL_OAUTH_CLIENT_ID_REQUIRED".to_string());
+    }
+
+    match provider {
+        MailProvider::Gmail => {
+            if client_secret.is_none_or(|value| value.trim().is_empty()) {
+                return Err("OPENMAIL_GMAIL_CLIENT_SECRET_REQUIRED".to_string());
+            }
+        }
+        MailProvider::Outlook => {
+            if client_secret.is_some_and(|value| !value.trim().is_empty()) {
+                return Err("OPENMAIL_OUTLOOK_CLIENT_SECRET_UNSUPPORTED".to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn provider_credentials_configured(
+    status: &OAuthCredentialStatus,
+    provider: &MailProvider,
+) -> bool {
+    match provider {
+        MailProvider::Gmail => status.gmail.client_id && status.gmail.client_secret,
+        MailProvider::Outlook => status.outlook.client_id,
+    }
+}
+
 pub fn microsoft_client_id() -> Result<String, String> {
     secure_store::load_oauth_client_id(MailProvider::Outlook)?
         .and_then(non_empty_trimmed)
@@ -69,7 +104,8 @@ pub fn oauth_credential_status() -> Result<OAuthCredentialStatus, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::non_empty_trimmed;
+    use super::{non_empty_trimmed, provider_credentials_configured, validate_oauth_credentials};
+    use crate::models::{MailProvider, OAuthCredentialStatus, OAuthProviderCredentialStatus};
 
     #[test]
     fn trims_values_and_rejects_blank_configuration() {
@@ -78,5 +114,48 @@ mod tests {
             Some("client-id".to_string())
         );
         assert_eq!(non_empty_trimmed("   ".to_string()), None);
+    }
+
+    #[test]
+    fn validates_required_provider_credentials_without_exposing_values() {
+        assert!(
+            validate_oauth_credentials(&MailProvider::Gmail, " client-id ", Some("secret")).is_ok()
+        );
+        assert_eq!(
+            validate_oauth_credentials(&MailProvider::Gmail, "client-id", None),
+            Err("OPENMAIL_GMAIL_CLIENT_SECRET_REQUIRED".to_string())
+        );
+        assert_eq!(
+            validate_oauth_credentials(&MailProvider::Gmail, "   ", Some("secret")),
+            Err("OPENMAIL_OAUTH_CLIENT_ID_REQUIRED".to_string())
+        );
+        assert!(validate_oauth_credentials(&MailProvider::Outlook, "client-id", None).is_ok());
+        assert_eq!(
+            validate_oauth_credentials(&MailProvider::Outlook, "client-id", Some("secret")),
+            Err("OPENMAIL_OUTLOOK_CLIENT_SECRET_UNSUPPORTED".to_string())
+        );
+    }
+
+    #[test]
+    fn checks_each_provider_against_its_required_credential_status() {
+        let status = OAuthCredentialStatus {
+            gmail: OAuthProviderCredentialStatus {
+                client_id: true,
+                client_secret: false,
+            },
+            outlook: OAuthProviderCredentialStatus {
+                client_id: true,
+                client_secret: false,
+            },
+        };
+
+        assert!(!provider_credentials_configured(
+            &status,
+            &MailProvider::Gmail
+        ));
+        assert!(provider_credentials_configured(
+            &status,
+            &MailProvider::Outlook
+        ));
     }
 }

@@ -45,6 +45,10 @@ pub fn run() {
                     .ok_or("Main window is unavailable during startup")?;
                 window.maximize()?;
                 window.show()?;
+
+                if let Err(error) = commands::register_notification_app_identity(app.handle()) {
+                    log::warn!("{error}");
+                }
             }
 
             #[cfg(desktop)]

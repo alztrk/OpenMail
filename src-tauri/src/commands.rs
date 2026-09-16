@@ -25,6 +25,27 @@ pub struct AppState {
     pub account_operation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
+#[cfg(windows)]
+pub fn register_notification_app_identity(app: &AppHandle) -> Result<(), String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let identifier = app.config().identifier.as_str();
+    let display_name = app.config().product_name.as_deref().unwrap_or("OpenMail");
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let icon_uri = executable.to_string_lossy().into_owned();
+    let key_path = format!("Software\\Classes\\AppUserModelId\\{identifier}");
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let (app_id_key, _) = current_user
+        .create_subkey(key_path)
+        .map_err(|error| format!("Could not register Windows notification identity: {error}"))?;
+    app_id_key
+        .set_value("DisplayName", &display_name)
+        .map_err(|error| format!("Could not set Windows notification display name: {error}"))?;
+    app_id_key
+        .set_value("IconUri", &icon_uri)
+        .map_err(|error| format!("Could not set Windows notification icon: {error}"))
+}
+
 #[tauri::command]
 pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
     let window = app
@@ -89,9 +110,14 @@ pub fn send_desktop_notification(
                     Ok(())
                 });
         }
-        toast
+        let result = toast
             .show()
-            .map_err(|error| format!("Could not show Windows notification: {error}"))
+            .map_err(|error| format!("Could not show Windows notification: {error}"));
+        match &result {
+            Ok(()) => log::info!("Windows desktop notification shown"),
+            Err(error) => log::error!("Windows desktop notification failed: {error}"),
+        }
+        result
     }
 
     #[cfg(not(windows))]
@@ -689,28 +715,18 @@ pub fn save_oauth_credentials(
     client_id: String,
     client_secret: Option<String>,
 ) -> Result<crate::models::OAuthCredentialStatus, String> {
+    config::validate_oauth_credentials(&provider, &client_id, client_secret.as_deref())?;
     let client_id = client_id.trim();
-    if client_id.is_empty() {
-        return Err("OPENMAIL_OAUTH_CLIENT_ID_REQUIRED".to_string());
-    }
 
     match provider {
         MailProvider::Gmail => {
-            let client_secret = client_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| "OPENMAIL_GMAIL_CLIENT_SECRET_REQUIRED".to_string())?;
+            let Some(client_secret) = client_secret.as_deref().map(str::trim) else {
+                return Err("OPENMAIL_GMAIL_CLIENT_SECRET_REQUIRED".to_string());
+            };
             secure_store::save_oauth_client_id(MailProvider::Gmail, client_id)?;
             secure_store::save_gmail_client_secret(client_secret)?;
         }
         MailProvider::Outlook => {
-            if client_secret
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                return Err("OPENMAIL_OUTLOOK_CLIENT_SECRET_UNSUPPORTED".to_string());
-            }
             secure_store::save_oauth_client_id(MailProvider::Outlook, client_id)?;
         }
     }
@@ -735,10 +751,7 @@ pub fn start_auth(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let status = config::oauth_credential_status()?;
-    let configured = match provider {
-        MailProvider::Gmail => status.gmail.client_id && status.gmail.client_secret,
-        MailProvider::Outlook => status.outlook.client_id,
-    };
+    let configured = config::provider_credentials_configured(&status, &provider);
     if !configured {
         return Err(match provider {
             MailProvider::Gmail => {
