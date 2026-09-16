@@ -13,20 +13,46 @@ docs/                 Operational and architectural documentation
 
 ## Commands
 
+Use Node.js 20 or newer with pnpm 11.13.1. The `packageManager` field in
+`package.json` pins the project version.
+
 ```powershell
-npm install
-npm run dev
-npm run tauri dev
-npm run lint
-npm run build
+pnpm install
+pnpm dev
+pnpm tauri dev
+pnpm lint
+pnpm test
+pnpm build
 cargo check --manifest-path src-tauri/Cargo.toml
-npm run tauri build -- --no-bundle
+pnpm tauri build --no-bundle
 ```
 
-The portable build reads the Gmail OAuth client ID and secret from a `.env` file
-next to the executable at runtime. Microsoft Graph reads its public client ID
-from the `OPENMAIL_MICROSOFT_CLIENT_ID` build environment. The executable is
-written to `src-tauri/target/release/openmail.exe`.
+### Visual QA screenshots
+
+`pnpm screenshots` starts the Vite app, opens the actual React interface in
+the installed Microsoft Edge browser at a 2560×1440 viewport, and saves the
+captured states under `artifacts/screenshots/`. The script injects
+screenshot-only Tauri fixtures so visual review does not need a live mailbox,
+OAuth session, or native Computer Use connection. These fixtures are never
+loaded by the production application.
+
+Useful options are `--width`, `--height`, `--headed`, `--no-server`, and
+`--browser-path`:
+
+```powershell
+pnpm screenshots
+pnpm screenshots -- --width 1440 --height 900
+pnpm screenshots -- --headed
+```
+
+The portable build reads the Gmail OAuth client ID and secret plus the Microsoft
+Graph public client ID from a `.env` file next to the executable at runtime.
+For Microsoft Graph, the build environment remains a supported fallback. The
+executable is written to `src-tauri/target/release/openmail.exe`.
+
+The live verification target for this release cycle is Gmail. Outlook/Microsoft
+Graph is validated only through compilation and unit tests until a public client
+ID, tenant or consent configuration, and a dedicated test account are available.
 
 ## Diagnostics
 

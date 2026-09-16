@@ -10,7 +10,26 @@ All notable changes to OpenMail are recorded here.
 - Gmail and Microsoft provider errors now expose distinct reconnect, permission, rate-limit, and temporary-service states.
 - Provider recovery error contracts now have regression coverage for HTTP and OAuth failure categories.
 - Gmail and Microsoft mailbox reads use a single bounded `Retry-After` retry without retrying message mutations.
-- Gmail metadata failures no longer prevent successfully loaded messages from appearing in the mailbox.
+- OAuth reauthorization now restores the previous refresh token if account metadata cannot be persisted.
+- Account removal now rejects stale or unknown account identifiers before touching local credentials or cache data.
+- Account removal and in-flight cache writes are serialized so a late sync cannot recreate a removed account's local mailbox data.
+- Account mailbox reads and mutations are serialized per account through their provider and cache stages, preventing late synchronization results from reverting newer actions.
+- Provider-loaded compose HTML is sanitized before editor state, draft persistence, or message delivery.
+- Outlook conversation reads now load complete bodies and attachment metadata before rendering, and staged drafts are cleaned up when an attachment upload fails.
+- Search commands now normalize and reject undersized queries consistently at the backend boundary.
+- Local settings and saved-recipient storage failures now remain visible as user-facing states instead of uncaught UI errors.
+- Message, reply, and draft commands now derive the sender address from the stored account instead of trusting the client payload.
+- OAuth callback listeners now accept only the registered callback path in addition to validating state.
+- Windows launch-at-startup registration now quotes executable paths that contain spaces.
+- Gmail and Outlook authorization failures and timeouts now use provider-correct localized messages.
+- Outlook token-refresh failures and missing client configuration now use safe localized error states.
+- Outlook attachment sizes are validated again at the backend boundary, including the combined compose total.
+- Outlook compose now supports attachments up to 150 MB through Graph upload sessions, with bounded chunks, retryable transient failures, and no bearer token on the pre-authenticated upload URL.
+- Application close requests now pass through unsaved compose protection before tray hiding or shutdown.
+- Drafts can be saved before a recipient is entered, while sending still requires a valid recipient.
+- Mail HTML sanitization now preserves safe inline layout styles while removing CSS-based remote resource loading.
+- Gmail metadata failures leave the existing cache untouched and surface an incomplete-sync error instead of replacing it with partial data.
+- Release verification scope is documented as Gmail-only for live provider tests; Microsoft Graph remains compile- and unit-tested without live credentials.
 - Reader hydration no longer resets the main reading surface scroll position.
 - Single-instance Windows startup now focuses the existing OpenMail window instead of opening a second process.
 - Global search now opens a compact result surface with one clear hierarchy, provider-aware account identity, and no repeated query or scope chrome.
@@ -79,6 +98,10 @@ All notable changes to OpenMail are recorded here.
 - Account navigation now scrolls independently when many accounts are connected, while identity popovers render outside the rail overflow boundary and stay inside the viewport edges.
 - Global search now lives in the window header and searches every connected account concurrently, showing provider-aware results in a keyboard-navigable modal panel.
 - Search cache isolation is covered by a Rust regression test.
+- Compose now validates incomplete recipient values immediately and keeps the selected account's sender, capabilities, and attachment limits aligned when account context changes.
+- Stale mailbox paging and refresh responses are ignored after account, folder, or inbox-mode changes, and partial refresh failures are reported instead of showing a false success message.
+- Draft loading and saving now use request and content revisions so late responses cannot overwrite newer compose edits.
+- Microsoft Graph no longer replays non-idempotent mutations after an authorization failure, avoiding duplicate sends or drafts when a provider response is ambiguous.
 - A corrupted primary message cache now recovers from its valid backup.
 - Cached message bodies now remain visible while conversation details refresh in the background.
 - Previously opened conversations are restored from the local cache before a network refresh.
@@ -116,8 +139,7 @@ All notable changes to OpenMail are recorded here.
 
 ### Planned
 
-- Outlook provider support.
-- Compose and reply delivery improvements beyond the current Gmail text flow.
+- Microsoft Graph live-provider verification with personal and work accounts.
 
 ## 0.1.0 - 2026-09-06
 

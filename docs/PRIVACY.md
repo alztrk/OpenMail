@@ -4,7 +4,7 @@ OpenMail is intended to be local-first.
 
 ## Storage model
 
-Mailbox messages and user-requested attachments are stored in the OpenMail application data directory on the Windows device. Refresh credentials are stored separately through the Windows secure credential store.
+Mailbox messages and account metadata are stored as authenticated encrypted files in the OpenMail application data directory on the Windows device. The local storage key is stored separately through the Windows secure credential store. Refresh credentials are also stored through that secure credential store. User-requested attachments remain ordinary files in the user's Downloads directory.
 
 OpenMail does not require an OpenMail-hosted backend for the first local mode. Provider APIs remain the source of truth for synchronization; the local database is a device cache and offline reading store.
 
@@ -14,7 +14,7 @@ OpenMail sends only the provider API requests required for the user action, such
 
 ## User control
 
-Disconnecting an account deletes its refresh credential and removes its local mailbox cache. Downloaded attachments remain ordinary files in the user's Downloads directory and must be removed by the user.
+Disconnecting an account deletes its refresh credential and removes its local mailbox cache. Existing legacy plaintext account and message cache files are migrated to the encrypted format when first read. Downloaded attachments remain ordinary files in the user's Downloads directory and must be removed by the user.
 
 ## Limitations
 

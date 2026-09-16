@@ -55,10 +55,21 @@ Revoked, expired, or missing credentials become an account reauthorization state
 
 Outlook, Hotmail, Live, and Microsoft 365 accounts use the Microsoft identity platform authorization code flow with PKCE and the system browser. A public Microsoft Entra application client ID is required for a distributed desktop build; no client secret is used or embedded in OpenMail.
 
-Set `OPENMAIL_MICROSOFT_CLIENT_ID` in the build environment before compiling the desktop application. The value is a public application identifier, not a credential. Register `http://localhost` as a mobile and desktop redirect URI in the Entra app registration. The running adapter binds an available loopback port and uses the corresponding callback path.
+Set `OPENMAIL_MICROSOFT_CLIENT_ID` in the build environment before compiling the desktop application, or provide it in the `.env` file next to `OpenMail.exe` for a portable release. A runtime value takes precedence over the build-time value. The value is a public application identifier, not a credential. Register `http://localhost` as a mobile and desktop redirect URI in the Entra app registration. The running adapter binds an available loopback port and uses the corresponding callback path.
 
 The delegated permissions are `User.Read`, `Mail.ReadWrite`, `Mail.Send`, and `offline_access`, together with the OpenID Connect scopes used during sign-in. The Graph adapter uses the signed-in user's `/me` profile and mail folder/message endpoints, stores refresh tokens in Windows Credential Manager, and keeps access tokens in the process cache with expiry-aware refresh. It uses draft-then-send for compose and reply so the sent message can be hydrated into the local cache. See the [Microsoft Graph delegated access flow](https://learn.microsoft.com/en-us/graph/auth-v2-user), [authorization code flow with PKCE](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow), [create a reply](https://learn.microsoft.com/en-us/graph/api/message-createreply?view=graph-rest-1.0), and [list messages](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0).
 
 ## Current verification boundary
 
-The Gmail OAuth flow and mailbox synchronization are compile-checked and require a real Google Cloud desktop client and an interactive Google account to verify end to end. The Microsoft Graph adapter is compile-checked and requires a public Microsoft Entra client ID plus an interactive Microsoft account for end-to-end verification. No refresh tokens or mailbox credentials are included in this repository.
+The Gmail OAuth flow, token refresh, mailbox synchronization, compose, reply,
+and attachment paths are the current live end-to-end verification target. That
+test requires a real Google Cloud desktop client ID and secret, an interactive
+Gmail account, and user approval in the browser. No credential or mailbox
+content is included in this repository.
+
+The Microsoft Graph adapter is compile-checked and covered by unit tests, but it
+is not live-tested in the current release cycle. A live Outlook test would
+require a public Microsoft Entra client ID, the relevant tenant and delegated
+consent configuration, and an interactive Microsoft account. No client secret,
+tenant credential, refresh token, or mailbox content is requested or stored in
+this repository for that test.

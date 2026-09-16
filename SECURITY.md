@@ -11,9 +11,11 @@ Do not open a public issue for a suspected vulnerability. Use a private GitHub S
 ## Security requirements
 
 - Store refresh tokens through the Windows secure credential store.
+- Encrypt account metadata and local mailbox cache files with an authenticated encryption key stored through the Windows secure credential store.
 - Use the smallest provider permission scopes that support the feature.
 - Treat all provider content as untrusted input.
 - Sanitize rendered HTML mail and attachments before display.
+- Sanitize provider-loaded compose HTML before it is placed in the editor or sent back to a provider.
 - Keep the runtime cache and provider state inside the OpenMail application data directory. User-initiated attachment downloads are written to the Windows Downloads directory and must use sanitized filenames without exposing provider credentials.
 
 ## Supported versions
