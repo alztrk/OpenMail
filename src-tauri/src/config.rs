@@ -3,7 +3,12 @@ use std::sync::OnceLock;
 
 static ENV_LOADED: OnceLock<()> = OnceLock::new();
 
-fn load_runtime_environment() {
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+pub fn load_runtime_environment() {
     ENV_LOADED.get_or_init(|| {
         let mut paths = Vec::new();
         if let Ok(executable) = std::env::current_exe() {
@@ -42,15 +47,22 @@ fn load_runtime_environment() {
                 }
                 Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    log::warn!(
-                        "Could not load OpenMail runtime environment from {}: {}",
-                        path.display(),
-                        error
-                    );
+                    log::warn!("Could not load OpenMail runtime environment file: {error}");
                 }
             }
         }
     });
+}
+
+pub fn microsoft_client_id() -> Result<String, String> {
+    load_runtime_environment();
+    std::env::var("OPENMAIL_MICROSOFT_CLIENT_ID")
+        .ok()
+        .or_else(|| option_env!("OPENMAIL_MICROSOFT_CLIENT_ID").map(str::to_owned))
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| {
+            "OUTLOOK_CLIENT_CONFIG: OPENMAIL_MICROSOFT_CLIENT_ID is not configured".to_string()
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +77,28 @@ impl GmailConfig {
         load_runtime_environment();
 
         Self {
-            client_id: std::env::var("OPENMAIL_GMAIL_CLIENT_ID").unwrap_or_default(),
-            client_secret: std::env::var("OPENMAIL_GMAIL_CLIENT_SECRET").ok(),
+            client_id: std::env::var("OPENMAIL_GMAIL_CLIENT_ID")
+                .ok()
+                .and_then(non_empty_trimmed)
+                .unwrap_or_default(),
+            client_secret: std::env::var("OPENMAIL_GMAIL_CLIENT_SECRET")
+                .ok()
+                .and_then(non_empty_trimmed),
             redirect_host: "127.0.0.1".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_empty_trimmed;
+
+    #[test]
+    fn trims_values_and_rejects_blank_configuration() {
+        assert_eq!(
+            non_empty_trimmed("  client-id  ".to_string()),
+            Some("client-id".to_string())
+        );
+        assert_eq!(non_empty_trimmed("   ".to_string()), None);
     }
 }

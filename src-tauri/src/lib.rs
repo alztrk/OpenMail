@@ -1,4 +1,5 @@
 mod account_store;
+mod attachment_store;
 mod commands;
 mod config;
 mod gmail_auth;
@@ -37,6 +38,15 @@ fn restore_main_window(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(desktop)]
+            {
+                let window = app
+                    .get_webview_window("main")
+                    .ok_or("Main window is unavailable during startup")?;
+                window.maximize()?;
+                window.show()?;
+            }
+
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {

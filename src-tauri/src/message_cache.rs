@@ -7,25 +7,41 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{MailFolder, MailMessage, MessageAction, MessagePage};
+use crate::{
+    models::{MailFolder, MailMessage, MessageAction, MessagePage},
+    secure_store,
+};
 
 const MAX_SEARCH_CACHE_ENTRIES: usize = 20;
 const MAX_LOCAL_SEARCH_RESULTS: usize = 100;
 const SENT_CACHE_SCOPE: &str = "folder:SENT";
+const CACHE_FORMAT_VERSION: u8 = 1;
 
 type CacheLock = Arc<Mutex<()>>;
 
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, CacheLock>>> = OnceLock::new();
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct CacheFile {
     accounts: Vec<CachedAccountMessages>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedAccountMessages {
     account_id: String,
     page: MessagePage,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EncryptedCacheFile {
+    version: u8,
+    nonce: String,
+    ciphertext: String,
+}
+
+enum CacheFileRead {
+    Encrypted(CacheFile),
+    Legacy(CacheFile),
 }
 
 pub fn load(data_dir: &Path, account_id: &str) -> Result<Option<MessagePage>, String> {
@@ -326,7 +342,19 @@ pub fn save_sync(
             .iter()
             .map(|message| message.id.clone())
             .collect();
-        let mut messages = incoming_messages;
+        let mut messages = incoming_messages
+            .into_iter()
+            .map(|message| {
+                match existing_page
+                    .messages
+                    .iter()
+                    .find(|existing| existing.id == message.id)
+                {
+                    Some(existing) => merge_message_details(existing, &message),
+                    None => message,
+                }
+            })
+            .collect::<Vec<_>>();
         messages.extend(existing_page.messages.into_iter().filter(|message| {
             !incoming_ids.contains(&message.id) && !removed_ids.contains(message.id.as_str())
         }));
@@ -525,10 +553,36 @@ pub fn remove_account(data_dir: &Path, account_id: &str) -> Result<(), String> {
 
 fn remove_account_locked(data_dir: &Path, account_id: &str) -> Result<(), String> {
     let mut cache = read(data_dir)?;
+    let original_cache = cache.clone();
     cache.accounts.retain(|entry| {
         entry.account_id != account_id && !entry.account_id.starts_with(&format!("{account_id}::"))
     });
-    write(data_dir, &cache)
+    write(data_dir, &cache)?;
+    let backup_path = data_dir.join("messages-cache.json.bak");
+    if backup_path.exists() {
+        if let Err(error) = fs::remove_file(backup_path) {
+            let rollback_error = write(data_dir, &original_cache).err();
+            return Err(match rollback_error {
+                Some(rollback_error) => format!(
+                    "Message cache backup could not be removed: {error}; cache restore failed: {rollback_error}"
+                ),
+                None => format!("Message cache backup could not be removed: {error}"),
+            });
+        }
+    }
+    let legacy_path = data_dir.join("messages-cache.json.legacy");
+    if legacy_path.exists() {
+        if let Err(error) = fs::remove_file(legacy_path) {
+            let rollback_error = write(data_dir, &original_cache).err();
+            return Err(match rollback_error {
+                Some(rollback_error) => format!(
+                    "Legacy message cache could not be removed: {error}; cache restore failed: {rollback_error}"
+                ),
+                None => format!("Legacy message cache could not be removed: {error}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn cache_key(account_id: &str, scope: Option<&str>) -> String {
@@ -567,50 +621,113 @@ fn read(data_dir: &Path) -> Result<CacheFile, String> {
     let backup_path = data_dir.join("messages-cache.json.bak");
     if cache_path.exists() {
         match read_cache_file(&cache_path) {
-            Ok(cache) => return Ok(cache),
+            Ok(CacheFileRead::Encrypted(cache)) => return Ok(cache),
+            Ok(CacheFileRead::Legacy(cache)) => {
+                write(data_dir, &cache)?;
+                return Ok(cache);
+            }
             Err(primary_error) if backup_path.exists() => {
-                return read_cache_file(&backup_path).or(Err(primary_error));
+                return match read_cache_file(&backup_path) {
+                    Ok(CacheFileRead::Encrypted(cache)) => Ok(cache),
+                    Ok(CacheFileRead::Legacy(cache)) => {
+                        write(data_dir, &cache)?;
+                        Ok(cache)
+                    }
+                    Err(_) => Err(primary_error),
+                };
             }
             Err(error) => return Err(error),
         }
     }
     if backup_path.exists() {
-        return read_cache_file(&backup_path);
+        return match read_cache_file(&backup_path)? {
+            CacheFileRead::Encrypted(cache) => Ok(cache),
+            CacheFileRead::Legacy(cache) => {
+                write(data_dir, &cache)?;
+                Ok(cache)
+            }
+        };
     }
     Ok(CacheFile::default())
 }
 
-fn read_cache_file(cache_path: &Path) -> Result<CacheFile, String> {
+fn read_cache_file(cache_path: &Path) -> Result<CacheFileRead, String> {
     let content = fs::read_to_string(cache_path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content).map_err(|error| error.to_string())
+    if let Ok(envelope) = serde_json::from_str::<EncryptedCacheFile>(&content) {
+        if envelope.version != CACHE_FORMAT_VERSION {
+            return Err(format!(
+                "Unsupported message cache format version: {}",
+                envelope.version
+            ));
+        }
+        let plaintext = secure_store::decrypt_payload(&envelope.nonce, &envelope.ciphertext)?;
+        let cache = serde_json::from_slice(&plaintext)
+            .map_err(|error| format!("Decrypted message cache is invalid: {error}"))?;
+        return Ok(CacheFileRead::Encrypted(cache));
+    }
+    serde_json::from_str(&content)
+        .map(CacheFileRead::Legacy)
+        .map_err(|error| format!("Message cache is invalid: {error}"))
 }
 
 fn write(data_dir: &Path, cache: &CacheFile) -> Result<(), String> {
     // Keep a recoverable backup because Windows cannot atomically rename over an existing file.
     fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
-    let content = serde_json::to_string_pretty(cache).map_err(|error| error.to_string())?;
+    let plaintext = serde_json::to_vec(cache).map_err(|error| error.to_string())?;
+    let (nonce, ciphertext) = secure_store::encrypt_payload(&plaintext)?;
+    let content = serde_json::to_string_pretty(&EncryptedCacheFile {
+        version: CACHE_FORMAT_VERSION,
+        nonce,
+        ciphertext,
+    })
+    .map_err(|error| error.to_string())?;
     let cache_path = path(data_dir);
     let temporary_path = cache_path.with_extension("json.tmp");
     let backup_path = cache_path.with_extension("json.bak");
+    let legacy_path = cache_path.with_extension("json.legacy");
+    let has_primary = cache_path.exists();
+    let primary_is_encrypted = has_primary && is_encrypted_cache_file(&cache_path);
+    let remove_plaintext_backup = backup_path.exists() && !is_encrypted_cache_file(&backup_path);
     fs::write(&temporary_path, content).map_err(|error| error.to_string())?;
-    if cache_path.exists() {
+    if primary_is_encrypted {
         if backup_path.exists() {
             fs::remove_file(&backup_path).map_err(|error| error.to_string())?;
         }
         fs::rename(&cache_path, &backup_path).map_err(|error| error.to_string())?;
+    } else if has_primary {
+        if legacy_path.exists() {
+            fs::remove_file(&legacy_path).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&cache_path, &legacy_path).map_err(|error| error.to_string())?;
     }
     if let Err(error) = fs::rename(&temporary_path, &cache_path) {
-        if backup_path.exists() {
+        if primary_is_encrypted && backup_path.exists() {
             let _ = fs::rename(&backup_path, &cache_path);
+        } else if has_primary && legacy_path.exists() {
+            let _ = fs::rename(&legacy_path, &cache_path);
         }
         return Err(error.to_string());
     }
+    if has_primary && legacy_path.exists() {
+        fs::remove_file(&legacy_path).map_err(|error| error.to_string())?;
+    }
+    if remove_plaintext_backup && backup_path.exists() {
+        fs::remove_file(&backup_path).map_err(|error| error.to_string())?;
+    }
     Ok(())
+}
+
+fn is_encrypted_cache_file(cache_path: &Path) -> bool {
+    fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<EncryptedCacheFile>(&content).ok())
+        .is_some_and(|envelope| envelope.version == CACHE_FORMAT_VERSION)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::MailAttachment;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -979,6 +1096,61 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_hydrated_details_when_metadata_is_refreshed() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-cache-details-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        let mut hydrated = message("full body");
+        hydrated.body_html = Some("<p>full body</p>".to_string());
+        hydrated.attachments = vec![MailAttachment {
+            id: "attachment-1".to_string(),
+            filename: "report.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 12,
+        }];
+        hydrated.has_attachment = true;
+        save_page(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![hydrated],
+                next_page_token: None,
+                history_id: Some("history-1".to_string()),
+            },
+            false,
+        )
+        .expect("hydrated message should save");
+
+        let mut metadata = message("");
+        metadata.subject = "Updated subject".to_string();
+        let synced = save_sync(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![metadata],
+                next_page_token: None,
+                history_id: Some("history-2".to_string()),
+            },
+            &[],
+        )
+        .expect("metadata refresh should save");
+
+        assert_eq!(synced.messages.len(), 1);
+        assert_eq!(synced.messages[0].subject, "Updated subject");
+        assert_eq!(synced.messages[0].body, "full body");
+        assert_eq!(
+            synced.messages[0].body_html.as_deref(),
+            Some("<p>full body</p>")
+        );
+        assert_eq!(synced.messages[0].attachments.len(), 1);
+        assert!(synced.messages[0].has_attachment);
+        fs::remove_dir_all(data_dir).expect("cache test directory should be removable");
+    }
+
+    #[test]
     fn search_cache_isolated_by_query() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1236,5 +1408,163 @@ mod tests {
             .expect("recovered cache should exist");
         assert_eq!(recovered.messages[0].body, "recoverable");
         fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn stores_cache_as_encrypted_json() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-encrypted-cache-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        save_page(
+            &data_dir,
+            account_id,
+            MessagePage {
+                messages: vec![message("secret body")],
+                next_page_token: None,
+                history_id: None,
+            },
+            false,
+        )
+        .expect("encrypted cache should save");
+
+        let content =
+            fs::read_to_string(path(&data_dir)).expect("encrypted cache should be readable");
+        let envelope: EncryptedCacheFile =
+            serde_json::from_str(&content).expect("cache should use the encrypted envelope");
+        assert_eq!(envelope.version, CACHE_FORMAT_VERSION);
+        assert!(!content.contains("secret body"));
+        assert_eq!(
+            load(&data_dir, account_id)
+                .expect("encrypted cache should load")
+                .expect("cached page should exist")
+                .messages[0]
+                .body,
+            "secret body"
+        );
+        fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn migrates_legacy_plaintext_cache_on_first_read() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-legacy-cache-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        let legacy_cache = CacheFile {
+            accounts: vec![CachedAccountMessages {
+                account_id: account_id.to_string(),
+                page: MessagePage {
+                    messages: vec![message("legacy secret body")],
+                    next_page_token: None,
+                    history_id: None,
+                },
+            }],
+        };
+        fs::create_dir_all(&data_dir).expect("legacy cache directory should exist");
+        fs::write(
+            path(&data_dir),
+            serde_json::to_string(&legacy_cache).expect("legacy cache should serialize"),
+        )
+        .expect("legacy cache should be written");
+
+        let loaded = load(&data_dir, account_id)
+            .expect("legacy cache should migrate")
+            .expect("migrated cache should exist");
+        let content =
+            fs::read_to_string(path(&data_dir)).expect("migrated cache should be readable");
+        assert_eq!(loaded.messages[0].body, "legacy secret body");
+        assert!(!content.contains("legacy secret body"));
+        assert!(serde_json::from_str::<EncryptedCacheFile>(&content).is_ok());
+        assert!(!data_dir.join("messages-cache.json.legacy").exists());
+        fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn migrates_legacy_cache_backup_when_primary_is_corrupt() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir =
+            std::env::temp_dir().join(format!("openmail-legacy-cache-backup-test-{suffix}"));
+        let account_id = "gmail:test@example.com";
+        let legacy_cache = CacheFile {
+            accounts: vec![CachedAccountMessages {
+                account_id: account_id.to_string(),
+                page: MessagePage {
+                    messages: vec![message("legacy backup secret body")],
+                    next_page_token: None,
+                    history_id: None,
+                },
+            }],
+        };
+        fs::create_dir_all(&data_dir).expect("cache directory should exist");
+        fs::write(path(&data_dir), "{not valid json").expect("primary should be corrupt");
+        fs::write(
+            data_dir.join("messages-cache.json.bak"),
+            serde_json::to_string(&legacy_cache).expect("legacy cache should serialize"),
+        )
+        .expect("legacy cache backup should be written");
+
+        let loaded = load(&data_dir, account_id)
+            .expect("legacy backup should migrate")
+            .expect("migrated cache should exist");
+        assert_eq!(loaded.messages[0].body, "legacy backup secret body");
+        let content =
+            fs::read_to_string(path(&data_dir)).expect("migrated cache should be readable");
+        assert!(serde_json::from_str::<EncryptedCacheFile>(&content).is_ok());
+        assert!(!content.contains("legacy backup secret body"));
+        assert!(!data_dir.join("messages-cache.json.bak").exists());
+        assert!(!data_dir.join("messages-cache.json.legacy").exists());
+        fs::remove_dir_all(data_dir).expect("test cache directory should be removable");
+    }
+
+    #[test]
+    fn removing_an_account_does_not_leave_a_backup_with_its_messages() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir =
+            std::env::temp_dir().join(format!("openmail-account-removal-cache-test-{suffix}"));
+        let removed_account = "gmail:removed@example.com";
+        let retained_account = "gmail:retained@example.com";
+        save_page(
+            &data_dir,
+            removed_account,
+            MessagePage {
+                messages: vec![message("removed account secret")],
+                next_page_token: None,
+                history_id: None,
+            },
+            false,
+        )
+        .expect("removed account cache should save");
+        save_page(
+            &data_dir,
+            retained_account,
+            MessagePage {
+                messages: vec![message("retained account secret")],
+                next_page_token: None,
+                history_id: None,
+            },
+            false,
+        )
+        .expect("retained account cache should save");
+
+        remove_account(&data_dir, removed_account).expect("account cache should be removed");
+        assert!(!data_dir.join("messages-cache.json.bak").exists());
+        assert!(load(&data_dir, removed_account)
+            .expect("removed account cache should load")
+            .is_none());
+        assert!(load(&data_dir, retained_account)
+            .expect("retained account cache should load")
+            .is_some());
+        fs::remove_dir_all(data_dir).expect("test account cache directory should be removable");
     }
 }

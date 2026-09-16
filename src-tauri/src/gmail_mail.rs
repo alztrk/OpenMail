@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -8,12 +8,16 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
     Engine,
 };
-use futures::future::{join, join_all};
+use futures::{
+    future::{join, join_all},
+    stream, StreamExt, TryStreamExt,
+};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
+    attachment_store,
     config::GmailConfig,
     models::{MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage},
     provider::{DraftAttachment, DraftRequest, DraftSummary, MailDraft, OutgoingAttachment},
@@ -23,6 +27,9 @@ use crate::{
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const MAX_GMAIL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const GMAIL_REQUEST_CONCURRENCY: usize = 8;
+const MAX_GMAIL_HISTORY_PAGES: usize = 100;
+const MAX_GMAIL_FULL_SYNC_PAGES: usize = 1_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -380,10 +387,11 @@ async fn list_messages_with_query(
             let client = client.clone();
             let access_token = access_token.clone();
             async move {
+                let message_url = gmail_message_url(&reference.id)?;
                 send_gmail_read_with_retry(
                     || {
                         client
-                            .get(format!("{GMAIL_API_URL}/messages/{}", reference.id))
+                            .get(message_url.clone())
                             .bearer_auth(&access_token)
                             .query(&[
                                 ("format", "metadata"),
@@ -403,10 +411,21 @@ async fn list_messages_with_query(
             }
         });
     let (responses, history_id) = if query.is_some() {
-        (join_all(requests).await, None)
+        (
+            stream::iter(requests)
+                .buffer_unordered(GMAIL_REQUEST_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await,
+            None,
+        )
     } else {
-        let (responses, history_id_result) =
-            join(join_all(requests), fetch_history_id(&client, &access_token)).await;
+        let (responses, history_id_result) = join(
+            stream::iter(requests)
+                .buffer_unordered(GMAIL_REQUEST_CONCURRENCY)
+                .collect::<Vec<_>>(),
+            fetch_history_id(&client, &access_token),
+        )
+        .await;
         (responses, Some(history_id_result?))
     };
     let mut messages = Vec::with_capacity(responses.len());
@@ -446,6 +465,51 @@ pub struct SyncOutcome {
     pub removed_message_ids: Vec<String>,
 }
 
+async fn full_inbox_sync(
+    account_id: &str,
+    cached_page: Option<&MessagePage>,
+) -> Result<SyncOutcome, String> {
+    let mut messages = Vec::new();
+    let mut page_token = None;
+    let mut history_id = None;
+
+    for _ in 0..MAX_GMAIL_FULL_SYNC_PAGES {
+        let page = list_messages(account_id, page_token.as_deref()).await?;
+        history_id = page.history_id.clone().or(history_id);
+        for message in page.messages {
+            upsert_message(&mut messages, message);
+        }
+        page_token = page.next_page_token;
+        if page_token.is_none() {
+            let current_ids = messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut removed_message_ids = cached_page
+                .into_iter()
+                .flat_map(|page| page.messages.iter())
+                .filter(|message| !current_ids.contains(message.id.as_str()))
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>();
+            removed_message_ids.sort();
+            removed_message_ids.dedup();
+            return Ok(SyncOutcome {
+                page: MessagePage {
+                    messages,
+                    next_page_token: None,
+                    history_id,
+                },
+                new_message_count: 0,
+                removed_message_ids,
+            });
+        }
+    }
+
+    Err(format!(
+        "GMAIL_SYNC_INCOMPLETE: Gmail full sync exceeded the {MAX_GMAIL_FULL_SYNC_PAGES}-page safety limit"
+    ))
+}
+
 pub async fn sync_messages(
     account_id: &str,
     cached_page: Option<MessagePage>,
@@ -458,11 +522,7 @@ pub async fn sync_messages(
         });
     };
     let Some(start_history_id) = cached_page.history_id.clone() else {
-        return Ok(SyncOutcome {
-            page: list_messages(account_id, None).await?,
-            new_message_count: 0,
-            removed_message_ids: Vec::new(),
-        });
+        return full_inbox_sync(account_id, Some(&cached_page)).await;
     };
 
     let refresh_token = secure_store::load_refresh_token(account_id)?
@@ -476,28 +536,28 @@ pub async fn sync_messages(
             log::warn!(
                 "Gmail history sync unavailable; falling back to full metadata sync: {error}"
             );
-            return Ok(SyncOutcome {
-                page: list_messages(account_id, None).await?,
-                new_message_count: 0,
-                removed_message_ids: Vec::new(),
-            });
+            return full_inbox_sync(account_id, Some(&cached_page)).await;
         }
         Err(error) => return Err(error),
     };
     if history.is_none() {
-        return Ok(SyncOutcome {
-            page: list_messages(account_id, None).await?,
-            new_message_count: 0,
-            removed_message_ids: Vec::new(),
-        });
+        return full_inbox_sync(account_id, Some(&cached_page)).await;
     }
 
+    let cached_page_for_full_sync = cached_page.clone();
     let mut page = cached_page;
     let mut added_ids = Vec::new();
     let mut changed_ids = Vec::new();
     let mut removed_ids = Vec::new();
     let mut latest_history_id = start_history_id.clone();
+    let mut history_pages = 0;
     while let Some(response) = history {
+        history_pages += 1;
+        if history_pages > MAX_GMAIL_HISTORY_PAGES {
+            return Err(format!(
+                "GMAIL_SYNC_INCOMPLETE: Gmail history exceeded the {MAX_GMAIL_HISTORY_PAGES}-page safety limit"
+            ));
+        }
         latest_history_id = response.history_id;
         for entry in response.history.unwrap_or_default() {
             for item in entry.messages_added {
@@ -520,11 +580,7 @@ pub async fn sync_messages(
                     Ok(page) => page,
                     Err(error) if error.starts_with("GMAIL_HISTORY_UNAVAILABLE:") => {
                         log::warn!("Gmail history page became unavailable; falling back to full metadata sync: {error}");
-                        return Ok(SyncOutcome {
-                            page: list_messages(account_id, None).await?,
-                            new_message_count: 0,
-                            removed_message_ids: Vec::new(),
-                        });
+                        return full_inbox_sync(account_id, Some(&cached_page_for_full_sync)).await;
                     }
                     Err(error) => return Err(error),
                 }
@@ -537,23 +593,27 @@ pub async fn sync_messages(
     removed_ids.dedup();
     page.messages
         .retain(|message| !removed_ids.iter().any(|id| id == &message.id));
-    changed_ids.sort();
-    changed_ids.dedup();
-    let changed_messages = fetch_metadata_messages(&client, &access_token, changed_ids).await?;
-    for (message, is_inbox) in changed_messages {
-        if is_inbox {
-            upsert_message(&mut page.messages, message);
-        } else {
-            page.messages.retain(|existing| existing.id != message.id);
-        }
-    }
     added_ids.sort();
     added_ids.dedup();
+    added_ids.retain(|id| removed_ids.binary_search(id).is_err());
+    changed_ids.sort();
+    changed_ids.dedup();
+    changed_ids.retain(|id| removed_ids.binary_search(id).is_err());
+    let changed_messages = fetch_metadata_messages(&client, &access_token, changed_ids).await?;
+    let new_message_count = count_new_inbox_messages(&changed_messages, &added_ids);
+    let mut removed_message_ids = removed_ids;
+    apply_changed_messages(
+        &mut page.messages,
+        changed_messages,
+        &mut removed_message_ids,
+    );
+    removed_message_ids.sort();
+    removed_message_ids.dedup();
     page.history_id = Some(latest_history_id);
     Ok(SyncOutcome {
         page,
-        new_message_count: added_ids.len(),
-        removed_message_ids: removed_ids,
+        new_message_count,
+        removed_message_ids,
     })
 }
 
@@ -564,18 +624,22 @@ pub async fn get_message(account_id: &str, message_id: &str) -> Result<MailMessa
     let config = GmailConfig::embedded();
     let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
     let client = shared_http_client()?;
-    let message = client
-        .get(format!("{GMAIL_API_URL}/messages/{message_id}"))
-        .bearer_auth(&access_token)
-        .query(&[("format", "full")])
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<GmailMessage>()
-        .await
-        .map_err(|error| error.to_string())?;
+    let message_url = gmail_message_url(message_id)?;
+    let message = send_gmail_read_with_retry(
+        || {
+            client
+                .get(message_url.clone())
+                .bearer_auth(&access_token)
+                .query(&[("format", "full")])
+        },
+        "load message",
+    )
+    .await?
+    .error_for_status()
+    .map_err(|error| error.to_string())?
+    .json::<GmailMessage>()
+    .await
+    .map_err(|error| error.to_string())?;
     let hydrated_message = hydrate_full_message(&client, &access_token, message).await?;
     log::info!(
         "Gmail message hydration completed: duration_ms={}",
@@ -591,18 +655,22 @@ pub async fn get_thread(account_id: &str, thread_id: &str) -> Result<MailThread,
     let access_token =
         refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
     let client = shared_http_client()?;
-    let response = client
-        .get(format!("{GMAIL_API_URL}/threads/{thread_id}"))
-        .bearer_auth(&access_token)
-        .query(&[("format", "full")])
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<GmailThread>()
-        .await
-        .map_err(|error| error.to_string())?;
+    let thread_url = gmail_thread_url(thread_id)?;
+    let response = send_gmail_read_with_retry(
+        || {
+            client
+                .get(thread_url.clone())
+                .bearer_auth(&access_token)
+                .query(&[("format", "full")])
+        },
+        "load conversation",
+    )
+    .await?
+    .error_for_status()
+    .map_err(|error| error.to_string())?
+    .json::<GmailThread>()
+    .await
+    .map_err(|error| error.to_string())?;
 
     let requests = response
         .messages
@@ -613,7 +681,9 @@ pub async fn get_thread(account_id: &str, thread_id: &str) -> Result<MailThread,
             let access_token = access_token.clone();
             async move { hydrate_full_message(&client, &access_token, message).await }
         });
-    let messages = join_all(requests)
+    let messages = stream::iter(requests)
+        .buffer_unordered(GMAIL_REQUEST_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
@@ -656,11 +726,7 @@ pub async fn download_attachment(
     .await?;
     let bytes =
         decode_base64(&data).ok_or_else(|| "Gmail returned invalid attachment data".to_string())?;
-    std::fs::create_dir_all(download_dir).map_err(|error| error.to_string())?;
-    let safe_filename = sanitize_filename(filename);
-    let path = download_dir.join(safe_filename);
-    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+    attachment_store::save(download_dir, filename, &bytes)
 }
 
 pub async fn list_drafts(account_id: &str) -> Result<Vec<DraftSummary>, String> {
@@ -690,7 +756,7 @@ pub async fn list_drafts(account_id: &str) -> Result<Vec<DraftSummary>, String> 
             .json::<DraftListResponse>()
             .await
             .map_err(|error| format!("Gmail drafts could not be decoded: {error}"))?;
-        let page_summaries = join_all(list.drafts.unwrap_or_default().into_iter().map(
+        let page_summaries = stream::iter(list.drafts.unwrap_or_default().into_iter().map(
             |reference| {
                 let client = client.clone();
                 let access_token = access_token.clone();
@@ -700,6 +766,8 @@ pub async fn list_drafts(account_id: &str) -> Result<Vec<DraftSummary>, String> 
                 }
             },
         ))
+        .buffer_unordered(GMAIL_REQUEST_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
@@ -741,8 +809,9 @@ pub async fn save_draft(request: DraftRequest<'_>) -> Result<MailDraft, String> 
     let payload = json!({ "message": { "raw": URL_SAFE_NO_PAD.encode(raw_message.as_bytes()) } });
     let response = match request.draft_id.filter(|value| !value.trim().is_empty()) {
         Some(draft_id) => {
+            let draft_url = gmail_draft_url(draft_id)?;
             client
-                .put(format!("{GMAIL_API_URL}/drafts/{draft_id}"))
+                .put(draft_url)
                 .bearer_auth(&access_token)
                 .json(&payload)
                 .send()
@@ -775,8 +844,9 @@ pub async fn delete_draft(account_id: &str, draft_id: &str) -> Result<(), String
         .ok_or_else(|| "The selected Gmail account has no stored refresh token".to_string())?;
     let access_token =
         refresh_access_token(account_id, &GmailConfig::embedded(), &refresh_token).await?;
+    let draft_url = gmail_draft_url(draft_id)?;
     let response = shared_http_client()?
-        .delete(format!("{GMAIL_API_URL}/drafts/{draft_id}"))
+        .delete(draft_url)
         .bearer_auth(access_token)
         .send()
         .await
@@ -794,8 +864,9 @@ async fn fetch_draft(
     access_token: &str,
     draft_id: &str,
 ) -> Result<GmailDraftResponse, String> {
+    let draft_url = gmail_draft_url(draft_id)?;
     let response = client
-        .get(format!("{GMAIL_API_URL}/drafts/{draft_id}"))
+        .get(draft_url)
         .bearer_auth(access_token)
         .query(&[("format", "full")])
         .send()
@@ -956,7 +1027,7 @@ fn build_draft_raw_message(request: &DraftRequest<'_>) -> Result<String, String>
         .chain(blind_copies.iter())
         .any(|value| !is_valid_email_address(value))
     {
-        return Err("The draft copy recipient is invalid".to_string());
+        return Err("OPENMAIL_DRAFT_COPY_RECIPIENT_INVALID".to_string());
     }
     let boundary = "OpenMailDraftAlternativeBoundary";
     let fallback_html = plain_text_to_html(request.body);
@@ -994,8 +1065,13 @@ fn build_draft_raw_message(request: &DraftRequest<'_>) -> Result<String, String>
     } else {
         format!("Bcc: {}\r\n", blind_copies.join(", "))
     };
+    let to_header = if recipients.is_empty() {
+        String::new()
+    } else {
+        format!("To: {}\r\n", recipients.join(", "))
+    };
     let subject = base64::engine::general_purpose::STANDARD.encode(request.subject.as_bytes());
-    Ok(format!("From: {}\r\nTo: {}\r\n{cc_header}{bcc_header}Subject: =?UTF-8?B?{subject}?=\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}\r\n\r\n{content}", request.sender, recipients.join(", ")))
+    Ok(format!("From: {}\r\n{to_header}{cc_header}{bcc_header}Subject: =?UTF-8?B?{subject}?=\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}\r\n\r\n{content}", request.sender))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,19 +1242,28 @@ async fn send_message_with_thread(
     {
         request_body["threadId"] = json!(thread_id);
     }
-    shared_http_client()?
+    let response = shared_http_client()?
         .post(format!("{GMAIL_API_URL}/messages/send"))
         .bearer_auth(access_token)
         .json(&request_body)
         .send()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            if error.is_timeout() {
+                "GMAIL_SEND_STATUS_UNKNOWN: Gmail did not confirm the message delivery before the request timed out".to_string()
+            } else {
+                error.to_string()
+            }
+        })?
         .error_for_status()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    response
         .json::<SendMessageResponse>()
         .await
         .map(|response| response.id)
-        .map_err(|error| error.to_string())
+        .map_err(|_| {
+            "GMAIL_SEND_STATUS_UNKNOWN: Gmail accepted the request but OpenMail could not confirm the message delivery".to_string()
+        })
 }
 
 fn escape_html(value: &str) -> String {
@@ -1267,10 +1352,11 @@ pub async fn modify_message(
     let config = GmailConfig::embedded();
     let access_token = refresh_access_token(account_id, &config, &refresh_token).await?;
     let client = shared_http_client()?;
+    let message_url = gmail_message_url(message_id)?;
     let response = match action {
         MessageAction::Archive => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "removeLabelIds": ["INBOX"] }))
                 .send()
@@ -1278,7 +1364,7 @@ pub async fn modify_message(
         }
         MessageAction::MarkUnread => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "addLabelIds": ["UNREAD"] }))
                 .send()
@@ -1286,7 +1372,7 @@ pub async fn modify_message(
         }
         MessageAction::MarkRead => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "removeLabelIds": ["UNREAD"] }))
                 .send()
@@ -1294,7 +1380,7 @@ pub async fn modify_message(
         }
         MessageAction::Star => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "addLabelIds": ["STARRED"] }))
                 .send()
@@ -1302,7 +1388,7 @@ pub async fn modify_message(
         }
         MessageAction::Unstar => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "removeLabelIds": ["STARRED"] }))
                 .send()
@@ -1310,7 +1396,7 @@ pub async fn modify_message(
         }
         MessageAction::Spam => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"] }))
                 .send()
@@ -1318,7 +1404,7 @@ pub async fn modify_message(
         }
         MessageAction::NotSpam => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/modify"))
+                .post(gmail_message_action_url(message_id, "modify")?)
                 .bearer_auth(access_token)
                 .json(&json!({ "addLabelIds": ["INBOX"], "removeLabelIds": ["SPAM"] }))
                 .send()
@@ -1326,21 +1412,21 @@ pub async fn modify_message(
         }
         MessageAction::Trash => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/trash"))
+                .post(gmail_message_action_url(message_id, "trash")?)
                 .bearer_auth(access_token)
                 .send()
                 .await
         }
         MessageAction::Untrash => {
             client
-                .post(format!("{GMAIL_API_URL}/messages/{message_id}/untrash"))
+                .post(gmail_message_action_url(message_id, "untrash")?)
                 .bearer_auth(access_token)
                 .send()
                 .await
         }
         MessageAction::DeleteForever => {
             client
-                .delete(format!("{GMAIL_API_URL}/messages/{message_id}"))
+                .delete(message_url)
                 .bearer_auth(access_token)
                 .send()
                 .await
@@ -1507,15 +1593,13 @@ fn to_mail_message(message: GmailMessage) -> MailMessage {
         .unwrap_or_default();
     let time = header_value(headers, "Date").unwrap_or_default();
     let preview = message.snippet.unwrap_or_default();
-    let avatar_url = sender_avatar_url(&address);
-
     MailMessage {
         id: message.id,
         thread_id: message.thread_id,
         message_id_header: header_value(headers, "Message-ID"),
         sender,
         address,
-        avatar_url,
+        avatar_url: None,
         subject,
         preview: preview.clone(),
         body: text_body(&payload).unwrap_or_default(),
@@ -1561,28 +1645,6 @@ fn collect_attachments_into(part: &MessagePart, result: &mut Vec<MailAttachment>
             collect_attachments_into(child, result);
         }
     }
-}
-
-fn sanitize_filename(filename: &str) -> String {
-    let sanitized = std::path::Path::new(filename)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("attachment");
-    if sanitized.is_empty() {
-        "attachment".to_string()
-    } else {
-        sanitized.to_string()
-    }
-}
-
-fn sender_avatar_url(address: &str) -> Option<String> {
-    let domain = address.rsplit_once('@')?.1.trim();
-    if domain.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "https://www.google.com/s2/favicons?domain={domain}&sz=64"
-    ))
 }
 
 fn is_valid_email_address(value: &str) -> bool {
@@ -1949,11 +2011,12 @@ async fn fetch_metadata_messages(
     access_token: &str,
     ids: Vec<String>,
 ) -> Result<Vec<(MailMessage, bool)>, String> {
-    join_all(ids.into_iter().map(|id| async move {
+    stream::iter(ids.into_iter().map(|id| async move {
+        let message_url = gmail_message_url(&id)?;
         send_gmail_read_with_retry(
             || {
                 client
-                    .get(format!("{GMAIL_API_URL}/messages/{id}"))
+                    .get(message_url.clone())
                     .bearer_auth(access_token)
                     .query(&[
                         ("format", "metadata"),
@@ -1975,9 +2038,9 @@ async fn fetch_metadata_messages(
         })
         .map_err(|error| error.to_string())
     }))
+    .buffer_unordered(GMAIL_REQUEST_CONCURRENCY)
+    .try_collect()
     .await
-    .into_iter()
-    .collect()
 }
 
 fn upsert_message(messages: &mut Vec<MailMessage>, message: MailMessage) {
@@ -1985,6 +2048,32 @@ fn upsert_message(messages: &mut Vec<MailMessage>, message: MailMessage) {
         *existing = message;
     } else {
         messages.insert(0, message);
+    }
+}
+
+fn count_new_inbox_messages(
+    changed_messages: &[(MailMessage, bool)],
+    added_ids: &[String],
+) -> usize {
+    let added_id_set = added_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    changed_messages
+        .iter()
+        .filter(|(message, is_inbox)| *is_inbox && added_id_set.contains(message.id.as_str()))
+        .count()
+}
+
+fn apply_changed_messages(
+    messages: &mut Vec<MailMessage>,
+    changed_messages: impl IntoIterator<Item = (MailMessage, bool)>,
+    removed_message_ids: &mut Vec<String>,
+) {
+    for (message, is_inbox) in changed_messages {
+        if is_inbox {
+            upsert_message(messages, message);
+        } else {
+            removed_message_ids.push(message.id.clone());
+            messages.retain(|existing| existing.id != message.id);
+        }
     }
 }
 
@@ -2003,7 +2092,7 @@ async fn hydrate_inline_images(
     };
     let mut inline_parts = Vec::new();
     collect_inline_parts(payload, &mut inline_parts);
-    let resolved_parts = join_all(inline_parts.into_iter().map(
+    let resolved_parts = stream::iter(inline_parts.into_iter().map(
         |(content_id, inline_data, attachment_id, mime_type)| {
             let client = client.clone();
             let access_token = access_token.to_string();
@@ -2033,6 +2122,8 @@ async fn hydrate_inline_images(
             }
         },
     ))
+    .buffer_unordered(GMAIL_REQUEST_CONCURRENCY)
+    .collect::<Vec<_>>()
     .await
     .into_iter()
     .collect::<Result<Vec<_>, String>>()?;
@@ -2119,10 +2210,9 @@ async fn fetch_attachment_data(
     attachment_id: &str,
 ) -> Result<String, String> {
     let started_at = Instant::now();
+    let attachment_url = gmail_attachment_url(message_id, attachment_id)?;
     let data = client
-        .get(format!(
-            "{GMAIL_API_URL}/messages/{message_id}/attachments/{attachment_id}"
-        ))
+        .get(attachment_url)
         .bearer_auth(access_token)
         .send()
         .await
@@ -2142,12 +2232,100 @@ async fn fetch_attachment_data(
     Ok(data)
 }
 
+fn gmail_message_url(message_id: &str) -> Result<url::Url, String> {
+    gmail_path_url(["messages", message_id])
+}
+
+fn gmail_thread_url(thread_id: &str) -> Result<url::Url, String> {
+    gmail_path_url(["threads", thread_id])
+}
+
+fn gmail_draft_url(draft_id: &str) -> Result<url::Url, String> {
+    gmail_path_url(["drafts", draft_id])
+}
+
+fn gmail_attachment_url(message_id: &str, attachment_id: &str) -> Result<url::Url, String> {
+    gmail_path_url(["messages", message_id, "attachments", attachment_id])
+}
+
+fn gmail_message_action_url(message_id: &str, action: &str) -> Result<url::Url, String> {
+    gmail_path_url(["messages", message_id, action])
+}
+
+fn gmail_path_url<const N: usize>(segments: [&str; N]) -> Result<url::Url, String> {
+    let mut url = url::Url::parse(GMAIL_API_URL)
+        .map_err(|error| format!("Gmail API URL could not be constructed: {error}"))?;
+    {
+        let mut path_segments = url
+            .path_segments_mut()
+            .map_err(|_| "Gmail API URL cannot be constructed".to_string())?;
+        for segment in segments {
+            path_segments.push(segment);
+        }
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn encodes_dynamic_gmail_url_segments() {
+        let url = gmail_attachment_url("message/with/slashes", "attachment?value")
+            .expect("Gmail attachment URL should be constructible");
+        assert_eq!(url.host_str(), Some("gmail.googleapis.com"));
+        assert!(url.path().contains("message%2Fwith%2Fslashes"));
+        assert!(url.path().contains("attachment%3Fvalue"));
+        assert_eq!(url.query(), None);
+    }
+
     fn encoded(value: &str) -> String {
         URL_SAFE_NO_PAD.encode(value.as_bytes())
+    }
+
+    fn mail_message(id: &str) -> MailMessage {
+        MailMessage {
+            id: id.to_string(),
+            thread_id: None,
+            message_id_header: None,
+            sender: String::new(),
+            address: String::new(),
+            avatar_url: None,
+            subject: String::new(),
+            preview: String::new(),
+            body: String::new(),
+            body_html: None,
+            time: String::new(),
+            unread: false,
+            starred: false,
+            has_attachment: false,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn counts_only_added_messages_that_are_in_the_inbox() {
+        let changed_messages = vec![
+            (mail_message("inbox-message"), true),
+            (mail_message("sent-message"), false),
+            (mail_message("existing-message"), true),
+        ];
+        let added_ids = vec!["inbox-message".to_string(), "sent-message".to_string()];
+
+        assert_eq!(count_new_inbox_messages(&changed_messages, &added_ids), 1);
+    }
+
+    #[test]
+    fn reports_messages_that_lost_the_inbox_label_as_removed() {
+        let mut messages = vec![mail_message("archived-message")];
+        let changed_messages = vec![(mail_message("archived-message"), false)];
+        let mut removed_message_ids = Vec::new();
+
+        apply_changed_messages(&mut messages, changed_messages, &mut removed_message_ids);
+
+        assert!(messages.is_empty());
+        assert_eq!(removed_message_ids, vec!["archived-message"]);
     }
 
     fn header(name: &str, value: &str) -> MessageHeader {
@@ -2506,6 +2684,46 @@ mod tests {
         assert!(is_valid_email_address("person+tag@example.co.uk"));
         assert!(!is_valid_email_address("person example.com"));
         assert!(!is_valid_email_address("person@@example.com"));
+    }
+
+    #[test]
+    fn rejects_invalid_draft_sender_before_building_mime() {
+        let request = DraftRequest {
+            account_id: "gmail:test@example.com",
+            draft_id: None,
+            sender: "attacker@example.com\r\nBcc: injected@example.com",
+            recipient: "person@example.com",
+            cc: "",
+            bcc: "",
+            subject: "Subject",
+            body: "Body",
+            body_html: "<p>Body</p>",
+            attachments: &[],
+        };
+
+        let error = build_draft_raw_message(&request).expect_err("invalid sender must be rejected");
+        assert_eq!(error, "OPENMAIL_DRAFT_SENDER_INVALID");
+    }
+
+    #[test]
+    fn allows_a_draft_without_a_to_recipient() {
+        let request = DraftRequest {
+            account_id: "gmail:test@example.com",
+            draft_id: None,
+            sender: "sender@example.com",
+            recipient: "",
+            cc: "",
+            bcc: "",
+            subject: "Subject",
+            body: "Body",
+            body_html: "<p>Body</p>",
+            attachments: &[],
+        };
+
+        let raw_message =
+            build_draft_raw_message(&request).expect("recipient-less draft should be valid");
+        assert!(raw_message.starts_with("From: sender@example.com\r\nSubject:"));
+        assert!(!raw_message.contains("To: \r\n"));
     }
 
     #[test]

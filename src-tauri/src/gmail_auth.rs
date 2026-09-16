@@ -14,6 +14,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use tauri::async_runtime;
 
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
 use crate::{
     account_store,
     config::GmailConfig,
@@ -68,18 +71,19 @@ pub fn start(
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    if let Ok(mut state) = auth_state.lock() {
-        *state = AuthState {
-            status: AuthStatus::WaitingForCallback,
-            account_id: None,
-            error: None,
-        };
-    }
-
     webbrowser::open(authorization_url.as_str()).map_err(|error| {
         log::error!("Unable to open the system browser for Gmail authorization: {error}");
         error.to_string()
     })?;
+
+    let mut state = auth_state
+        .lock()
+        .map_err(|_| "Auth state is unavailable".to_string())?;
+    *state = AuthState {
+        status: AuthStatus::WaitingForCallback,
+        account_id: None,
+        error: None,
+    };
 
     let callback_state = Arc::clone(&auth_state);
     thread::spawn(move || {
@@ -162,6 +166,26 @@ fn receive_callback(
                 continue;
             }
         };
+        if url.path() != "/oauth2/callback" {
+            log::debug!("Ignored an OAuth callback with an unexpected path");
+            continue;
+        }
+        let Some(state) = url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+        else {
+            log::debug!("Ignored an OAuth callback without state");
+            continue;
+        };
+        if state != expected_state {
+            write_callback_response(
+                &mut stream,
+                "OpenMail rejected this authorization response. You can close this tab.",
+            );
+            log::warn!("Rejected Gmail OAuth callback because state validation failed");
+            continue;
+        }
         if let Some(error) = url
             .query_pairs()
             .find(|(key, _)| key == "error")
@@ -182,22 +206,6 @@ fn receive_callback(
             log::debug!("Ignored an OAuth callback without an authorization code");
             continue;
         };
-        let Some(state) = url
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.into_owned())
-        else {
-            log::debug!("Ignored an OAuth callback without state");
-            continue;
-        };
-        if state != expected_state {
-            write_callback_response(
-                &mut stream,
-                "OpenMail rejected this authorization response. You can close this tab.",
-            );
-            log::warn!("Rejected Gmail OAuth callback because state validation failed");
-            return Err("OAuth state validation failed".to_string());
-        }
         log::info!("Received a valid Gmail OAuth callback");
         write_callback_response(
             &mut stream,
@@ -227,7 +235,11 @@ async fn finish(
     auth_state: Arc<Mutex<AuthState>>,
 ) -> Result<(), String> {
     let (client, code, verifier, app_data_dir) = data;
-    let http_client = Client::new();
+    let http_client = Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Unable to initialize Gmail OAuth network client: {error}"))?;
     let token = client
         .exchange_code(code)
         .set_pkce_verifier(verifier)
@@ -236,7 +248,7 @@ async fn finish(
         .map_err(|error| error.to_string())?;
     log::info!("Gmail authorization code exchanged successfully");
     let access_token = token.access_token().secret();
-    let profile = Client::new()
+    let profile = http_client
         .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
         .bearer_auth(access_token)
         .send()
@@ -249,12 +261,15 @@ async fn finish(
         .map_err(|error| error.to_string())?;
     log::info!("Gmail profile loaded successfully");
     let account_id = format!("gmail:{}", profile.email_address);
-    let refresh_token = token.refresh_token().ok_or_else(|| {
-        log::error!("Gmail authorization completed without a refresh token");
-        "Google did not return a refresh token. Reauthorize OpenMail and try again.".to_string()
-    })?;
-    secure_store::save_refresh_token(&account_id, refresh_token.secret())?;
-    gmail_mail::invalidate_access_token(&account_id);
+    let previous_refresh_token = secure_store::load_refresh_token(&account_id)?;
+    let refresh_token = token
+        .refresh_token()
+        .map(|value| value.secret().to_string())
+        .or(previous_refresh_token.clone())
+        .ok_or_else(|| {
+            log::error!("Gmail authorization completed without a refresh token");
+            "Google did not return a refresh token. Reauthorize OpenMail and try again.".to_string()
+        })?;
     let mut accounts = account_store::load_accounts(&app_data_dir)?;
     let is_default = accounts.is_empty();
     accounts.retain(|account| account.id != account_id);
@@ -265,25 +280,41 @@ async fn finish(
         display_name: None,
         is_default,
     });
-    account_store::save_accounts(&app_data_dir, &accounts)?;
-    log::info!("Gmail account metadata saved locally");
-    if let Ok(mut state) = auth_state.lock() {
-        *state = AuthState {
-            status: AuthStatus::Connected,
-            account_id: Some(account_id),
-            error: None,
-        };
+    secure_store::save_refresh_token(&account_id, &refresh_token)?;
+    gmail_mail::invalidate_access_token(&account_id);
+    if let Err(error) = account_store::save_accounts(&app_data_dir, &accounts) {
+        let rollback_error =
+            secure_store::restore_refresh_token(&account_id, previous_refresh_token.as_deref())
+                .err();
+        return Err(match rollback_error {
+            Some(rollback_error) => format!(
+                "Gmail account metadata could not be saved: {error}. The previous credential could not be restored: {rollback_error}"
+            ),
+            None => format!("Gmail account metadata could not be saved: {error}"),
+        });
     }
+    log::info!("Gmail account metadata saved locally");
+    let mut state = auth_state
+        .lock()
+        .map_err(|_| "Auth state is unavailable".to_string())?;
+    *state = AuthState {
+        status: AuthStatus::Connected,
+        account_id: Some(account_id),
+        error: None,
+    };
     Ok(())
 }
 
 fn set_failed(state: &Arc<Mutex<AuthState>>, error: String) {
     log::error!("Gmail authorization failed: {error}");
-    if let Ok(mut value) = state.lock() {
-        *value = AuthState {
-            status: AuthStatus::Failed,
-            account_id: None,
-            error: Some(error),
-        };
+    match state.lock() {
+        Ok(mut value) => {
+            *value = AuthState {
+                status: AuthStatus::Failed,
+                account_id: None,
+                error: Some(error),
+            };
+        }
+        Err(_) => log::error!("Unable to update Gmail authorization failure state"),
     }
 }

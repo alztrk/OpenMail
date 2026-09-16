@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tauri::async_runtime;
 
 use crate::{
-    account_store, microsoft_mail,
+    account_store, config, microsoft_mail,
     models::{AuthState, AuthStatus, MailAccount, MailProvider},
     secure_store,
 };
@@ -71,18 +71,19 @@ pub fn start(
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    if let Ok(mut state) = auth_state.lock() {
-        *state = AuthState {
-            status: AuthStatus::WaitingForCallback,
-            account_id: None,
-            error: None,
-        };
-    }
-
     webbrowser::open(authorization_url.as_str()).map_err(|error| {
         log::error!("Unable to open the system browser for Outlook authorization: {error}");
         error.to_string()
     })?;
+
+    let mut state = auth_state
+        .lock()
+        .map_err(|_| "Auth state is unavailable".to_string())?;
+    *state = AuthState {
+        status: AuthStatus::WaitingForCallback,
+        account_id: None,
+        error: None,
+    };
 
     let callback_state = Arc::clone(&auth_state);
     thread::spawn(move || {
@@ -105,12 +106,7 @@ pub fn start(
 }
 
 fn public_client_id() -> Result<String, String> {
-    option_env!("OPENMAIL_MICROSOFT_CLIENT_ID")
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            "Microsoft Graph is not configured. Build OpenMail with the public client ID in OPENMAIL_MICROSOFT_CLIENT_ID.".to_string()
-        })
+    config::microsoft_client_id()
 }
 
 fn build_client(client_id: &str, redirect_uri: &str) -> Result<MicrosoftClient, String> {
@@ -163,6 +159,26 @@ fn receive_callback(
                 continue;
             }
         };
+        if url.path() != "/oauth2/callback" {
+            log::debug!("Ignored an Outlook OAuth callback with an unexpected path");
+            continue;
+        }
+        let Some(state) = url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+        else {
+            log::debug!("Ignored an Outlook OAuth callback without state");
+            continue;
+        };
+        if state != expected_state {
+            write_callback_response(
+                &mut stream,
+                "OpenMail rejected this authorization response. You can close this tab.",
+            );
+            log::warn!("Rejected Microsoft OAuth callback because state validation failed");
+            continue;
+        }
         if let Some(error) = url
             .query_pairs()
             .find(|(key, _)| key == "error")
@@ -183,22 +199,6 @@ fn receive_callback(
             log::debug!("Ignored an Outlook OAuth callback without an authorization code");
             continue;
         };
-        let Some(state) = url
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.into_owned())
-        else {
-            log::debug!("Ignored an Outlook OAuth callback without state");
-            continue;
-        };
-        if state != expected_state {
-            write_callback_response(
-                &mut stream,
-                "OpenMail rejected this authorization response. You can close this tab.",
-            );
-            log::warn!("Rejected Microsoft OAuth callback because state validation failed");
-            return Err("Microsoft OAuth state validation failed".to_string());
-        }
         write_callback_response(
             &mut stream,
             "OpenMail authorization completed. You can close this tab.",
@@ -228,13 +228,18 @@ async fn finish(
     auth_state: Arc<Mutex<AuthState>>,
 ) -> Result<(), String> {
     let (client, code, verifier, app_data_dir) = data;
+    let http_client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| format!("Unable to initialize Microsoft OAuth network client: {error}"))?;
     let token = client
         .exchange_code(code)
         .set_pkce_verifier(verifier)
-        .request_async(&Client::new())
+        .request_async(&http_client)
         .await
         .map_err(|error| error.to_string())?;
-    let profile = Client::new()
+    let profile = http_client
         .get(GRAPH_PROFILE_URL)
         .bearer_auth(token.access_token().secret())
         .send()
@@ -250,13 +255,16 @@ async fn finish(
         .or(profile.user_principal_name)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "Microsoft Graph did not return a mailbox address".to_string())?;
-    let refresh_token = token.refresh_token().ok_or_else(|| {
-        "Microsoft did not return a refresh token. Reauthorize OpenMail and try again.".to_string()
-    })?;
     let account_id = format!("outlook:{}", profile.id);
-    secure_store::save_refresh_token(&account_id, refresh_token.secret())?;
-    microsoft_mail::invalidate_access_token(&account_id);
-
+    let previous_refresh_token = secure_store::load_refresh_token(&account_id)?;
+    let refresh_token = token
+        .refresh_token()
+        .map(|value| value.secret().to_string())
+        .or(previous_refresh_token.clone())
+        .ok_or_else(|| {
+            "Microsoft did not return a refresh token. Reauthorize OpenMail and try again."
+                .to_string()
+        })?;
     let mut accounts = account_store::load_accounts(&app_data_dir)?;
     let is_default = accounts
         .iter()
@@ -271,25 +279,41 @@ async fn finish(
         display_name: profile.display_name,
         is_default,
     });
-    account_store::save_accounts(&app_data_dir, &accounts)?;
-    if let Ok(mut state) = auth_state.lock() {
-        *state = AuthState {
-            status: AuthStatus::Connected,
-            account_id: Some(account_id),
-            error: None,
-        };
+    secure_store::save_refresh_token(&account_id, &refresh_token)?;
+    microsoft_mail::invalidate_access_token(&account_id);
+    if let Err(error) = account_store::save_accounts(&app_data_dir, &accounts) {
+        let rollback_error =
+            secure_store::restore_refresh_token(&account_id, previous_refresh_token.as_deref())
+                .err();
+        return Err(match rollback_error {
+            Some(rollback_error) => format!(
+                "Microsoft account metadata could not be saved: {error}. The previous credential could not be restored: {rollback_error}"
+            ),
+            None => format!("Microsoft account metadata could not be saved: {error}"),
+        });
     }
+    let mut state = auth_state
+        .lock()
+        .map_err(|_| "Auth state is unavailable".to_string())?;
+    *state = AuthState {
+        status: AuthStatus::Connected,
+        account_id: Some(account_id),
+        error: None,
+    };
     Ok(())
 }
 
 fn set_failed(state: &Arc<Mutex<AuthState>>, error: String) {
     log::error!("Microsoft authorization failed: {error}");
-    if let Ok(mut value) = state.lock() {
-        *value = AuthState {
-            status: AuthStatus::Failed,
-            account_id: None,
-            error: Some(error),
-        };
+    match state.lock() {
+        Ok(mut value) => {
+            *value = AuthState {
+                status: AuthStatus::Failed,
+                account_id: None,
+                error: Some(error),
+            };
+        }
+        Err(_) => log::error!("Unable to update Microsoft authorization failure state"),
     }
 }
 

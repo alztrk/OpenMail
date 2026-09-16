@@ -1,6 +1,13 @@
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use keyring::Entry;
 
 const SERVICE_NAME: &str = "OpenMail";
+#[cfg(not(test))]
+const STORAGE_KEY_ACCOUNT: &str = "local-storage-encryption-key";
 
 pub fn save_refresh_token(account_id: &str, refresh_token: &str) -> Result<(), String> {
     Entry::new(SERVICE_NAME, account_id)
@@ -28,4 +35,82 @@ pub fn delete_refresh_token(account_id: &str) -> Result<(), String> {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+pub fn restore_refresh_token(account_id: &str, previous_token: Option<&str>) -> Result<(), String> {
+    match previous_token {
+        Some(token) => save_refresh_token(account_id, token),
+        None => delete_refresh_token(account_id),
+    }
+}
+
+pub fn load_or_create_storage_key() -> Result<[u8; 32], String> {
+    #[cfg(test)]
+    {
+        Ok([0x5a; 32])
+    }
+
+    #[cfg(not(test))]
+    {
+        let entry = Entry::new(SERVICE_NAME, STORAGE_KEY_ACCOUNT)
+            .map_err(|error| format!("Unable to access the cache encryption key: {error}"))?;
+        match entry.get_password() {
+            Ok(encoded_key) => decode_cache_key(&encoded_key),
+            Err(keyring::Error::NoEntry) => {
+                let key = Aes256Gcm::generate_key(&mut OsRng);
+                let encoded_key = URL_SAFE_NO_PAD.encode(key.as_slice());
+                entry
+                    .set_password(&encoded_key)
+                    .map_err(|error| format!("Unable to save the cache encryption key: {error}"))?;
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| "Generated cache encryption key has an invalid length".to_string())
+            }
+            Err(error) => Err(format!("Unable to load the cache encryption key: {error}")),
+        }
+    }
+}
+
+pub fn encrypt_payload(plaintext: &[u8]) -> Result<(String, String), String> {
+    let key = load_or_create_storage_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| "Unable to initialize local storage encryption".to_string())?;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|_| "Unable to encrypt local storage".to_string())?;
+    Ok((
+        URL_SAFE_NO_PAD.encode(nonce.as_slice()),
+        URL_SAFE_NO_PAD.encode(ciphertext),
+    ))
+}
+
+pub fn decrypt_payload(nonce: &str, ciphertext: &str) -> Result<Vec<u8>, String> {
+    let key = load_or_create_storage_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| "Unable to initialize local storage encryption".to_string())?;
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(nonce)
+        .map_err(|error| format!("Stored local data nonce is invalid: {error}"))?;
+    if nonce_bytes.len() != 12 {
+        return Err("Stored local data nonce has an invalid length".to_string());
+    }
+    let ciphertext_bytes = URL_SAFE_NO_PAD
+        .decode(ciphertext)
+        .map_err(|error| format!("Stored local data ciphertext is invalid: {error}"))?;
+    cipher
+        .decrypt(
+            aes_gcm::Nonce::from_slice(&nonce_bytes),
+            ciphertext_bytes.as_ref(),
+        )
+        .map_err(|_| "Unable to decrypt local storage".to_string())
+}
+
+#[cfg(not(test))]
+fn decode_cache_key(encoded_key: &str) -> Result<[u8; 32], String> {
+    let key = URL_SAFE_NO_PAD
+        .decode(encoded_key)
+        .map_err(|error| format!("Stored cache encryption key is invalid: {error}"))?;
+    key.try_into()
+        .map_err(|_| "Stored cache encryption key has an invalid length".to_string())
 }

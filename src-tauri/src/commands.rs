@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -17,6 +18,8 @@ use crate::{
 pub struct AppState {
     pub app_data_dir: std::path::PathBuf,
     pub auth_state: Arc<Mutex<AuthState>>,
+    pub account_operation_lock: Arc<Mutex<()>>,
+    pub account_operation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[tauri::command]
@@ -156,13 +159,11 @@ pub fn get_cached_search_messages(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Option<MessagePage>, String> {
-    if query.trim().len() < 2 {
-        return Err("Search query is too short".to_string());
-    }
+    let query = normalize_search_query(&query)?;
     message_cache::load_scope(
         &state.app_data_dir,
         &account_id,
-        Some(&format!("search:{}", query.trim())),
+        Some(&format!("search:{query}")),
     )
 }
 
@@ -172,17 +173,22 @@ pub fn search_cached_messages(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let query = normalize_search_query(&query)?;
     message_cache::search_cached_messages(&state.app_data_dir, &account_id, &query)
 }
 
 #[tauri::command]
-pub fn cache_folder_messages(
+pub async fn cache_folder_messages(
     account_id: String,
     folder: MailFolder,
     page: MessagePage,
     append: bool,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
@@ -193,22 +199,24 @@ pub fn cache_folder_messages(
 }
 
 #[tauri::command]
-pub fn cache_search_messages(
+pub async fn cache_search_messages(
     account_id: String,
     query: String,
     page: MessagePage,
     append: bool,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
-    if query.trim().len() < 2 {
-        return Err("Search query is too short".to_string());
-    }
+    let query = normalize_search_query(&query)?;
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
         page,
         append,
-        Some(&format!("search:{}", query.trim())),
+        Some(&format!("search:{query}")),
     )
 }
 
@@ -219,10 +227,14 @@ pub async fn list_messages(
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
     log::info!("Loading messages for account");
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let page = adapter
         .list_messages(&account_id, page_token.as_deref())
         .await?;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::save_page(&state.app_data_dir, &account_id, page, page_token.is_some())
 }
 
@@ -233,6 +245,9 @@ pub async fn search_messages(
     page_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let query = normalize_search_query(&query)?;
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     adapter
         .search_messages(&account_id, &query, page_token.as_deref())
@@ -246,6 +261,8 @@ pub async fn list_folder_messages(
     page_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     adapter
         .list_folder_messages(&account_id, folder, page_token.as_deref())
@@ -258,8 +275,12 @@ pub async fn get_message(
     message_id: String,
     state: State<'_, AppState>,
 ) -> Result<MailMessage, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let message = adapter.get_message(&account_id, &message_id).await?;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::update_message(&state.app_data_dir, &account_id, message.clone())?;
     Ok(message)
 }
@@ -270,8 +291,12 @@ pub async fn get_thread(
     thread_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MailMessage>, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let thread = adapter.get_thread(&account_id, &thread_id).await?;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::update_messages(&state.app_data_dir, &account_id, thread.messages.clone())?;
     Ok(thread.messages)
 }
@@ -284,6 +309,8 @@ pub async fn download_attachment(
     filename: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let user_profile = std::env::var_os("USERPROFILE")
         .ok_or_else(|| "The Windows Downloads folder is unavailable".to_string())?;
     let download_dir = std::path::PathBuf::from(user_profile).join("Downloads");
@@ -303,11 +330,15 @@ pub async fn download_attachment(
 pub fn open_external_url(url: String) -> Result<(), String> {
     let parsed_url =
         url::Url::parse(&url).map_err(|_| "The link is not a valid URL".to_string())?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        return Err("Only web links can be opened".to_string());
+    if !is_supported_external_scheme(parsed_url.scheme()) {
+        return Err("Only web and mail links can be opened".to_string());
     }
     webbrowser::open(parsed_url.as_str()).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn is_supported_external_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "mailto")
 }
 
 #[tauri::command]
@@ -323,12 +354,16 @@ pub async fn send_reply(
     in_reply_to: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let _ = sender;
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let account_sender = account_address(&state.app_data_dir, &account_id)?;
     adapter
         .send_reply(provider::ReplyRequest {
             account_id: &account_id,
             message_id: message_id.as_deref(),
-            sender: &sender,
+            sender: &account_sender,
             recipient: &recipient,
             subject: &subject,
             body: &body,
@@ -352,11 +387,15 @@ pub async fn send_message(
     attachments: Vec<provider::OutgoingAttachment>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let _ = sender;
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let account_sender = account_address(&state.app_data_dir, &account_id)?;
     adapter
         .send_message(provider::SendRequest {
             account_id: &account_id,
-            sender: &sender,
+            sender: &account_sender,
             recipient: &recipient,
             cc: &cc,
             bcc: &bcc,
@@ -373,6 +412,8 @@ pub async fn list_drafts(
     account_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<provider::DraftSummary>, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     adapter.list_drafts(&account_id).await
 }
@@ -384,6 +425,8 @@ pub async fn get_draft(
     draft_id: String,
     state: State<'_, AppState>,
 ) -> Result<provider::MailDraft, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     adapter.get_draft(&account_id, &draft_id).await
 }
@@ -403,12 +446,16 @@ pub async fn save_draft(
     attachments: Vec<provider::OutgoingAttachment>,
     state: State<'_, AppState>,
 ) -> Result<provider::MailDraft, String> {
+    let _ = sender;
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
+    let account_sender = account_address(&state.app_data_dir, &account_id)?;
     adapter
         .save_draft(provider::DraftRequest {
             account_id: &account_id,
             draft_id: draft_id.as_deref(),
-            sender: &sender,
+            sender: &account_sender,
             recipient: &recipient,
             cc: &cc,
             bcc: &bcc,
@@ -426,6 +473,8 @@ pub async fn delete_draft(
     draft_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     adapter.delete_draft(&account_id, &draft_id).await
 }
@@ -436,8 +485,12 @@ pub async fn cache_sent_message(
     message_id: String,
     state: State<'_, AppState>,
 ) -> Result<MailMessage, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let message = adapter.get_message(&account_id, &message_id).await?;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
@@ -459,6 +512,8 @@ pub async fn sync_messages(
 ) -> Result<SyncResult, String> {
     let started_at = Instant::now();
     log::info!("Synchronizing messages for account");
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let cached_page = message_cache::load(&state.app_data_dir, &account_id)?;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let result = adapter.sync_messages(&account_id, cached_page).await?;
@@ -468,6 +523,8 @@ pub async fn sync_messages(
         result.new_message_count,
         started_at.elapsed().as_millis()
     );
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     let page = message_cache::save_sync(
         &state.app_data_dir,
         &account_id,
@@ -516,13 +573,17 @@ pub async fn modify_messages(
             error: None,
         });
     }
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     if !provider::supports_message_action(adapter.capabilities(), action) {
-        return Err("The selected provider does not support this message action".to_string());
+        return Err("OPENMAIL_PROVIDER_ACTION_UNSUPPORTED".to_string());
     }
     let result = adapter
         .modify_messages(&account_id, &message_ids, action)
         .await?;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     for message_id in &result.succeeded_message_ids {
         message_cache::apply_message_action(&state.app_data_dir, &account_id, message_id, action)?;
     }
@@ -553,15 +614,20 @@ pub fn start_auth(
 }
 
 #[tauri::command]
-pub fn remove_account(
+pub async fn remove_account(
     account_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MailAccount>, String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
+    let _operation_guard = lock_account_operations(&state)?;
     let mut accounts = account_store::load_accounts(&state.app_data_dir)?;
+    let original_accounts = accounts.clone();
     let removed_provider = accounts
         .iter()
         .find(|account| account.id == account_id)
-        .map(|account| account.provider.clone());
+        .map(|account| account.provider.clone())
+        .ok_or_else(|| "The selected mail account does not exist".to_string())?;
     let removed_default = accounts
         .iter()
         .any(|account| account.id == account_id && account.is_default);
@@ -571,12 +637,64 @@ pub fn remove_account(
             account.is_default = true;
         }
     }
-    secure_store::delete_refresh_token(&account_id)?;
-    if let Some(provider) = removed_provider {
-        provider::invalidate_session(provider, &account_id);
+    let previous_refresh_token = secure_store::load_refresh_token(&account_id)?;
+    if let Err(error) = account_store::save_accounts(&state.app_data_dir, &accounts) {
+        let rollback_error = rollback_account_removal(
+            &state.app_data_dir,
+            &original_accounts,
+            &account_id,
+            previous_refresh_token.as_deref(),
+        );
+        return Err(match rollback_error {
+            Some(rollback_error) => format!(
+                "Account metadata could not be updated for removal: {error}. {rollback_error}"
+            ),
+            None => format!("Account metadata could not be updated for removal: {error}"),
+        });
     }
-    message_cache::remove_account(&state.app_data_dir, &account_id)?;
-    account_store::save_accounts(&state.app_data_dir, &accounts)?;
+    if let Err(error) = secure_store::delete_refresh_token(&account_id) {
+        let rollback_error = rollback_account_removal(
+            &state.app_data_dir,
+            &original_accounts,
+            &account_id,
+            previous_refresh_token.as_deref(),
+        );
+        return Err(match rollback_error {
+            Some(rollback_error) => {
+                format!("Account credential could not be removed: {error}. {rollback_error}")
+            }
+            None => format!("Account credential could not be removed: {error}"),
+        });
+    }
+    if let Err(error) = account_store::remove_backup(&state.app_data_dir) {
+        let rollback_error = rollback_account_removal(
+            &state.app_data_dir,
+            &original_accounts,
+            &account_id,
+            previous_refresh_token.as_deref(),
+        );
+        return Err(match rollback_error {
+            Some(rollback_error) => {
+                format!("Account backup could not be removed: {error}. {rollback_error}")
+            }
+            None => format!("Account backup could not be removed: {error}"),
+        });
+    }
+    if let Err(error) = message_cache::remove_account(&state.app_data_dir, &account_id) {
+        let rollback_error = rollback_account_removal(
+            &state.app_data_dir,
+            &original_accounts,
+            &account_id,
+            previous_refresh_token.as_deref(),
+        );
+        return Err(match rollback_error {
+            Some(rollback_error) => {
+                format!("Account cache could not be removed: {error}. {rollback_error}")
+            }
+            None => format!("Account cache could not be removed: {error}"),
+        });
+    }
+    provider::invalidate_session(removed_provider, &account_id);
     Ok(accounts)
 }
 
@@ -585,6 +703,7 @@ pub fn set_default_account(
     account_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MailAccount>, String> {
+    let _operation_guard = lock_account_operations(&state)?;
     let mut accounts = account_store::load_accounts(&state.app_data_dir)?;
     if !accounts.iter().any(|account| account.id == account_id) {
         return Err("The selected account does not exist".to_string());
@@ -606,8 +725,9 @@ pub fn set_launch_at_startup(enabled: bool) -> Result<(), String> {
         .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
         .map_err(|error| error.to_string())?;
     if enabled {
+        let launch_command = startup_launch_command(&current_exe);
         run_key
-            .set_value("OpenMail", &current_exe.to_string_lossy().to_string())
+            .set_value("OpenMail", &launch_command)
             .map_err(|error| error.to_string())?;
     } else if let Err(error) = run_key.delete_value("OpenMail") {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -615,4 +735,84 @@ pub fn set_launch_at_startup(enabled: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn startup_launch_command(executable: &std::path::Path) -> String {
+    format!("\"{}\"", executable.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MailProvider;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolves_sender_from_a_stored_account() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("openmail-command-test-{suffix}"));
+        let account = MailAccount {
+            id: "gmail:test@example.com".to_string(),
+            provider: MailProvider::Gmail,
+            address: "test@example.com".to_string(),
+            display_name: None,
+            is_default: true,
+        };
+        account_store::save_accounts(&data_dir, std::slice::from_ref(&account))
+            .expect("test account should save");
+
+        assert_eq!(
+            account_address(&data_dir, &account.id).as_deref(),
+            Ok("test@example.com")
+        );
+        assert!(account_address(&data_dir, "gmail:missing@example.com").is_err());
+
+        std::fs::remove_dir_all(data_dir).expect("test command directory should be removable");
+    }
+
+    #[test]
+    fn quotes_startup_executable_paths() {
+        assert_eq!(
+            startup_launch_command(std::path::Path::new(
+                "C:\\Program Files\\OpenMail\\openmail.exe"
+            )),
+            "\"C:\\Program Files\\OpenMail\\openmail.exe\""
+        );
+    }
+
+    #[test]
+    fn normalizes_and_validates_search_queries() {
+        assert_eq!(
+            normalize_search_query("  invoice  ").as_deref(),
+            Ok("invoice")
+        );
+        assert!(normalize_search_query(" ").is_err());
+        assert!(normalize_search_query("a").is_err());
+    }
+
+    #[test]
+    fn limits_external_links_to_web_and_mail_schemes() {
+        assert!(is_supported_external_scheme("http"));
+        assert!(is_supported_external_scheme("https"));
+        assert!(is_supported_external_scheme("mailto"));
+        assert!(!is_supported_external_scheme("file"));
+        assert!(!is_supported_external_scheme("javascript"));
+    }
+
+    #[test]
+    fn reuses_account_operation_locks_per_account() {
+        let state = AppState::new(std::env::temp_dir());
+        let first = account_operation_lock(&state, "gmail:first@example.com")
+            .expect("first account lock should be available");
+        let second = account_operation_lock(&state, "gmail:first@example.com")
+            .expect("same account lock should be available");
+        let other = account_operation_lock(&state, "gmail:other@example.com")
+            .expect("other account lock should be available");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
 }
