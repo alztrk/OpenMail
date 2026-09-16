@@ -380,6 +380,7 @@ impl MailProviderAdapter for GmailAdapter {
             Ok(SyncResult {
                 page: result.page,
                 new_message_count: result.new_message_count,
+                new_messages: result.new_messages,
                 removed_message_ids: result.removed_message_ids,
             })
         })

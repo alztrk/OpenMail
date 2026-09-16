@@ -24,7 +24,11 @@ type SettingsPanelProps = {
   isAddAccountOpen: boolean
   onAddAccountOpenChange: (open: boolean) => void
   isAccountMutationInFlight: boolean
+  notificationPermission: NotificationPermissionState
+  onRequestNotificationPermission: () => Promise<boolean>
 }
+
+type NotificationPermissionState = 'unknown' | 'granted' | 'denied' | 'requesting'
 
 type MailAccount = {
   id: string
@@ -76,7 +80,7 @@ function SettingRow({ label, description, value, children }: SettingRowProps) {
   return <div className="setting-row"><div className="setting-description"><strong id={labelId}>{label}</strong><span id={descriptionId}>{description}</span></div><div className="setting-control">{control}{value ? <output className="setting-value">{value}</output> : null}</div></div>
 }
 
-export function SettingsPanel({ settings, onChange, accounts, providerLogos, defaultAccountId, onSetDefault, onRemoveAccount, onStartAuth, onError, onBackToMail, isAddAccountOpen, onAddAccountOpenChange, isAccountMutationInFlight }: SettingsPanelProps) {
+export function SettingsPanel({ settings, onChange, accounts, providerLogos, defaultAccountId, onSetDefault, onRemoveAccount, onStartAuth, onError, onBackToMail, isAddAccountOpen, onAddAccountOpenChange, isAccountMutationInFlight, notificationPermission, onRequestNotificationPermission }: SettingsPanelProps) {
   const { t, i18n } = useTranslation()
   const [activeTab, setActiveTab] = useState<'general' | 'appearance' | 'language' | 'notifications' | 'accounts'>(accounts.length === 0 ? 'accounts' : 'general')
   const [accountToRemoveId, setAccountToRemoveId] = useState<string | null>(null)
@@ -86,6 +90,13 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
   const addAccountButtonRef = useRef<HTMLButtonElement>(null)
   const firstProviderButtonRef = useRef<HTMLButtonElement>(null)
   const isAuthInFlight = isAddingAccount || reconnectingAccountId !== null || isAccountMutationInFlight
+  const notificationPermissionLabel = notificationPermission === 'granted'
+    ? t('notificationPermissionGranted')
+    : notificationPermission === 'denied'
+      ? t('notificationPermissionDenied')
+      : notificationPermission === 'requesting'
+        ? t('notificationPermissionRequesting')
+        : t('notificationPermissionUnknown')
 
   const handleStartAuth = async (provider: MailAccount['provider']) => {
     if (isAddingAccount) return
@@ -188,6 +199,7 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
       {activeTab === 'notifications' ? <section className="settings-section">
         <div className="settings-group-heading"><strong>{t('notificationDeliveryGroup')}</strong><span>{t('notificationDeliveryGroupDescription')}</span></div>
         <SettingRow label={t('notificationsEnabled')} description={t('notificationsEnabledDescription')}>{({ labelId, descriptionId }) => <Switch className="setting-toggle" aria-labelledby={labelId} aria-describedby={descriptionId} checked={settings.notificationsEnabled} onChange={(e) => onChange('notificationsEnabled', e.target.checked)} />}</SettingRow>
+        <div className={`notification-permission-status ${notificationPermission}`} role="status"><span>{notificationPermissionLabel}</span>{notificationPermission !== 'granted' && notificationPermission !== 'requesting' ? <Button type="button" variant="ghost" size="default" disabled={!settings.notificationsEnabled} onClick={() => { void onRequestNotificationPermission() }}>{t('allowNotifications')}</Button> : null}</div>
         <SettingRow label={t('notificationSound')} description={t('notificationSoundDescription')}>{({ labelId, descriptionId }) => <Switch className="setting-toggle" aria-labelledby={labelId} aria-describedby={descriptionId} checked={settings.notificationSound} disabled={!settings.notificationsEnabled} onChange={(e) => onChange('notificationSound', e.target.checked)} />}</SettingRow>
         <SettingRow label={t('notificationSoundName')} description={t('notificationSoundNameDescription')}>{({ labelId, descriptionId }) => <Select value={settings.notificationSoundName} disabled={!settings.notificationsEnabled || !settings.notificationSound} onValueChange={(value) => { if (isNotificationSoundName(value)) onChange('notificationSoundName', value) }}><SelectTrigger aria-labelledby={labelId} aria-describedby={descriptionId}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="default">{t('defaultSound')}</SelectItem><SelectItem value="soft">{t('softSound')}</SelectItem><SelectItem value="none">{t('noSound')}</SelectItem></SelectContent></Select>}</SettingRow>
         <div className="settings-group-heading"><strong>{t('quietHoursGroup')}</strong><span>{t('quietHoursGroupDescription')}</span></div>

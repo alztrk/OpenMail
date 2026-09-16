@@ -4,6 +4,9 @@ use std::{
     time::Instant,
 };
 
+use serde::Deserialize;
+#[cfg(windows)]
+use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
@@ -30,6 +33,81 @@ pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
     window
         .hide()
         .map_err(|error| format!("Could not hide the main window: {error}"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopNotificationRequest {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub inbox_lines: Vec<String>,
+    pub sound: Option<String>,
+    pub notification_key: Option<String>,
+    pub action_label: String,
+}
+
+#[tauri::command]
+pub fn send_desktop_notification(
+    app: AppHandle,
+    request: DesktopNotificationRequest,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use tauri_winrt_notification::{Sound, Toast};
+
+        let app_id = if tauri::is_dev() {
+            Toast::POWERSHELL_APP_ID
+        } else {
+            &app.config().identifier
+        };
+        let mut toast = Toast::new(app_id)
+            .title(&request.title)
+            .text1(&request.body);
+        if let Some(line) = request.inbox_lines.first() {
+            toast = toast.text2(line);
+        }
+        toast = match request.sound.as_deref() {
+            Some("none") | None => toast.sound(None),
+            Some("soft") | Some("default") => toast.sound(Some(Sound::Default)),
+            Some(_) => toast.sound(Some(Sound::Default)),
+        };
+        if let Some(notification_key) = request.notification_key {
+            let event_app = app.clone();
+            toast = toast
+                .add_button(&request.action_label, &notification_key)
+                .on_activated(move |action| {
+                    if let Some(notification_key) = action {
+                        event_app
+                            .emit("openmail:notification-action", notification_key)
+                            .map_err(|error| {
+                                tauri_winrt_notification::Error::Io(std::io::Error::other(
+                                    error.to_string(),
+                                ))
+                            })?;
+                    }
+                    Ok(())
+                });
+        }
+        toast
+            .show()
+            .map_err(|error| format!("Could not show Windows notification: {error}"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = request.inbox_lines;
+        let _ = request.sound;
+        let _ = request.notification_key;
+        let _ = request.action_label;
+        use tauri_plugin_notification::NotificationExt;
+        app.notification()
+            .builder()
+            .title(request.title)
+            .body(request.body)
+            .show()
+            .map_err(|error| format!("Could not show desktop notification: {error}"))
+    }
 }
 
 impl AppState {
@@ -534,6 +612,7 @@ pub async fn sync_messages(
     Ok(SyncResult {
         page,
         new_message_count: result.new_message_count,
+        new_messages: result.new_messages,
         removed_message_ids: result.removed_message_ids,
     })
 }

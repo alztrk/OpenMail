@@ -4,7 +4,8 @@ import { createPortal } from 'react-dom'
 import { IconAlertTriangle, IconArchive, IconChevronDown, IconChevronLeft, IconChevronRight, IconDownload, IconFileText, IconInbox, IconMail, IconMailPlus, IconMaximize, IconMinus, IconPaperclip, IconPencil, IconRefresh, IconSearch, IconSend, IconSettings, IconStar, IconTrash, IconX, IconRestore } from '@tabler/icons-react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
-import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+import { listen } from '@tauri-apps/api/event'
+import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification'
 import openMailWordmark from './assets/openmail-wordmark.svg'
 import openMailWordmarkDark from './assets/openmail-wordmark-dark.svg'
 import gmailLogo from './assets/providers/gmail.svg'
@@ -33,6 +34,7 @@ import { areValidEmailAddresses, splitEmailAddresses } from '@/lib/utils'
 import { compareMessageTimes, getMessageIdentity, getMessageTimeValue, getSenderLabel } from '@/lib/mail'
 import { sanitizeComposeHtml } from '@/lib/compose-html'
 import { formatFileSize } from '@/lib/formatters'
+import { aggregateNotificationTargets, consumeNotificationDestination, getNotificationLines, getPollingDelayMs, isQuietHours, NOTIFICATION_ACTION_EVENT, registerNotificationDestination, shouldSendDesktopNotification, type NewMailNotification, type NotificationDestination } from '@/lib/notifications'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { loadSettings, saveSettings, type AppSettings, type Density } from '@/settings'
 import './App.css'
@@ -120,6 +122,7 @@ type MessagePage = {
 type SyncResult = {
   page: MessagePage
   new_message_count: number
+  new_messages: NewMailNotification[]
   removed_message_ids: string[]
 }
 
@@ -142,23 +145,11 @@ type MailDraft = {
 }
 
 type AccountSyncStatus = 'idle' | 'syncing' | 'error'
+type NotificationPermissionState = 'unknown' | 'granted' | 'denied' | 'requesting'
 
-function isQuietHours(settings: AppSettings): boolean {
-  if (!settings.quietHoursEnabled) return false
-  const currentMinutes = new Date().getHours() * 60 + new Date().getMinutes()
-  const [startHour, startMinute] = settings.quietHoursStart.split(':').map(Number)
-  const [endHour, endMinute] = settings.quietHoursEnd.split(':').map(Number)
-  const startMinutes = startHour * 60 + startMinute
-  const endMinutes = endHour * 60 + endMinute
-  return startMinutes <= endMinutes
-    ? currentMinutes >= startMinutes && currentMinutes < endMinutes
-    : currentMinutes >= startMinutes || currentMinutes < endMinutes
-}
-
-function getNotificationSound(settings: AppSettings): string | undefined {
-  if (!settings.notificationSound || settings.notificationSoundName === 'none') return undefined
-  if (settings.notificationSoundName === 'soft') return 'C:\\Windows\\Media\\Windows Notify Messaging.wav'
-  return 'C:\\Windows\\Media\\Windows Notify Email.wav'
+function getNotificationSoundName(settings: AppSettings): string | undefined {
+  if (!settings.notificationSound || settings.notificationSoundName === 'none') return 'none'
+  return settings.notificationSoundName
 }
 
 function isTauriRuntime(): boolean {
@@ -256,9 +247,6 @@ const providerLogos = {
   gmail: gmailLogo,
   outlook: outlookLogo,
 } as const
-
-const foregroundSyncIntervalMs = 15000
-const backgroundSyncIntervalMs = 60000
 
 type WindowHeaderProps = {
   onRequestClose: () => void
@@ -537,6 +525,7 @@ function App() {
   const [openAddAccount, setOpenAddAccount] = useState(false)
   const [contextMenu, setContextMenu] = useState<{ messageId: string; x: number; y: number; returnFocusElement: HTMLButtonElement } | null>(null)
   const [settings, setSettings] = useState<AppSettings>(loadSettings)
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionState>('unknown')
   const [defaultAccountId, setDefaultAccountId] = useState('')
   const [toastMessage, setToastMessage] = useState('')
   const handleWindowActionError = useCallback((error: unknown) => {
@@ -546,6 +535,28 @@ function App() {
     if (!isTauriRuntime()) return
     await invoke('hide_main_window')
   }, [])
+  const restoreWindow = useCallback(async () => {
+    if (!isTauriRuntime()) return
+    const window = getCurrentWindow()
+    await window.show()
+    await window.unminimize()
+    await window.setFocus()
+  }, [])
+  const requestNotificationPermission = useCallback(async (): Promise<boolean> => {
+    if (!isTauriRuntime()) return false
+    setNotificationPermission('requesting')
+    try {
+      const permission = await requestPermission()
+      const granted = permission === 'granted'
+      setNotificationPermission(granted ? 'granted' : 'denied')
+      if (!granted) setToastMessage(t('notificationPermissionDenied'))
+      return granted
+    } catch {
+      setNotificationPermission('denied')
+      setToastMessage(t('notificationPermissionFailed'))
+      return false
+    }
+  }, [t])
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [pendingPermanentDeleteId, setPendingPermanentDeleteId] = useState<string | null>(null)
   const [pendingArchiveId, setPendingArchiveId] = useState<string | null>(null)
@@ -578,6 +589,7 @@ function App() {
   const accountMutationInFlightRef = useRef(false)
   const accountsLoadRequestIdRef = useRef(0)
   const syncInFlightAccountsRef = useRef(new Set<string>())
+  const pendingNotificationDestinationRef = useRef<NotificationDestination | null>(null)
   const composeRevisionRef = useRef(0)
   const draftListRequestIdRef = useRef(0)
   const draftLoadRequestIdRef = useRef(0)
@@ -598,6 +610,18 @@ function App() {
     activeFolderRef.current = activeFolder
     isUnifiedInboxRef.current = isUnifiedInbox
   }, [activeAccountId, activeFolder, isUnifiedInbox])
+  useEffect(() => {
+    if (!isTauriRuntime()) return
+    let cancelled = false
+    void isPermissionGranted()
+      .then((granted) => {
+        if (!cancelled) setNotificationPermission(granted ? 'granted' : 'denied')
+      })
+      .catch(() => {
+        if (!cancelled) setNotificationPermission('unknown')
+      })
+    return () => { cancelled = true }
+  }, [])
   const activeProviderCapabilities = providerCapabilitiesByAccount[activeAccountId] ?? null
   const composeOpenSequenceRef = useRef(0)
 
@@ -660,10 +684,10 @@ function App() {
   }, [setIsReaderDetailsOpen, setIsReaderScrolled, setIsReplying, setLoadingMessageId, setMessageLoadErrorId, setReplyDraft, setSelectedMessageId])
 
   const clearBulkSelection = useCallback(() => setSelectedMessageIds(new Set()), [])
-  const invalidateLoadMore = () => {
+  const invalidateLoadMore = useCallback(() => {
     loadMoreRequestIdRef.current += 1
     setIsLoadingMore(false)
-  }
+  }, [])
   const toggleMessageSelection = useCallback((messageId: string) => {
     setSelectedMessageIds((current) => {
       const next = new Set(current)
@@ -920,23 +944,43 @@ function App() {
     if (accounts.length === 0) return
     let cancelled = false
     let nativeWindowFocused = true
+    let consecutiveFailures = 0
+    let lastSyncError = ''
+    let timeoutId: number | undefined
+    const isForeground = () => document.visibilityState === 'visible' && nativeWindowFocused
+    const scheduleNextSync = () => {
+      if (cancelled) return
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+      timeoutId = window.setTimeout(sync, getPollingDelayMs(isForeground(), consecutiveFailures))
+    }
     const sync = () => {
+      if (cancelled) return
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId)
+        timeoutId = undefined
+      }
       const accountsToSync = accounts.filter((account) => !syncInFlightAccountsRef.current.has(account.id))
-      if (accountsToSync.length === 0) return
+      if (accountsToSync.length === 0) {
+        scheduleNextSync()
+        return
+      }
       accountsToSync.forEach((account) => syncInFlightAccountsRef.current.add(account.id))
       setAccountSyncStatus((current) => accountsToSync.reduce((next, account) => ({ ...next, [account.id]: 'syncing' as const }), current))
       void Promise.allSettled(accountsToSync.map((account) => invoke<SyncResult>('sync_messages', { accountId: account.id })))
         .then(async (results) => {
           if (cancelled) return
-          const notificationTargets: Array<{ accountId: string; count: number }> = []
+          const notificationTargets: Array<{ accountId: string; newMessageCount: number; messages: NewMailNotification[] }> = []
+          let failedAccountCount = 0
+          let firstFailure: unknown = null
           results.forEach((result, index) => {
             if (result.status === 'rejected') {
+              failedAccountCount += 1
+              firstFailure ??= result.reason
               setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'error' }))
-              setToastMessage(getDisplayError(result.reason))
               return
             }
-              setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'idle' }))
-            if (result.value.new_message_count > 0) notificationTargets.push({ accountId: accountsToSync[index].id, count: result.value.new_message_count })
+            setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'idle' }))
+            if (result.value.new_message_count > 0) notificationTargets.push({ accountId: accountsToSync[index].id, newMessageCount: result.value.new_message_count, messages: result.value.new_messages })
             if (!cancelled && isUnifiedInbox && activeFolder === 'inbox') {
               setUnifiedNextPageTokens((current) => ({ ...current, [accountsToSync[index].id]: result.value.page.next_page_token }))
               setMessages((current) => mergeUnifiedAccountMessages(
@@ -958,19 +1002,44 @@ function App() {
               setMailboxLoadError(false)
             }
           })
-          if (cancelled || notificationTargets.length === 0 || !settings.notificationsEnabled || isQuietHours(settings)) return
-          let permissionGranted = await isPermissionGranted()
-          if (!permissionGranted) permissionGranted = (await requestPermission()) === 'granted'
-          if (permissionGranted) {
-            const notificationResults = await Promise.allSettled(notificationTargets.map(({ accountId, count }) => sendNotification({
-              title: t('newMailNotificationTitle'),
-              body: t('newMailNotificationBody', { count }),
-              sound: getNotificationSound(settings),
-              extra: { accountId },
-              autoCancel: true,
-            })))
-            const notificationFailure = notificationResults.find((result): result is PromiseRejectedResult => result.status === 'rejected')
-            if (notificationFailure && !cancelled) setToastMessage(getDisplayError(notificationFailure.reason))
+          if (failedAccountCount > 0) {
+            consecutiveFailures += 1
+            const errorMessage = firstFailure ? getDisplayError(firstFailure) : t('unexpectedError')
+            if (errorMessage !== lastSyncError || consecutiveFailures === 1) setToastMessage(errorMessage)
+            lastSyncError = errorMessage
+          } else {
+            consecutiveFailures = 0
+            lastSyncError = ''
+          }
+          if (cancelled || notificationTargets.length === 0 || !settings.notificationsEnabled || isQuietHours(settings) || !shouldSendDesktopNotification(document.visibilityState === 'visible', nativeWindowFocused)) return
+          const permissionGranted = await isPermissionGranted()
+          if (cancelled) return
+          setNotificationPermission(permissionGranted ? 'granted' : 'denied')
+          if (!permissionGranted) return
+          const batch = aggregateNotificationTargets(notificationTargets)
+          if (batch.count <= 0) return
+          const firstMessage = batch.messages[0]
+          const singleMessage = batch.count === 1 && firstMessage
+          const notificationKey = firstMessage
+            ? registerNotificationDestination({
+              accountId: firstMessage.accountId,
+              messageId: firstMessage.id,
+              threadId: firstMessage.thread_id,
+            })
+            : null
+          const lines = getNotificationLines(batch)
+          const notificationOptions = {
+            title: singleMessage ? firstMessage.sender || t('newMailNotificationTitle') : t('newMailNotificationTitle'),
+            body: singleMessage ? firstMessage.subject || t('newMailNotificationBody', { count: batch.count }) : t('newMailNotificationBody', { count: batch.count }),
+            sound: getNotificationSoundName(settings),
+            actionLabel: t('openMailNotification'),
+            notificationKey,
+            inboxLines: !singleMessage ? lines : [],
+          }
+          try {
+            await invoke('send_desktop_notification', { request: notificationOptions })
+          } catch {
+            if (!cancelled) setToastMessage(t('notificationSendFailed'))
           }
         })
         .catch((error: unknown) => {
@@ -978,25 +1047,19 @@ function App() {
         })
         .finally(() => {
           accountsToSync.forEach((account) => syncInFlightAccountsRef.current.delete(account.id))
+          scheduleNextSync()
         })
-    }
-    let intervalId = window.setInterval(sync, document.visibilityState === 'visible' ? foregroundSyncIntervalMs : backgroundSyncIntervalMs)
-    const scheduleNextSync = () => {
-      window.clearInterval(intervalId)
-      const isForeground = document.visibilityState === 'visible' && nativeWindowFocused
-      intervalId = window.setInterval(sync, isForeground ? foregroundSyncIntervalMs : backgroundSyncIntervalMs)
     }
     const handleWindowFocus = () => {
       nativeWindowFocused = true
-      scheduleNextSync()
       sync()
     }
     let removeTauriFocusListener: (() => void) | undefined
     if (isTauriRuntime()) {
       void getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         nativeWindowFocused = focused
-        scheduleNextSync()
         if (!cancelled && focused) sync()
+        else scheduleNextSync()
       }).then((removeListener) => {
         if (cancelled) {
           removeListener()
@@ -1008,14 +1071,14 @@ function App() {
       })
     }
     const handleVisibilityChange = () => {
-      scheduleNextSync()
       if (document.visibilityState === 'visible') sync()
+      else scheduleNextSync()
     }
     window.addEventListener('focus', handleWindowFocus)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
       cancelled = true
-      window.clearInterval(intervalId)
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
       window.removeEventListener('focus', handleWindowFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       removeTauriFocusListener?.()
@@ -1820,6 +1883,9 @@ function App() {
     }
     settingsRef.current = next
     setSettings(next)
+    if (key === 'notificationsEnabled' && value === true && notificationPermission !== 'granted') {
+      void requestNotificationPermission()
+    }
     if (key === 'launchAtStartup') {
       const requestId = ++launchAtStartupRequestIdRef.current
       void invoke('set_launch_at_startup', { enabled: next.launchAtStartup }).catch((error: unknown) => {
@@ -2540,7 +2606,7 @@ function App() {
     setLoadingMessageId(messageId)
   }
 
-  const selectReaderMessage = (nextMessage: MailMessage) => {
+  const selectReaderMessage = useCallback((nextMessage: MailMessage) => {
     const messageWithAccount = nextMessage.account_id ? nextMessage : { ...nextMessage, account_id: activeAccountId }
     const messageKey = getMessageIdentity(messageWithAccount, activeAccountId)
     const needsBody = !messageWithAccount.body_html && (!messageWithAccount.body || messageWithAccount.body === messageWithAccount.preview)
@@ -2552,7 +2618,53 @@ function App() {
     setIsReaderScrolled(false)
     setLoadingMessageId(needsBody ? messageKey : null)
     setContextMenu(null)
-  }
+  }, [activeAccountId])
+
+  const openNotificationDestination = useCallback(async (destination: NotificationDestination) => {
+    if (!accounts.some((account) => account.id === destination.accountId)) return
+    pendingNotificationDestinationRef.current = destination
+    await restoreWindow()
+    clearBulkSelection()
+    clearReaderSelection()
+    clearSearch()
+    invalidateLoadMore()
+    setIsUnifiedInbox(false)
+    setActiveFolder('inbox')
+    setActiveFilter('all')
+    setActiveView('mail')
+    setActiveAccountId(destination.accountId)
+  }, [accounts, clearBulkSelection, clearReaderSelection, clearSearch, invalidateLoadMore, restoreWindow])
+
+  useEffect(() => {
+    const destination = pendingNotificationDestinationRef.current
+    if (!destination || activeView !== 'mail' || activeAccountId !== destination.accountId) return
+    const message = selectableMessages.find((item) => item.id === destination.messageId || item.thread_id === destination.threadId)
+    if (!message) return
+    pendingNotificationDestinationRef.current = null
+    selectReaderMessage(message)
+  }, [activeAccountId, activeView, selectableMessages, selectReaderMessage])
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return
+    let cancelled = false
+    let notificationListener: (() => void) | undefined
+    void listen<string>(NOTIFICATION_ACTION_EVENT, ({ payload: key }) => {
+      const destination = consumeNotificationDestination(key)
+      if (!destination) return
+      void openNotificationDestination(destination).catch(() => {
+        if (!cancelled) setToastMessage(t('notificationActionUnavailable'))
+      })
+    }).then((remove) => {
+      if (cancelled) void remove()
+      else notificationListener = remove
+    }).catch(() => {
+      if (!cancelled) setToastMessage(t('notificationActionUnavailable'))
+    })
+    return () => {
+      cancelled = true
+      if (notificationListener) notificationListener()
+    }
+  }, [openNotificationDestination, t])
 
   const selectSearchResult = (result: MailSearchResult) => {
     const nextMessage = { ...result.message, account_id: result.account.id }
@@ -2864,7 +2976,7 @@ function App() {
             </section>
           </div>
         </div> : null}
-        {activeView === 'settings' ? <section className="settings-page" aria-labelledby="settings-title"><Suspense fallback={<div className="settings-loading" role="status">{t('loadingMailbox')}</div>}><SettingsPanel settings={settings} onChange={updateSetting} accounts={accounts} providerLogos={providerLogos} defaultAccountId={defaultAccountId} onSetDefault={setDefaultAccount} onRemoveAccount={removeAccount} onStartAuth={startAuth} onError={(error: unknown) => setToastMessage(getDisplayError(error))} onBackToMail={() => { setOpenAddAccount(false); setActiveView('mail'); clearSearch(); window.requestAnimationFrame(() => settingsButtonRef.current?.focus()) }} isAddAccountOpen={openAddAccount} onAddAccountOpenChange={setOpenAddAccount} isAccountMutationInFlight={isAccountMutationInFlight} /></Suspense></section> : null}
+        {activeView === 'settings' ? <section className="settings-page" aria-labelledby="settings-title"><Suspense fallback={<div className="settings-loading" role="status">{t('loadingMailbox')}</div>}><SettingsPanel settings={settings} onChange={updateSetting} accounts={accounts} providerLogos={providerLogos} defaultAccountId={defaultAccountId} onSetDefault={setDefaultAccount} onRemoveAccount={removeAccount} onStartAuth={startAuth} onError={(error: unknown) => setToastMessage(getDisplayError(error))} onBackToMail={() => { setOpenAddAccount(false); setActiveView('mail'); clearSearch(); window.requestAnimationFrame(() => settingsButtonRef.current?.focus()) }} isAddAccountOpen={openAddAccount} onAddAccountOpenChange={setOpenAddAccount} isAccountMutationInFlight={isAccountMutationInFlight} notificationPermission={notificationPermission} onRequestNotificationPermission={requestNotificationPermission} /></Suspense></section> : null}
       </section>
       {isComposing ? <section className="compose-page" aria-labelledby="compose-title">
         <header className="compose-page-header">

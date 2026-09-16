@@ -13,7 +13,8 @@ use serde_json::json;
 use crate::{
     attachment_store, config,
     models::{
-        MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage, SyncResult,
+        MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage,
+        NewMailNotification, SyncResult,
     },
     provider::{
         DraftAttachment, DraftRequest, DraftSummary, MailDraft, OutgoingAttachment, ReplyRequest,
@@ -1093,17 +1094,19 @@ pub async fn sync_messages(
         })
         .unwrap_or_default();
     let page = list_messages(account_id, None).await?;
-    let new_message_count = page
+    let new_messages = page
         .messages
         .iter()
         .filter(|message| !previous_ids.contains(&message.id.as_str()))
-        .count();
+        .map(to_notification_message)
+        .collect::<Vec<_>>();
     Ok(SyncResult {
         page: MessagePage {
             history_id: page.history_id,
             ..page
         },
-        new_message_count,
+        new_message_count: new_messages.len(),
+        new_messages,
         removed_message_ids: Vec::new(),
     })
 }
@@ -1139,6 +1142,7 @@ async fn initial_delta_sync(
         result.removed_message_ids.dedup();
     }
     result.new_message_count = 0;
+    result.new_messages.clear();
     Ok(result)
 }
 
@@ -1195,10 +1199,12 @@ async fn sync_from_delta(
     let mut messages = cached_page.messages.clone();
     messages.retain(|message| !removed.contains(&message.id));
     let previous_ids: HashSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
-    let new_message_count = changed
+    let mut new_messages = changed
         .iter()
         .filter(|(id, _)| !previous_ids.contains(id.as_str()))
-        .count();
+        .map(|(_, message)| to_notification_message(message))
+        .collect::<Vec<_>>();
+    new_messages.sort_by(|left, right| left.id.cmp(&right.id));
     for message in changed.into_values() {
         if let Some(existing) = messages.iter_mut().find(|item| item.id == message.id) {
             *existing = message;
@@ -1220,7 +1226,8 @@ async fn sync_from_delta(
             next_page_token: None,
             history_id: cursor,
         },
-        new_message_count,
+        new_message_count: new_messages.len(),
+        new_messages,
         removed_message_ids,
     })
 }
@@ -1583,13 +1590,14 @@ fn to_mail_message(message: GraphMessage) -> MailMessage {
             })
         })
         .collect::<Vec<_>>();
+    let avatar_url = sender_avatar_url(&address);
     MailMessage {
         id: message.id,
         thread_id: message.conversation_id,
         message_id_header: message.internet_message_id,
         sender,
         address,
-        avatar_url: None,
+        avatar_url,
         subject: message
             .subject
             .unwrap_or_else(|| "(No subject)".to_string()),
@@ -1604,6 +1612,43 @@ fn to_mail_message(message: GraphMessage) -> MailMessage {
             .is_some_and(|status| status.eq_ignore_ascii_case("flagged")),
         has_attachment: message.has_attachments.unwrap_or(!attachments.is_empty()),
         attachments,
+    }
+}
+
+fn sender_avatar_url(address: &str) -> Option<String> {
+    let (_, domain) = address.rsplit_once('@')?;
+    let domain = domain.trim();
+    if !is_valid_avatar_domain(domain) {
+        return None;
+    }
+
+    Some(format!(
+        "https://www.google.com/s2/favicons?domain={domain}&sz=64"
+    ))
+}
+
+fn is_valid_avatar_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
+        return false;
+    }
+
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn to_notification_message(message: &MailMessage) -> NewMailNotification {
+    NewMailNotification {
+        id: message.id.clone(),
+        thread_id: message.thread_id.clone(),
+        sender: message.sender.clone(),
+        subject: message.subject.clone(),
     }
 }
 
@@ -1660,6 +1705,21 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_sender_favicon_url_from_a_valid_domain() {
+        assert_eq!(
+            sender_avatar_url("sender@example.com").as_deref(),
+            Some("https://www.google.com/s2/favicons?domain=example.com&sz=64")
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_sender_favicon_domains() {
+        assert!(sender_avatar_url("sender").is_none());
+        assert!(sender_avatar_url("sender@example.com/path").is_none());
+        assert!(sender_avatar_url("sender@-example.com").is_none());
+    }
 
     #[test]
     fn validates_graph_pagination_links() {

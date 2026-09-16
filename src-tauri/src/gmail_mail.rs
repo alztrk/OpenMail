@@ -19,7 +19,10 @@ use serde_json::json;
 use crate::{
     attachment_store,
     config::GmailConfig,
-    models::{MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage},
+    models::{
+        MailAttachment, MailFolder, MailMessage, MailThread, MessageAction, MessagePage,
+        NewMailNotification,
+    },
     provider::{DraftAttachment, DraftRequest, DraftSummary, MailDraft, OutgoingAttachment},
     secure_store,
 };
@@ -462,6 +465,7 @@ async fn list_messages_with_query(
 pub struct SyncOutcome {
     pub page: MessagePage,
     pub new_message_count: usize,
+    pub new_messages: Vec<NewMailNotification>,
     pub removed_message_ids: Vec<String>,
 }
 
@@ -500,6 +504,7 @@ async fn full_inbox_sync(
                     history_id,
                 },
                 new_message_count: 0,
+                new_messages: Vec::new(),
                 removed_message_ids,
             });
         }
@@ -518,6 +523,7 @@ pub async fn sync_messages(
         return Ok(SyncOutcome {
             page: list_messages(account_id, None).await?,
             new_message_count: 0,
+            new_messages: Vec::new(),
             removed_message_ids: Vec::new(),
         });
     };
@@ -600,7 +606,8 @@ pub async fn sync_messages(
     changed_ids.dedup();
     changed_ids.retain(|id| removed_ids.binary_search(id).is_err());
     let changed_messages = fetch_metadata_messages(&client, &access_token, changed_ids).await?;
-    let new_message_count = count_new_inbox_messages(&changed_messages, &added_ids);
+    let new_messages = collect_new_inbox_notifications(&changed_messages, &added_ids);
+    let new_message_count = new_messages.len();
     let mut removed_message_ids = removed_ids;
     apply_changed_messages(
         &mut page.messages,
@@ -613,6 +620,7 @@ pub async fn sync_messages(
     Ok(SyncOutcome {
         page,
         new_message_count,
+        new_messages,
         removed_message_ids,
     })
 }
@@ -1593,13 +1601,14 @@ fn to_mail_message(message: GmailMessage) -> MailMessage {
         .unwrap_or_default();
     let time = header_value(headers, "Date").unwrap_or_default();
     let preview = message.snippet.unwrap_or_default();
+    let avatar_url = sender_avatar_url(&address);
     MailMessage {
         id: message.id,
         thread_id: message.thread_id,
         message_id_header: header_value(headers, "Message-ID"),
         sender,
         address,
-        avatar_url: None,
+        avatar_url,
         subject,
         preview: preview.clone(),
         body: text_body(&payload).unwrap_or_default(),
@@ -1610,6 +1619,34 @@ fn to_mail_message(message: GmailMessage) -> MailMessage {
         has_attachment: has_attachment(&payload),
         attachments: collect_attachments(&payload),
     }
+}
+
+fn sender_avatar_url(address: &str) -> Option<String> {
+    let (_, domain) = address.rsplit_once('@')?;
+    let domain = domain.trim();
+    if !is_valid_avatar_domain(domain) {
+        return None;
+    }
+
+    Some(format!(
+        "https://www.google.com/s2/favicons?domain={domain}&sz=64"
+    ))
+}
+
+fn is_valid_avatar_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
+        return false;
+    }
+
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 fn collect_attachments(part: &MessagePart) -> Vec<MailAttachment> {
@@ -2051,15 +2088,21 @@ fn upsert_message(messages: &mut Vec<MailMessage>, message: MailMessage) {
     }
 }
 
-fn count_new_inbox_messages(
+fn collect_new_inbox_notifications(
     changed_messages: &[(MailMessage, bool)],
     added_ids: &[String],
-) -> usize {
+) -> Vec<NewMailNotification> {
     let added_id_set = added_ids.iter().map(String::as_str).collect::<HashSet<_>>();
     changed_messages
         .iter()
         .filter(|(message, is_inbox)| *is_inbox && added_id_set.contains(message.id.as_str()))
-        .count()
+        .map(|(message, _)| NewMailNotification {
+            id: message.id.clone(),
+            thread_id: message.thread_id.clone(),
+            sender: message.sender.clone(),
+            subject: message.subject.clone(),
+        })
+        .collect()
 }
 
 fn apply_changed_messages(
@@ -2280,6 +2323,21 @@ mod tests {
         assert_eq!(url.query(), None);
     }
 
+    #[test]
+    fn builds_sender_favicon_url_from_a_valid_domain() {
+        assert_eq!(
+            sender_avatar_url("sender@example.com").as_deref(),
+            Some("https://www.google.com/s2/favicons?domain=example.com&sz=64")
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_sender_favicon_domains() {
+        assert!(sender_avatar_url("sender").is_none());
+        assert!(sender_avatar_url("sender@example.com/path").is_none());
+        assert!(sender_avatar_url("sender@-example.com").is_none());
+    }
+
     fn encoded(value: &str) -> String {
         URL_SAFE_NO_PAD.encode(value.as_bytes())
     }
@@ -2305,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_only_added_messages_that_are_in_the_inbox() {
+    fn collects_only_added_messages_that_are_in_the_inbox() {
         let changed_messages = vec![
             (mail_message("inbox-message"), true),
             (mail_message("sent-message"), false),
@@ -2313,7 +2371,9 @@ mod tests {
         ];
         let added_ids = vec!["inbox-message".to_string(), "sent-message".to_string()];
 
-        assert_eq!(count_new_inbox_messages(&changed_messages, &added_ids), 1);
+        let notifications = collect_new_inbox_notifications(&changed_messages, &added_ids);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].id, "inbox-message");
     }
 
     #[test]

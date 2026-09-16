@@ -4714,6 +4714,45 @@ html[data-theme='dark'] .window-brand-logo-dark {
   padding-top: 16px;
 }
 
+.notification-permission-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-height: 48px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+}
+
+.notification-permission-status > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.notification-permission-status > span::before {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  content: '';
+}
+
+.notification-permission-status.granted > span::before {
+  background: var(--success, #3d8b62);
+}
+
+.notification-permission-status.denied > span::before {
+  background: var(--danger);
+}
+
+.notification-permission-status.requesting > span::before {
+  background: var(--accent);
+  animation: sync-pulse 1.2s ease-in-out infinite;
+}
+
 .settings-accounts-heading {
   align-items: center;
 }

@@ -101,6 +101,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::hide_main_window,
+            commands::send_desktop_notification,
             commands::list_accounts,
             commands::get_provider_capabilities,
             commands::list_messages,

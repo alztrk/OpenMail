@@ -58,7 +58,18 @@ pub struct SyncResult {
     pub page: MessagePage,
     pub new_message_count: usize,
     #[serde(default)]
+    pub new_messages: Vec<NewMailNotification>,
+    #[serde(default)]
     pub removed_message_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMailNotification {
+    pub id: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    pub sender: String,
+    pub subject: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
