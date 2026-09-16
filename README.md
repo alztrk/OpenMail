@@ -56,11 +56,11 @@ Build the Windows portable release:
 pnpm tauri build --no-bundle
 ```
 
-The portable release is a single `openmail.exe`. Copy `.env.example` to `.env`,
-fill in the provider client IDs, and place the file next to the executable.
-OpenMail loads these values at runtime, so they are not embedded in the binary.
-The Microsoft Graph client ID is a public application identifier, while the
-Gmail client secret remains private. Never commit the real `.env` file.
+The portable release is a single `openmail.exe`. Start it, open Settings, and
+enter the provider application values in OAuth credentials. OpenMail stores
+them in Windows Credential Manager and never embeds them in the binary or
+account data. Gmail requires both a desktop client ID and client secret;
+Microsoft Graph requires only its public client ID.
 
 ## Localization
 

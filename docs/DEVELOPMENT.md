@@ -45,10 +45,10 @@ pnpm screenshots -- --width 1440 --height 900
 pnpm screenshots -- --headed
 ```
 
-The portable build reads the Gmail OAuth client ID and secret plus the Microsoft
-Graph public client ID from a `.env` file next to the executable at runtime.
-For Microsoft Graph, the build environment remains a supported fallback. The
-executable is written to `src-tauri/target/release/openmail.exe`.
+The portable build reads OAuth credentials from Windows Credential Manager after
+they are entered in Settings. No provider credential is read from a `.env`
+file or build environment. The executable is written to
+`src-tauri/target/release/openmail.exe`.
 
 The live verification target for this release cycle is Gmail. Outlook/Microsoft
 Graph is validated only through compilation and unit tests until a public client

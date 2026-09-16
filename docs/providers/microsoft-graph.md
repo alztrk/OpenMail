@@ -4,7 +4,7 @@
 
 Support Outlook.com, Hotmail, Live, and Microsoft 365 mailboxes through Microsoft Graph. One adapter covers both personal Microsoft accounts and work or school accounts.
 
-Status: implemented in the Rust adapter. Initial release requires a Microsoft Entra public client ID in the runtime `.env` file or build environment. Live-provider and portable-release verification remain release checks. Priority: P1.
+Status: implemented in the Rust adapter. Initial release requires a Microsoft Entra public client ID configured from Settings. Live-provider and portable-release verification remain release checks. Priority: P1.
 
 ## Provider capabilities
 
@@ -43,11 +43,10 @@ openid profile email User.Read Mail.ReadWrite Mail.Send offline_access
 
 The desktop application uses a public client id. Do not add a client secret to the OpenMail binary or source configuration. Microsoft documents that client secrets are not needed for public native clients. See [Get access on behalf of a user](https://learn.microsoft.com/en-us/graph/auth-v2-user) and [Register an application](https://learn.microsoft.com/en-us/graph/auth-register-app-v2).
 
-OpenMail reads the public client ID from `OPENMAIL_MICROSOFT_CLIENT_ID` in the
-runtime `.env` file when available, with the build-time environment as a
-fallback. This is an application identifier, not a client secret. The existing
-Gmail credential configuration is independent and is not changed by this
-provider.
+OpenMail reads the public client ID from Settings and stores it in Windows
+Credential Manager. This is an application identifier, not a client secret. The
+existing Gmail credential configuration is independent and is not changed by
+this provider.
 
 For the Entra app registration, add a mobile and desktop redirect URI for `http://localhost`. The adapter binds an available loopback port and sends the same `http://localhost:{port}/oauth2/callback` shape during authorization. Do not add a client secret to this application registration or to a build environment.
 
