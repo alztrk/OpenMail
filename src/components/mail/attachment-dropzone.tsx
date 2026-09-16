@@ -11,17 +11,14 @@ export type ComposeAttachment = {
   dataBase64: string
 }
 
-function formatFileSize(size: number): string {
-  if (size < 1024) return `${size} B`
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`
-}
-
 function encodeBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
-  let binary = ''
-  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index])
-  return btoa(binary)
+  const binaryChunks: string[] = []
+  const chunkSize = 32 * 1024
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binaryChunks.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize)))
+  }
+  return btoa(binaryChunks.join(''))
 }
 
 type AttachmentDropzoneProps = {
@@ -33,12 +30,15 @@ type AttachmentDropzoneProps = {
 }
 
 export function AttachmentDropzone({ attachments, onChange, disabled, maxFileSize, maxTotalSize }: AttachmentDropzoneProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const inputRef = useRef<HTMLInputElement>(null)
+  const readingRef = useRef(false)
   const [isDragging, setIsDragging] = useState(false)
+  const [isReading, setIsReading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const addFiles = async (files: FileList | File[]) => {
+    if (disabled || readingRef.current) return
     const selectedFiles = Array.from(files)
     if (selectedFiles.length === 0) return
     const currentTotalSize = attachments.reduce((total, attachment) => total + attachment.size, 0)
@@ -46,7 +46,7 @@ export function AttachmentDropzone({ attachments, onChange, disabled, maxFileSiz
     let nextTotalSize = currentTotalSize
     let firstError: string | null = null
     for (const file of selectedFiles) {
-      if (file.size >= maxFileSize) {
+      if (file.size > maxFileSize) {
         firstError ??= t('attachmentTooLarge', { filename: file.name })
         continue
       }
@@ -57,7 +57,12 @@ export function AttachmentDropzone({ attachments, onChange, disabled, maxFileSiz
       acceptedFiles.push(file)
       nextTotalSize += file.size
     }
-    if (acceptedFiles.length === 0) return
+    if (acceptedFiles.length === 0) {
+      setError(firstError)
+      return
+    }
+    readingRef.current = true
+    setIsReading(true)
     let newAttachments: ComposeAttachment[]
     try {
       newAttachments = await Promise.all(acceptedFiles.map(async (file) => ({
@@ -69,10 +74,14 @@ export function AttachmentDropzone({ attachments, onChange, disabled, maxFileSiz
       })))
     } catch {
       setError(t('attachmentsReadFailed'))
+      readingRef.current = false
+      setIsReading(false)
       return
     }
     setError(firstError)
     onChange([...attachments, ...newAttachments])
+    readingRef.current = false
+    setIsReading(false)
   }
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {

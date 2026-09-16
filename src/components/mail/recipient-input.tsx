@@ -12,6 +12,7 @@ export type SavedRecipient = {
 
 type RecipientInputProps = {
   id: string
+  errorId?: string
   value: string
   placeholder: string
   removeLabel: string
@@ -37,7 +38,7 @@ function normalizeEmail(value: string): string {
   return value.trim().toLowerCase()
 }
 
-export function RecipientInput({ id, value, placeholder, removeLabel, saveLabel, savedLabel, suggestionsLabel, invalid, savedRecipients, onChange, onSaveRecipient }: RecipientInputProps) {
+export function RecipientInput({ id, errorId, value, placeholder, removeLabel, saveLabel, savedLabel, suggestionsLabel, invalid, savedRecipients, onChange, onSaveRecipient }: RecipientInputProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const listId = useId()
   const { committed, draft } = splitValue(value)
@@ -123,6 +124,7 @@ export function RecipientInput({ id, value, placeholder, removeLabel, saveLabel,
         }}
         placeholder={committed.length === 0 ? placeholder : undefined}
         aria-invalid={invalid}
+        aria-describedby={invalid && errorId ? errorId : undefined}
         aria-autocomplete="list"
         aria-controls={suggestions.length > 0 ? listId : undefined}
       />

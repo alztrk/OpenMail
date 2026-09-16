@@ -1,14 +1,18 @@
 import type { SavedRecipient } from '@/components/mail/recipient-input'
+import { isValidEmailAddress } from '@/lib/utils'
 
 const STORAGE_KEY = 'openmail.saved-recipients'
 
 function isSavedRecipient(value: unknown): value is SavedRecipient {
   if (typeof value !== 'object' || value === null) return false
-  const recipient = value as Record<string, unknown>
-  return typeof recipient.id === 'string'
-    && typeof recipient.email === 'string'
-    && typeof recipient.name === 'string'
-    && typeof recipient.updatedAt === 'string'
+  return 'id' in value
+    && 'email' in value
+    && 'name' in value
+    && 'updatedAt' in value
+    && typeof value.id === 'string' && value.id.trim().length > 0
+    && typeof value.email === 'string' && isValidEmailAddress(value.email)
+    && typeof value.name === 'string'
+    && typeof value.updatedAt === 'string' && !Number.isNaN(Date.parse(value.updatedAt))
 }
 
 export function loadSavedRecipients(): SavedRecipient[] {

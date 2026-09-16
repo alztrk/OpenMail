@@ -1,20 +1,12 @@
-import DOMPurify from 'dompurify'
 import { useEffect, useMemo, useRef } from 'react'
+
+import { sanitizeMailHtml } from '../../lib/mail-html'
 
 type MailHtmlProps = {
   html: string
   title: string
   fontScale: number
   onLinkClick: (href: string) => void
-}
-
-function sanitizeMailHtml(value: string): string {
-  return DOMPurify.sanitize(value, {
-    USE_PROFILES: { html: true },
-    ADD_TAGS: ['style'],
-    ADD_ATTR: ['align', 'bgcolor', 'border', 'cellpadding', 'cellspacing', 'height', 'rel', 'style', 'target', 'valign', 'width'],
-    FORBID_TAGS: ['base', 'embed', 'form', 'iframe', 'input', 'object', 'script', 'textarea'],
-  })
 }
 
 export function MailHtml({ html, title, fontScale, onLinkClick }: MailHtmlProps) {

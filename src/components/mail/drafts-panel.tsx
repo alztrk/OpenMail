@@ -34,12 +34,12 @@ export function DraftsPanel({ drafts, currentDraftId, canSave, isSaving, isLoadi
       <div className="compose-drafts-header"><strong>{title}</strong><Button type="button" size="default" variant="ghost" disabled={!canSave || isSaving || isLoading} onClick={onSave}>{isLoading ? loadingLabel : isSaving ? savingLabel : saveLabel}</Button></div>
       {drafts.length > 0 ? <ul className="compose-drafts-list">
         {drafts.map((draft) => <li className={draft.id === currentDraftId ? 'is-current' : undefined} key={draft.id}>
-          <button className="compose-draft-item" type="button" onClick={() => onSelect(draft)}>
+          <button className="compose-draft-item" type="button" disabled={isSaving || isLoading} onClick={() => onSelect(draft)}>
             <IconFileText aria-hidden="true" size={15} stroke={1.8} />
             <span><strong>{draft.subject || untitledLabel}</strong><small>{draft.recipient || noRecipientsLabel} · {formatTime(draft.updatedAt)}</small></span>
             <IconChevronRight aria-hidden="true" size={15} stroke={1.8} />
           </button>
-          <button className="compose-draft-delete" type="button" aria-label={`${deleteLabel}: ${draft.subject || untitledLabel}`} title={deleteLabel} onClick={() => onDelete(draft)}><IconTrash aria-hidden="true" size={14} stroke={1.8} /></button>
+          <button className="compose-draft-delete" type="button" disabled={isSaving || isLoading} aria-label={`${deleteLabel}: ${draft.subject || untitledLabel}`} title={deleteLabel} onClick={() => onDelete(draft)}><IconTrash aria-hidden="true" size={14} stroke={1.8} /></button>
         </li>)}
       </ul> : <p className="compose-drafts-empty">{emptyLabel}</p>}
     </div>
