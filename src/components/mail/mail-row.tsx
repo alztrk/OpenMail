@@ -60,7 +60,7 @@ export function MailRow({ message, selected, selectionChecked, unreadLabel, isSt
         <span className="message-row-topline">
           <span className="message-sender-cell">
             <span className="message-sender-group">
-              <SenderAvatar className="message-avatar" label={sender} imageUrl={message.avatar_url} loading="lazy" />
+              <SenderAvatar className="message-avatar" label={sender} address={message.address} imageUrl={message.avatar_url} loading="lazy" />
               <span className={`unread-dot ${message.unread ? '' : 'inactive'}`} aria-hidden="true" />
               <span className="message-sender" dir="auto">{sender}</span>
             </span>

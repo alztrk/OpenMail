@@ -2909,7 +2909,7 @@ function App() {
                   </Button>
                 </div>
                 <div className="reader-meta">
-                  <SenderAvatar className="reader-avatar" label={selectedMessageSender} imageUrl={selectedMessage.avatar_url} />
+                  <SenderAvatar className="reader-avatar" label={selectedMessageSender} address={selectedMessage.address} imageUrl={selectedMessage.avatar_url} />
                   <div>
                     <strong dir="auto">{selectedMessageSender}</strong>
                     <button className="reader-details-toggle" type="button" aria-expanded={isReaderDetailsOpen} aria-controls="reader-details" onClick={() => setIsReaderDetailsOpen((current) => !current)}>

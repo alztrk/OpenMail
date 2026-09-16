@@ -1144,17 +1144,43 @@ html[data-theme='dark'] .window-brand-logo-dark {
   height: 28px;
   overflow: hidden;
   border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  color: var(--text-secondary);
-  background: var(--surface-raised);
+  border-radius: 50%;
   font-size: 11px;
   font-weight: 700;
 }
 
-.message-avatar img {
+.sender-avatar {
+  color: var(--sender-avatar-color, var(--accent-strong));
+  border-color: color-mix(in srgb, var(--sender-avatar-color, var(--accent)) 28%, var(--border-subtle));
+  background: color-mix(in srgb, var(--sender-avatar-color, var(--accent)) 13%, var(--surface-raised));
+}
+
+.sender-avatar-tone-0 {
+  --sender-avatar-color: var(--accent-strong);
+}
+
+.sender-avatar-tone-1 {
+  --sender-avatar-color: var(--warning);
+}
+
+.sender-avatar-tone-2 {
+  --sender-avatar-color: var(--danger-strong);
+}
+
+.sender-avatar-tone-3 {
+  --sender-avatar-color: var(--text-secondary);
+}
+
+.sender-avatar img {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.sender-avatar-fallback {
+  display: block;
+  line-height: 1;
 }
 
 .unread-dot {
@@ -2086,17 +2112,9 @@ html[data-theme='dark'] .window-brand-logo-dark {
   height: 30px;
   overflow: hidden;
   border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  color: var(--text-secondary);
-  background: var(--surface-selected);
+  border-radius: 50%;
   font-size: var(--font-size-caption);
   font-weight: 700;
-}
-
-.thread-message-avatar img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
 }
 
 .thread-message-summary {
@@ -3005,14 +3023,7 @@ html[data-theme='dark'] .window-brand-logo-dark {
   height: 30px;
   overflow: hidden;
   border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--surface-selected);
-}
-
-.search-result-avatar img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
+  border-radius: 50%;
 }
 
 .search-result-content {

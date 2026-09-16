@@ -49,7 +49,7 @@ export function ThreadMessageCard({ sender, address, avatarUrl, time, body, body
   return (
     <article className="thread-message">
       <button className="thread-message-toggle" type="button" aria-expanded={isExpanded} aria-controls={bodyId} onClick={() => setIsExpanded((current) => !current)}>
-        <span className="thread-message-toggle-identity"><SenderAvatar className="thread-message-avatar" label={senderLabel} imageUrl={avatarUrl} loading="lazy" /><span className="thread-message-summary"><strong dir="auto">{senderLabel}</strong><span dir="ltr">{address}</span></span></span>
+        <span className="thread-message-toggle-identity"><SenderAvatar className="thread-message-avatar" label={senderLabel} address={address} imageUrl={avatarUrl} loading="lazy" /><span className="thread-message-summary"><strong dir="auto">{senderLabel}</strong><span dir="ltr">{address}</span></span></span>
         <span className="thread-message-meta"><time dateTime={dateTime}>{time}</time><IconChevronDown aria-hidden="true" size={15} stroke={1.8} /></span>
       </button>
       {isExpanded ? <div className="thread-message-body" id={bodyId}>
