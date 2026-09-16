@@ -1,3 +1,5 @@
+import { isSupportedLocale, type SupportedLocale } from './locale-config'
+
 export type ThemeMode = 'dark' | 'light' | 'system'
 export type Density = 'compact' | 'comfortable' | 'spacious'
 export type ClockFormat = '12' | '24'
@@ -14,7 +16,7 @@ export type AppSettings = {
   readerFontScale: number
   dateFormat: 'system' | 'short' | 'long'
   clockFormat: ClockFormat
-  language: 'en' | 'tr'
+  language: SupportedLocale
   notificationsEnabled: boolean
   notificationSound: boolean
   notificationSoundName: 'default' | 'soft' | 'none'
@@ -25,7 +27,7 @@ export type AppSettings = {
 
 export const defaultSettings: AppSettings = {
   launchAtStartup: false, minimizeToTray: true, closeToTray: false, confirmOnClose: true, confirmActions: true,
-  theme: 'dark', density: 'comfortable', fontScale: 1.05, readerFontScale: 1,
+  theme: 'light', density: 'comfortable', fontScale: 1.05, readerFontScale: 1,
   dateFormat: 'system', clockFormat: '24', language: 'en', notificationsEnabled: true, notificationSound: true,
   notificationSoundName: 'default', quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '07:00',
 }
@@ -42,6 +44,10 @@ function clampScale(value: unknown, minimum: number, maximum: number, fallback: 
     : fallback
 }
 
+function normalizeTime(value: unknown, fallback: string): string {
+  return typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value) ? value : fallback
+}
+
 function normalizeSettings(value: unknown): AppSettings {
   if (!isRecord(value)) return defaultSettings
   return {
@@ -56,13 +62,13 @@ function normalizeSettings(value: unknown): AppSettings {
     readerFontScale: clampScale(value.readerFontScale, 0.9, 1.3, defaultSettings.readerFontScale),
     dateFormat: value.dateFormat === 'system' || value.dateFormat === 'short' || value.dateFormat === 'long' ? value.dateFormat : defaultSettings.dateFormat,
     clockFormat: value.clockFormat === '12' || value.clockFormat === '24' ? value.clockFormat : defaultSettings.clockFormat,
-    language: value.language === 'en' || value.language === 'tr' ? value.language : defaultSettings.language,
+    language: typeof value.language === 'string' && isSupportedLocale(value.language) ? value.language : defaultSettings.language,
     notificationsEnabled: typeof value.notificationsEnabled === 'boolean' ? value.notificationsEnabled : defaultSettings.notificationsEnabled,
     notificationSound: typeof value.notificationSound === 'boolean' ? value.notificationSound : defaultSettings.notificationSound,
     notificationSoundName: value.notificationSoundName === 'default' || value.notificationSoundName === 'soft' || value.notificationSoundName === 'none' ? value.notificationSoundName : defaultSettings.notificationSoundName,
     quietHoursEnabled: typeof value.quietHoursEnabled === 'boolean' ? value.quietHoursEnabled : defaultSettings.quietHoursEnabled,
-    quietHoursStart: typeof value.quietHoursStart === 'string' ? value.quietHoursStart : defaultSettings.quietHoursStart,
-    quietHoursEnd: typeof value.quietHoursEnd === 'string' ? value.quietHoursEnd : defaultSettings.quietHoursEnd,
+    quietHoursStart: normalizeTime(value.quietHoursStart, defaultSettings.quietHoursStart),
+    quietHoursEnd: normalizeTime(value.quietHoursEnd, defaultSettings.quietHoursEnd),
   }
 }
 
