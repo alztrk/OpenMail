@@ -163,7 +163,7 @@ Options:
   --width <px>       Viewport width. Defaults to 2560.
   --height <px>      Viewport height. Defaults to 1440.
   --output <path>    Screenshot directory. Defaults to artifacts/screenshots.
-  --url <url>        Existing Vite URL when --no-server is used.
+  --url <url>        Existing Vite URL when --no-server is used. Defaults to the local preview URL.
   --headed           Show the browser while capturing.
   --browser-path <p> Use a specific Chromium-compatible browser executable.
   --no-server        Do not start pnpm dev; use the supplied URL.
@@ -212,6 +212,17 @@ function createTauriMockScript() {
       switch (command) {
         case 'list_accounts':
           return copy([account]);
+        case 'get_oauth_credential_status':
+          return {
+            gmail: { client_id: false, client_secret: false },
+            outlook: { client_id: false, client_secret: false },
+          };
+        case 'save_oauth_credentials':
+        case 'clear_oauth_credentials':
+          return {
+            gmail: { client_id: false, client_secret: false },
+            outlook: { client_id: false, client_secret: false },
+          };
         case 'get_provider_capabilities':
           return copy(capabilities);
         case 'get_cached_messages':
@@ -271,10 +282,21 @@ function createTauriMockScript() {
 function startViteServer(url) {
   const parsedUrl = new URL(url)
   const port = parsedUrl.port || '5173'
+  const buildCommand = process.platform === 'win32' ? 'cmd.exe' : 'pnpm'
+  const buildArgs = process.platform === 'win32' ? ['/d', '/s', '/c', 'pnpm build'] : ['build']
+  const buildResult = spawnSync(buildCommand, buildArgs, {
+    cwd: projectRoot,
+    stdio: 'inherit',
+    windowsHide: true,
+  })
+  if (buildResult.status !== 0) {
+    throw new Error('The frontend build failed before screenshot capture.')
+  }
+
   const command = process.platform === 'win32' ? 'cmd.exe' : 'pnpm'
   const args = process.platform === 'win32'
-    ? ['/d', '/s', '/c', `pnpm dev --host ${parsedUrl.hostname} --port ${port}`]
-    : ['dev', '--host', parsedUrl.hostname, '--port', port]
+    ? ['/d', '/s', '/c', `pnpm preview --host ${parsedUrl.hostname} --port ${port}`]
+    : ['preview', '--host', parsedUrl.hostname, '--port', port]
   const child = spawn(command, args, {
     cwd: projectRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -382,27 +404,29 @@ async function captureScreens(page, outputDirectory, url) {
   await page.locator('.settings-layout').waitFor({ state: 'visible', timeout: 10000 })
   await capture(page, outputDirectory, '05-settings-general', captures)
 
-  for (const [index, name] of [[1, '06-settings-appearance'], [2, '07-settings-language'], [3, '08-settings-notifications'], [4, '09-settings-accounts']]) {
+  for (const [index, name] of [[1, '06-settings-appearance'], [2, '07-settings-language'], [3, '08-settings-notifications'], [4, '09-settings-accounts'], [5, '10-settings-oauth']]) {
     await page.locator('.settings-tab').nth(index).click()
     await page.locator('.settings-layout').waitFor({ state: 'visible', timeout: 10000 })
     await capture(page, outputDirectory, name, captures)
   }
 
+  await page.locator('.settings-tab').nth(4).click()
+  await page.locator('.settings-layout').waitFor({ state: 'visible', timeout: 10000 })
   await page.locator('.account-add-button').click()
   await page.locator('.provider-action-cards').waitFor({ state: 'visible', timeout: 10000 })
-  await capture(page, outputDirectory, '10-settings-add-account', captures)
+  await capture(page, outputDirectory, '11-settings-add-account', captures)
 
   await openFresh(page, url)
   await page.getByRole('button', { name: 'Compose', exact: true }).first().click()
   await page.locator('.compose-page').waitFor({ state: 'visible', timeout: 10000 })
-  await capture(page, outputDirectory, '11-compose', captures)
+  await capture(page, outputDirectory, '12-compose', captures)
 
   await openFresh(page, url)
   const search = page.getByRole('combobox', { name: /Search mail/i })
   await search.fill('design')
   await page.locator('.search-results-dialog').waitFor({ state: 'visible', timeout: 10000 })
   await page.locator('[data-search-result-index]').first().waitFor({ state: 'visible', timeout: 10000 })
-  await capture(page, outputDirectory, '12-search-results', captures)
+  await capture(page, outputDirectory, '13-search-results', captures)
 
   return captures
 }
