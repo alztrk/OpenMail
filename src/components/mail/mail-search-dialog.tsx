@@ -123,7 +123,7 @@ export function MailSearchDialog({ results, isSearching, hasError, hasPartialErr
             <span className="search-result-topline">
               <span className="search-result-identity">
                 <strong dir="auto">{getResultSenderLabel(result)}</strong>
-                <span className="search-result-account" dir="ltr"><img src={providerLogos[result.account.provider]} alt="" aria-hidden="true" /><span>{result.account.address}</span></span>
+                <span className="search-result-account" dir="ltr"><img src={providerLogos[result.account.provider]} alt="" aria-hidden="true" /><span className="search-result-account-address">{result.account.address}</span></span>
               </span>
               <time dateTime={result.message.time}>{formatTime(result.message.time)}</time>
             </span>

@@ -1,11 +1,12 @@
 import { type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode, type RefObject, type UIEvent, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
-import { IconAlertTriangle, IconArchive, IconChevronDown, IconDownload, IconFileText, IconInbox, IconMail, IconMaximize, IconMinus, IconPaperclip, IconPencil, IconRefresh, IconSearch, IconSend, IconSettings, IconStar, IconTrash, IconX, IconRestore } from '@tabler/icons-react'
+import { IconAlertTriangle, IconArchive, IconChevronDown, IconChevronLeft, IconChevronRight, IconDownload, IconFileText, IconInbox, IconMail, IconMailPlus, IconMaximize, IconMinus, IconPaperclip, IconPencil, IconRefresh, IconSearch, IconSend, IconSettings, IconStar, IconTrash, IconX, IconRestore } from '@tabler/icons-react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import openMailWordmark from './assets/openmail-wordmark.svg'
+import openMailWordmarkDark from './assets/openmail-wordmark-dark.svg'
 import gmailLogo from './assets/providers/gmail.svg'
 import outlookLogo from './assets/providers/outlook.svg'
 import { Input } from '@/components/ui/input'
@@ -29,8 +30,11 @@ import { Toast } from '@/components/ui/toast'
 import { Dialog } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { areValidEmailAddresses, splitEmailAddresses } from '@/lib/utils'
-import { getSenderLabel } from '@/lib/mail'
-import { loadSettings, saveSettings, type AppSettings } from '@/settings'
+import { compareMessageTimes, getMessageIdentity, getMessageTimeValue, getSenderLabel } from '@/lib/mail'
+import { sanitizeComposeHtml } from '@/lib/compose-html'
+import { formatFileSize } from '@/lib/formatters'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { loadSettings, saveSettings, type AppSettings, type Density } from '@/settings'
 import './App.css'
 
 const SettingsPanel = lazy(() => import('@/components/settings/settings-panel').then(({ SettingsPanel: panel }) => ({ default: panel })))
@@ -67,9 +71,16 @@ type MessageAction = 'archive' | 'trash' | 'untrash' | 'spam' | 'not_spam' | 'de
 
 type MailFolder = 'inbox' | 'spam' | 'sent' | 'trash' | 'starred'
 type MailFilter = 'all' | 'unread' | 'starred' | 'attachments'
+type MailNavigationFolder = Exclude<MailFolder, 'starred'>
+type MailSort = 'newest' | 'oldest' | 'sender_asc' | 'sender_desc'
+
+const MAIL_NAVIGATION_FOLDERS: MailNavigationFolder[] = ['inbox', 'sent', 'spam', 'trash']
+
+const MAIL_SORT_OPTIONS: MailSort[] = ['newest', 'oldest', 'sender_asc', 'sender_desc']
 
 type MailMessage = {
   id: string
+  account_id?: string
   thread_id?: string | null
   message_id_header?: string | null
   sender: string
@@ -93,9 +104,11 @@ type MailAttachment = {
   size: number
 }
 
+const GMAIL_ATTACHMENT_LIMIT = 25 * 1024 * 1024
 const attachmentLimits = {
-  gmail: { maxFileSize: 25 * 1024 * 1024, maxTotalSize: 25 * 1024 * 1024 },
-  outlook: { maxFileSize: 3 * 1024 * 1024, maxTotalSize: 3 * 1024 * 1024 },
+  // Gmail's MIME request boundary is exclusive after encoding overhead.
+  gmail: { maxFileSize: GMAIL_ATTACHMENT_LIMIT - 1, maxTotalSize: GMAIL_ATTACHMENT_LIMIT - 1 },
+  outlook: { maxFileSize: 150 * 1024 * 1024, maxTotalSize: 150 * 1024 * 1024 },
 } as const
 
 type MessagePage = {
@@ -107,6 +120,7 @@ type MessagePage = {
 type SyncResult = {
   page: MessagePage
   new_message_count: number
+  removed_message_ids: string[]
 }
 
 type BulkMessageActionResult = {
@@ -151,15 +165,10 @@ function isTauriRuntime(): boolean {
   return '__TAURI_INTERNALS__' in window
 }
 
-function formatFileSize(size: number): string {
-  if (size < 1024) return `${size} B`
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`
-}
-
 function formatMessageTime(value: string, settings: AppSettings, locale: string): string {
-  const date = new Date(/^\d+$/.test(value) ? Number(value) : value)
-  if (Number.isNaN(date.getTime())) return value
+  const timeValue = getMessageTimeValue(value)
+  if (!Number.isFinite(timeValue)) return value
+  const date = new Date(timeValue)
   const dateStyle = settings.dateFormat === 'short' ? 'short' : settings.dateFormat === 'long' ? 'long' : undefined
   return new Intl.DateTimeFormat(locale, {
     dateStyle,
@@ -171,6 +180,7 @@ function formatMessageTime(value: string, settings: AppSettings, locale: string)
 function mergeMessageDetails(existing: MailMessage, incoming: MailMessage): MailMessage {
   return {
     ...incoming,
+    account_id: incoming.account_id ?? existing.account_id,
     body: incoming.body || existing.body,
     body_html: incoming.body_html ?? existing.body_html,
     avatar_url: incoming.avatar_url ?? existing.avatar_url,
@@ -179,12 +189,33 @@ function mergeMessageDetails(existing: MailMessage, incoming: MailMessage): Mail
   }
 }
 
+function withAccountId(accountId: string, messages: MailMessage[]): MailMessage[] {
+  return messages.map((message) => ({ ...message, account_id: accountId }))
+}
+
+function mergeUnifiedAccountMessages(existing: MailMessage[], accountId: string, incoming: MailMessage[]): MailMessage[] {
+  const otherAccounts = existing.filter((message) => message.account_id !== accountId)
+  const currentAccountMessages = mergeMessageLists(
+    existing.filter((message) => message.account_id === accountId),
+    withAccountId(accountId, incoming),
+  )
+  return [...otherAccounts, ...currentAccountMessages].sort((left, right) => compareMessageTimes(left.time, right.time))
+}
+
 function mergeMessageLists(existing: MailMessage[], incoming: MailMessage[]): MailMessage[] {
   const existingById = new Map(existing.map((message) => [message.id, message]))
-  return incoming.map((message) => {
+  const incomingIds = new Set(incoming.map((message) => message.id))
+  const mergedIncoming = incoming.map((message) => {
     const previousMessage = existingById.get(message.id)
     return previousMessage ? mergeMessageDetails(previousMessage, message) : message
   })
+  return [...mergedIncoming, ...existing.filter((message) => !incomingIds.has(message.id))]
+}
+
+function removeMessagesForAccount(messages: MailMessage[], accountId: string, removedMessageIds: string[]): MailMessage[] {
+  if (removedMessageIds.length === 0) return messages
+  const removedIds = new Set(removedMessageIds)
+  return messages.filter((message) => (message.account_id ?? accountId) !== accountId || !removedIds.has(message.id))
 }
 
 function appendUniqueMessages(existing: MailMessage[], incoming: MailMessage[]): MailMessage[] {
@@ -218,12 +249,7 @@ function mergeSearchResults(existing: MailSearchResult[], incoming: MailSearchRe
       message: { ...result[existingIndex].message, ...item.message },
     }
   })
-  return result.sort((left, right) => {
-    const leftTime = new Date(left.message.time).getTime()
-    const rightTime = new Date(right.message.time).getTime()
-    if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) return 0
-    return rightTime - leftTime
-  })
+  return result.sort((left, right) => compareMessageTimes(left.message.time, right.message.time))
 }
 
 const providerLogos = {
@@ -258,13 +284,32 @@ function WindowHeader({ onRequestClose, onWindowActionError, onHideToTray, minim
 
   useEffect(() => {
     if (!isTauriRuntime()) return undefined
+    const window = getCurrentWindow()
     let cancelled = false
-    void getCurrentWindow().isMaximized().then((maximized) => {
-      if (!cancelled) setIsMaximized(maximized)
+    const refreshMaximizedState = () => {
+      void window.isMaximized().then((maximized) => {
+        if (!cancelled) setIsMaximized(maximized)
+      }).catch(() => {
+        if (!cancelled) setIsMaximized(false)
+      })
+    }
+    refreshMaximizedState()
+    let removeResizeListener: (() => void) | undefined
+    void window.onResized(() => {
+      refreshMaximizedState()
+    }).then((removeListener) => {
+      if (cancelled) {
+        removeListener()
+        return
+      }
+      removeResizeListener = removeListener
     }).catch(() => {
-      if (!cancelled) setIsMaximized(false)
+      // The initial state remains usable when resize event registration is unavailable.
     })
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      removeResizeListener?.()
+    }
   }, [])
 
   const minimize = async () => {
@@ -286,9 +331,10 @@ function WindowHeader({ onRequestClose, onWindowActionError, onHideToTray, minim
 
   return (
     <header className="window-header">
-      <div className="window-drag-region" data-tauri-drag-region="true" onDoubleClick={() => { void toggleMaximize() }}>
+      <div className="window-drag-region" data-tauri-drag-region="true" onDoubleClick={() => { void toggleMaximize().catch(onWindowActionError) }}>
         <div className="window-brand">
-          <img className="window-brand-logo" src={openMailWordmark} alt={t('openMailLogoAlt')} />
+          <img className="window-brand-logo window-brand-logo-light" src={openMailWordmark} alt={t('openMailLogoAlt')} />
+          <img className="window-brand-logo window-brand-logo-dark" src={openMailWordmarkDark} alt="" aria-hidden="true" />
         </div>
         <div className="window-search-surface" data-search-surface data-tauri-drag-region="false" onDoubleClick={(event) => event.stopPropagation()}>
           <label className={`window-search ${searchDisabled ? 'disabled' : ''}`} data-compact-label={searchCompactLabel} data-has-value={searchQuery.length > 0 ? 'true' : 'false'}>
@@ -318,13 +364,15 @@ type AccountButtonProps = {
   account: MailAccount
   active: boolean
   syncStatus: AccountSyncStatus
+  unreadCount: number | undefined
+  expanded: boolean
   providerLogos: typeof providerLogos
   tabIndex: 0 | -1
   onSelect: () => void
   onKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void
 }
 
-function AccountButton({ account, active, syncStatus, providerLogos, tabIndex, onSelect, onKeyDown }: AccountButtonProps) {
+function AccountButton({ account, active, syncStatus, unreadCount, expanded, providerLogos, tabIndex, onSelect, onKeyDown }: AccountButtonProps) {
   const { t } = useTranslation()
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLSpanElement>(null)
@@ -363,27 +411,29 @@ function AccountButton({ account, active, syncStatus, providerLogos, tabIndex, o
   useEffect(() => {
     if (!popoverPosition) return undefined
     const handlePositionChange = () => updatePopoverPosition()
+    // The account rail is part of the fixed-height shell, so only viewport resizing can move it.
     window.addEventListener('resize', handlePositionChange)
-    window.addEventListener('scroll', handlePositionChange, true)
     return () => {
       window.removeEventListener('resize', handlePositionChange)
-      window.removeEventListener('scroll', handlePositionChange, true)
     }
   }, [popoverPosition, updatePopoverPosition])
 
   const syncLabel = syncStatus === 'syncing' ? 'accountSyncing' : syncStatus === 'error' ? 'accountSyncFailed' : 'accountSynced'
+  const unreadLabel = unreadCount && unreadCount > 0 ? `, ${t('accountUnreadCount', { count: unreadCount })}` : ''
   const accountLabel = active
-    ? `${t(account.provider)}, ${account.address}, ${t('activeAccount')}, ${t(syncLabel)}`
-    : `${t(account.provider)}, ${account.address}, ${t(syncLabel)}`
+    ? `${t(account.provider)}, ${account.address}, ${t('activeAccount')}, ${t(syncLabel)}${unreadLabel}`
+    : `${t(account.provider)}, ${account.address}, ${t(syncLabel)}${unreadLabel}`
 
   return <>
-    <button ref={buttonRef} className={`account-button ${active ? 'active' : ''}`} data-account-id={account.id} type="button" tabIndex={tabIndex} aria-label={accountLabel} title={accountLabel} aria-current={active ? 'page' : undefined} onClick={() => { hidePopover(); onSelect() }} onKeyDown={onKeyDown} onMouseEnter={updatePopoverPosition} onMouseLeave={hidePopover} onFocus={updatePopoverPosition} onBlur={hidePopover}>
+    <button ref={buttonRef} className={`account-button ${active ? 'active' : ''} ${expanded ? 'expanded' : ''}`} data-account-id={account.id} type="button" tabIndex={tabIndex} aria-label={accountLabel} title={expanded ? undefined : accountLabel} aria-current={active ? 'page' : undefined} onClick={() => { hidePopover(); onSelect() }} onKeyDown={onKeyDown} onMouseEnter={expanded ? undefined : updatePopoverPosition} onMouseLeave={hidePopover} onFocus={expanded ? undefined : updatePopoverPosition} onBlur={hidePopover}>
       <span className="account-avatar" aria-hidden="true">
         <img src={providerLogos[account.provider]} alt="" />
       </span>
+      {expanded ? <span className="account-button-copy"><strong>{t(account.provider)}</strong><span>{account.address}</span></span> : null}
+      {unreadCount && unreadCount > 0 ? <span className="account-unread-count" aria-hidden="true">{unreadCount > 9 ? '9+' : unreadCount}</span> : null}
       <span className={`account-sync-status ${syncStatus}`} aria-hidden="true" />
     </button>
-    {popoverPosition ? createPortal(
+    {!expanded && popoverPosition ? createPortal(
       <span ref={popoverRef} className="account-popover account-popover-portal" role="tooltip" aria-hidden="true" style={{ left: `${popoverPosition.left}px`, top: `${popoverPosition.top}px` }}>
         <strong>{t(account.provider)}</strong>
         <span>{account.address}</span>
@@ -444,6 +494,8 @@ function App() {
   const [isLoadingAccounts, setIsLoadingAccounts] = useState(() => isTauriRuntime())
   const [accountLoadError, setAccountLoadError] = useState(false)
   const [activeAccountId, setActiveAccountId] = useState('')
+  const [isUnifiedInbox, setIsUnifiedInbox] = useState(false)
+  const [isSidebarExpanded, setIsSidebarExpanded] = useState(false)
   const accountListRef = useRef<HTMLElement>(null)
   const settingsButtonRef = useRef<HTMLButtonElement>(null)
   const [messages, setMessages] = useState<MailMessage[]>([])
@@ -464,7 +516,9 @@ function App() {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false)
   const [messagesAccountId, setMessagesAccountId] = useState<string | null>(null)
   const [nextPageToken, setNextPageToken] = useState<string | null>(null)
+  const [unifiedNextPageTokens, setUnifiedNextPageTokens] = useState<Record<string, string | null>>({})
   const [isLoadingMore, setIsLoadingMore] = useState(false)
+  const loadMoreRequestIdRef = useRef(0)
   const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null)
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set())
   const [bulkActionInFlight, setBulkActionInFlight] = useState(false)
@@ -478,6 +532,7 @@ function App() {
   const [messageLoadErrorId, setMessageLoadErrorId] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [activeFilter, setActiveFilter] = useState<MailFilter>('all')
+  const [mailSort, setMailSort] = useState<MailSort>('newest')
   const [activeView, setActiveView] = useState<'mail' | 'settings'>('mail')
   const [openAddAccount, setOpenAddAccount] = useState(false)
   const [contextMenu, setContextMenu] = useState<{ messageId: string; x: number; y: number; returnFocusElement: HTMLButtonElement } | null>(null)
@@ -515,29 +570,59 @@ function App() {
   const [savedRecipients, setSavedRecipients] = useState<SavedRecipient[]>(loadSavedRecipients)
   const [isSendingMessage, setIsSendingMessage] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [isAccountMutationInFlight, setIsAccountMutationInFlight] = useState(false)
   const [messageActionInFlightId, setMessageActionInFlightId] = useState<string | null>(null)
-  const [providerCapabilities, setProviderCapabilities] = useState<ProviderCapabilities | null>(null)
-  const [providerCapabilitiesAccountId, setProviderCapabilitiesAccountId] = useState<string | null>(null)
+  const [providerCapabilitiesByAccount, setProviderCapabilitiesByAccount] = useState<Record<string, ProviderCapabilities>>({})
+  const settingsRef = useRef(settings)
+  const launchAtStartupRequestIdRef = useRef(0)
+  const accountMutationInFlightRef = useRef(false)
+  const accountsLoadRequestIdRef = useRef(0)
   const syncInFlightAccountsRef = useRef(new Set<string>())
+  const composeRevisionRef = useRef(0)
+  const draftListRequestIdRef = useRef(0)
+  const draftLoadRequestIdRef = useRef(0)
+  const draftSaveInFlightRef = useRef(false)
+  const pendingWindowCloseAfterComposeRef = useRef(false)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const suppressSearchFocusRef = useRef(false)
   const searchRequestIdRef = useRef(0)
+  const searchLoadRequestIdRef = useRef(0)
   const allowWindowCloseRef = useRef(false)
   const [isCloseConfirmationOpen, setIsCloseConfirmationOpen] = useState(false)
-  const activeProviderCapabilities = providerCapabilitiesAccountId === activeAccountId ? providerCapabilities : null
+  const [isComposeCloseConfirmationOpen, setIsComposeCloseConfirmationOpen] = useState(false)
+  const activeAccountIdRef = useRef(activeAccountId)
+  const activeFolderRef = useRef(activeFolder)
+  const isUnifiedInboxRef = useRef(isUnifiedInbox)
+  useEffect(() => {
+    activeAccountIdRef.current = activeAccountId
+    activeFolderRef.current = activeFolder
+    isUnifiedInboxRef.current = isUnifiedInbox
+  }, [activeAccountId, activeFolder, isUnifiedInbox])
+  const activeProviderCapabilities = providerCapabilitiesByAccount[activeAccountId] ?? null
   const composeOpenSequenceRef = useRef(0)
 
-  const updateComposeRecipient = (value: string) => { setComposeRecipient(value); setDraftStatus('idle') }
-  const updateComposeCc = (value: string) => { setComposeCc(value); setDraftStatus('idle') }
-  const updateComposeBcc = (value: string) => { setComposeBcc(value); setDraftStatus('idle') }
-  const updateComposeSubject = (value: string) => { setComposeSubject(value); setDraftStatus('idle') }
-  const updateComposeBody = (value: string) => { setComposeBody(value); setDraftStatus('idle') }
+  const hasUnsavedComposeContent = useCallback(() => {
+    if (!isComposing || draftStatus !== 'idle') return false
+    return [composeRecipient, composeCc, composeBcc, composeSubject, composeBody].some((value) => value.trim().length > 0) || composeAttachments.length > 0
+  }, [composeAttachments.length, composeBcc, composeBody, composeCc, composeRecipient, composeSubject, draftStatus, isComposing])
+
+  const markComposeDirty = () => {
+    composeRevisionRef.current += 1
+    if (!draftSaveInFlightRef.current) setDraftStatus('idle')
+  }
+  const updateComposeRecipient = (value: string) => { setComposeRecipient(value); markComposeDirty() }
+  const updateComposeCc = (value: string) => { setComposeCc(value); markComposeDirty() }
+  const updateComposeBcc = (value: string) => { setComposeBcc(value); markComposeDirty() }
+  const updateComposeSubject = (value: string) => { setComposeSubject(value); markComposeDirty() }
+  const updateComposeBody = (value: string) => { setComposeBody(value); markComposeDirty() }
+  const updateComposeBodyHtml = (value: string) => { setComposeBodyHtml(value); markComposeDirty() }
+  const updateComposeAttachments = (attachments: ComposeAttachment[]) => { setComposeAttachments(attachments); markComposeDirty() }
 
   const selectableMessages = useMemo(
     () => activeView === 'mail'
-      ? activeFolder !== 'inbox' ? folderMessages : messagesAccountId === activeAccountId ? messages : []
+      ? activeFolder !== 'inbox' ? folderMessages : (isUnifiedInbox || messagesAccountId === activeAccountId) ? messages : []
       : [],
-    [activeAccountId, activeFolder, activeView, folderMessages, messages, messagesAccountId],
+    [activeAccountId, activeFolder, activeView, folderMessages, isUnifiedInbox, messages, messagesAccountId],
   )
   const filteredMessages = useMemo(
     () => selectableMessages.filter((message) => {
@@ -548,6 +633,20 @@ function App() {
     }),
     [activeFilter, selectableMessages],
   )
+  const displayedMessages = useMemo(() => {
+    const sorted = [...filteredMessages]
+    if (mailSort === 'newest') return sorted.sort((left, right) => compareMessageTimes(left.time, right.time))
+    if (mailSort === 'oldest') return sorted.sort((left, right) => compareMessageTimes(right.time, left.time))
+    return sorted.sort((left, right) => {
+      const senderOrder = getSenderLabel(left.sender, left.address).localeCompare(getSenderLabel(right.sender, right.address), i18n.language, { sensitivity: 'base' })
+      return mailSort === 'sender_asc' ? senderOrder : -senderOrder
+    })
+  }, [filteredMessages, i18n.language, mailSort])
+  const selectedVisibleMessageCount = useMemo(
+    () => filteredMessages.filter((message) => selectedMessageIds.has(getMessageIdentity(message, activeAccountId))).length,
+    [activeAccountId, filteredMessages, selectedMessageIds],
+  )
+  const allVisibleMessagesSelected = filteredMessages.length > 0 && filteredMessages.every((message) => selectedMessageIds.has(getMessageIdentity(message, activeAccountId)))
   const selectableMessagesRef = useRef<MailMessage[]>([])
 
   const clearReaderSelection = useCallback(() => {
@@ -561,6 +660,10 @@ function App() {
   }, [setIsReaderDetailsOpen, setIsReaderScrolled, setIsReplying, setLoadingMessageId, setMessageLoadErrorId, setReplyDraft, setSelectedMessageId])
 
   const clearBulkSelection = useCallback(() => setSelectedMessageIds(new Set()), [])
+  const invalidateLoadMore = () => {
+    loadMoreRequestIdRef.current += 1
+    setIsLoadingMore(false)
+  }
   const toggleMessageSelection = useCallback((messageId: string) => {
     setSelectedMessageIds((current) => {
       const next = new Set(current)
@@ -570,12 +673,12 @@ function App() {
     })
   }, [])
   const toggleAllMessageSelection = useCallback(() => {
-    const filteredMessageIds = filteredMessages.map((message) => message.id)
+    const filteredMessageIds = filteredMessages.map((message) => getMessageIdentity(message, activeAccountId))
     setSelectedMessageIds((current) => {
       const allVisibleMessagesSelected = filteredMessageIds.length > 0 && filteredMessageIds.every((messageId) => current.has(messageId))
       return allVisibleMessagesSelected ? new Set() : new Set(filteredMessageIds)
     })
-  }, [filteredMessages])
+  }, [activeAccountId, filteredMessages])
 
   const dismissSearch = useCallback((restoreFocus = false) => {
     setIsSearchOpen(false)
@@ -591,9 +694,11 @@ function App() {
 
   const clearSearch = useCallback(() => {
     searchRequestIdRef.current += 1
+    searchLoadRequestIdRef.current += 1
     setSearchQuery('')
     setSearchResults([])
     setSearchPageTokens({})
+    setIsLoadingMoreSearch(false)
     setIsSearchOpen(false)
     setIsSearchingMail(false)
     setSearchError(false)
@@ -607,19 +712,25 @@ function App() {
 
   const loadAccounts = useCallback(() => {
     if (!isTauriRuntime()) return
+    const requestId = ++accountsLoadRequestIdRef.current
     void invoke<MailAccount[]>('list_accounts').then((loadedAccounts) => {
+      if (requestId !== accountsLoadRequestIdRef.current) return
       setAccounts(loadedAccounts)
       setIsLoadingAccounts(false)
       setAccountLoadError(false)
       const defaultAccount = loadedAccounts.find((account) => account.is_default) ?? loadedAccounts[0]
       if (!defaultAccount) {
+        setProviderCapabilitiesByAccount({})
+        setAccountSyncStatus({})
         clearBulkSelection()
+        setIsUnifiedInbox(false)
         setActiveAccountId('')
         setDefaultAccountId('')
         setIsLoadingMessages(false)
         setMessages([])
         setMessagesAccountId(null)
         setNextPageToken(null)
+        setUnifiedNextPageTokens({})
         setFolderMessages([])
         setFolderNextPageToken(null)
         setIsLoadingFolder(false)
@@ -635,15 +746,20 @@ function App() {
       setActiveAccountId(defaultAccount.id)
       setDefaultAccountId(defaultAccount.id)
     }).catch(() => {
+      if (requestId !== accountsLoadRequestIdRef.current) return
       setAccounts([])
+      setProviderCapabilitiesByAccount({})
+      setAccountSyncStatus({})
       setIsLoadingAccounts(false)
       setAccountLoadError(true)
+      setIsUnifiedInbox(false)
       setIsLoadingMessages(false)
       setActiveAccountId('')
       setDefaultAccountId('')
       setMessages([])
       setMessagesAccountId(null)
       setNextPageToken(null)
+      setUnifiedNextPageTokens({})
       setFolderMessages([])
       setFolderNextPageToken(null)
       setIsLoadingFolder(false)
@@ -667,24 +783,21 @@ function App() {
   }
 
   useEffect(() => {
-    if (!isTauriRuntime() || !activeAccountId) return
+    if (!isTauriRuntime() || accounts.length === 0) return
     let cancelled = false
-    void invoke<ProviderCapabilities>('get_provider_capabilities', { accountId: activeAccountId })
-      .then((capabilities) => {
-        if (!cancelled) {
-          setProviderCapabilitiesAccountId(activeAccountId)
-          setProviderCapabilities(capabilities)
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setProviderCapabilitiesAccountId(null)
-          setProviderCapabilities(null)
-          setToastMessage(getDisplayError(error))
-        }
+    void Promise.allSettled(accounts.map((account) => invoke<ProviderCapabilities>('get_provider_capabilities', { accountId: account.id })))
+      .then((results) => {
+        if (cancelled) return
+        const nextCapabilities: Record<string, ProviderCapabilities> = {}
+        results.forEach((result, index) => {
+          if (result.status === 'fulfilled') nextCapabilities[accounts[index].id] = result.value
+        })
+        setProviderCapabilitiesByAccount(nextCapabilities)
+        const activeFailure = results.find((result, index) => result.status === 'rejected' && accounts[index].id === activeAccountId)
+        if (activeFailure?.status === 'rejected') setToastMessage(getDisplayError(activeFailure.reason))
       })
     return () => { cancelled = true }
-  }, [activeAccountId, getDisplayError])
+  }, [accounts, activeAccountId, getDisplayError])
 
   useEffect(() => {
     if (!isTauriRuntime()) return
@@ -693,6 +806,70 @@ function App() {
     }
     let cancelled = false
     let networkSyncCompleted = false
+
+    if (isUnifiedInbox) {
+      void Promise.allSettled(accounts.map((account) => invoke<MessagePage | null>('get_cached_messages', { accountId: account.id })))
+        .then((results) => {
+          if (cancelled || networkSyncCompleted) return
+          setUnifiedNextPageTokens(Object.fromEntries(accounts.map((account, index) => {
+            const result = results[index]
+            return [account.id, result?.status === 'fulfilled' ? result.value?.next_page_token ?? null : null]
+          })))
+          const cachedMessages = results.flatMap((result, index) => result.status === 'fulfilled' && result.value
+            ? withAccountId(accounts[index].id, result.value.messages)
+            : [])
+          const hasCachedPage = results.some((result) => result.status === 'fulfilled' && result.value !== null)
+          if (cachedMessages.length > 0) setMessages(cachedMessages.sort((left, right) => compareMessageTimes(left.time, right.time)))
+          if (hasCachedPage) {
+            setMessagesAccountId(null)
+            setIsLoadingMessages(false)
+            setMailboxLoadError(false)
+          }
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) setToastMessage(getDisplayError(error))
+        })
+
+      const accountsToSync = accounts.filter((account) => !syncInFlightAccountsRef.current.has(account.id))
+      if (accountsToSync.length === 0) return () => { cancelled = true }
+      accountsToSync.forEach((account) => syncInFlightAccountsRef.current.add(account.id))
+      setAccountSyncStatus((current) => accountsToSync.reduce((next, account) => ({ ...next, [account.id]: 'syncing' as const }), current))
+      void Promise.allSettled(accountsToSync.map((account) => invoke<SyncResult>('sync_messages', { accountId: account.id })))
+        .then((results) => {
+          if (cancelled) return
+          let successCount = 0
+          results.forEach((result, index) => {
+            const accountId = accountsToSync[index].id
+            if (result.status === 'rejected') {
+              setAccountSyncStatus((current) => ({ ...current, [accountId]: 'error' }))
+              return
+            }
+            successCount += 1
+            setAccountSyncStatus((current) => ({ ...current, [accountId]: 'idle' }))
+            setUnifiedNextPageTokens((current) => ({ ...current, [accountId]: result.value.page.next_page_token }))
+            setMessages((current) => mergeUnifiedAccountMessages(
+              removeMessagesForAccount(current, accountId, result.value.removed_message_ids),
+              accountId,
+              result.value.page.messages,
+            ))
+          })
+          networkSyncCompleted = successCount > 0
+          if (successCount > 0) {
+            setMailboxLoadError(false)
+            setIsLoadingMessages(false)
+          } else {
+            setMailboxLoadError(true)
+            const firstFailure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+            if (firstFailure) setToastMessage(getDisplayError(firstFailure.reason))
+          }
+        })
+        .finally(() => {
+          accountsToSync.forEach((account) => syncInFlightAccountsRef.current.delete(account.id))
+          if (!cancelled && networkSyncCompleted) setIsLoadingMessages(false)
+        })
+      return () => { cancelled = true }
+    }
+
     void invoke<MessagePage | null>('get_cached_messages', { accountId: activeAccountId })
       .then((cachedPage) => {
         if (cancelled || networkSyncCompleted || !cachedPage) return
@@ -713,12 +890,15 @@ function App() {
     if (!shouldStartSync) return () => { cancelled = true }
     syncInFlightAccountsRef.current.add(requestedAccountId)
     void invoke<SyncResult>('sync_messages', { accountId: requestedAccountId })
-      .then(({ page }) => {
+      .then((result) => {
         if (cancelled) return
         networkSyncCompleted = true
         setAccountSyncStatus((current) => ({ ...current, [requestedAccountId]: 'idle' }))
-        setMessages((current) => mergeMessageLists(current, page.messages))
-        setNextPageToken(page.next_page_token)
+        setMessages((current) => mergeMessageLists(
+          removeMessagesForAccount(current, requestedAccountId, result.removed_message_ids),
+          withAccountId(requestedAccountId, result.page.messages),
+        ))
+        setNextPageToken(result.page.next_page_token)
         setMessagesAccountId(requestedAccountId)
         setMailboxLoadError(false)
       })
@@ -734,7 +914,7 @@ function App() {
         if (!cancelled) setIsLoadingMessages(false)
       })
     return () => { cancelled = true }
-  }, [activeAccountId, activeView, getDisplayError])
+  }, [accounts, activeAccountId, activeView, getDisplayError, isUnifiedInbox])
 
   useEffect(() => {
     if (accounts.length === 0) return
@@ -755,10 +935,23 @@ function App() {
               setToastMessage(getDisplayError(result.reason))
               return
             }
-            setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'idle' }))
+              setAccountSyncStatus((current) => ({ ...current, [accountsToSync[index].id]: 'idle' }))
             if (result.value.new_message_count > 0) notificationTargets.push({ accountId: accountsToSync[index].id, count: result.value.new_message_count })
-            if (!cancelled && accountsToSync[index].id === activeAccountId) {
-              setMessages((current) => mergeMessageLists(current, result.value.page.messages))
+            if (!cancelled && isUnifiedInbox && activeFolder === 'inbox') {
+              setUnifiedNextPageTokens((current) => ({ ...current, [accountsToSync[index].id]: result.value.page.next_page_token }))
+              setMessages((current) => mergeUnifiedAccountMessages(
+                removeMessagesForAccount(current, accountsToSync[index].id, result.value.removed_message_ids),
+                accountsToSync[index].id,
+                result.value.page.messages,
+              ))
+              setMessagesAccountId(null)
+              setIsLoadingMessages(false)
+              setMailboxLoadError(false)
+            } else if (!cancelled && accountsToSync[index].id === activeAccountId) {
+              setMessages((current) => mergeMessageLists(
+                removeMessagesForAccount(current, accountsToSync[index].id, result.value.removed_message_ids),
+                withAccountId(accountsToSync[index].id, result.value.page.messages),
+              ))
               setNextPageToken(result.value.page.next_page_token)
               setMessagesAccountId(activeAccountId)
               setIsLoadingMessages(false)
@@ -827,7 +1020,7 @@ function App() {
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       removeTauriFocusListener?.()
     }
-  }, [accounts, activeAccountId, activeView, getDisplayError, settings, t])
+  }, [accounts, activeAccountId, activeFolder, activeView, getDisplayError, isUnifiedInbox, settings, t])
 
   useEffect(() => {
     const query = searchQuery.trim()
@@ -835,41 +1028,52 @@ function App() {
     searchRequestIdRef.current = requestId
     if (!isTauriRuntime() || accounts.length === 0 || query.length < 2) return
     let cancelled = false
-    const search = async () => {
-      // Start local and network lookups together so a slow cache read cannot delay remote results.
+    const search = () => {
+      // Start local and network lookups together and publish each result as soon as it arrives.
       const cachedResponsesPromise = Promise.allSettled(accounts.map((account) => invoke<MessagePage>('search_cached_messages', { accountId: account.id, query })))
       const remoteResponsesPromise = Promise.allSettled(accounts.map((account) => invoke<MessagePage>('search_messages', { accountId: account.id, query })))
-      const cachedResponses = await cachedResponsesPromise
-      if (cancelled || requestId !== searchRequestIdRef.current) return
-      const cachedResults = cachedResponses.flatMap((response, index) => response.status === 'fulfilled' && response.value
-        ? response.value.messages.map((message) => ({ account: accounts[index], message }))
-        : [])
-      setSearchPageTokens(Object.fromEntries(accounts.map((account) => [account.id, null])))
-      if (cachedResults.length > 0) setSearchResults(mergeSearchResults([], cachedResults))
+      let cachedResults: MailSearchResult[] = []
+      let remoteResults: MailSearchResult[] = []
+      let remoteCompleted = false
+      let successfulAccountCount = 0
+      let failedAccountCount = 0
+      const publishResults = () => {
+        if (cancelled || requestId !== searchRequestIdRef.current) return
+        setSearchResults(mergeSearchResults(cachedResults, remoteResults))
+        if (!remoteCompleted) return
+        setIsSearchingMail(false)
+        setSearchError(successfulAccountCount === 0 && cachedResults.length === 0)
+        setSearchPartialError(failedAccountCount > 0 && (successfulAccountCount > 0 || cachedResults.length > 0))
+      }
 
-      const remoteResponses = await remoteResponsesPromise
-      if (cancelled || requestId !== searchRequestIdRef.current) return
-      const remoteResults = remoteResponses.flatMap((response, index) => response.status === 'fulfilled'
-        ? response.value.messages.map((message) => ({ account: accounts[index], message }))
-        : [])
-      const successfulAccountCount = remoteResponses.filter((response) => response.status === 'fulfilled').length
-      const failedAccountCount = accounts.length - successfulAccountCount
-      const combinedResults = mergeSearchResults(cachedResults, remoteResults)
-      setSearchResults(combinedResults)
-      setSearchPageTokens((current) => {
-        const next = { ...current }
-        remoteResponses.forEach((response, index) => {
-          if (response.status === 'fulfilled') next[accounts[index].id] = response.value.next_page_token
-        })
-        return next
+      void cachedResponsesPromise.then((responses) => {
+        if (cancelled || requestId !== searchRequestIdRef.current) return
+        cachedResults = responses.flatMap((response, index) => response.status === 'fulfilled' && response.value
+          ? response.value.messages.map((message) => ({ account: accounts[index], message }))
+          : [])
+        publishResults()
       })
-      setIsSearchingMail(false)
-      setSearchError(successfulAccountCount === 0 && cachedResults.length === 0)
-      setSearchPartialError(failedAccountCount > 0 && successfulAccountCount > 0)
-      remoteResponses.forEach((response, index) => {
-        if (response.status !== 'fulfilled') return
-        void invoke('cache_search_messages', { accountId: accounts[index].id, query, page: response.value, append: false }).catch((error: unknown) => {
-          if (!cancelled && requestId === searchRequestIdRef.current) setToastMessage(getDisplayError(error))
+      void remoteResponsesPromise.then((responses) => {
+        if (cancelled || requestId !== searchRequestIdRef.current) return
+        remoteResults = responses.flatMap((response, index) => response.status === 'fulfilled'
+          ? response.value.messages.map((message) => ({ account: accounts[index], message }))
+          : [])
+        successfulAccountCount = responses.filter((response) => response.status === 'fulfilled').length
+        failedAccountCount = accounts.length - successfulAccountCount
+        remoteCompleted = true
+        setSearchPageTokens((current) => {
+          const next = { ...current }
+          responses.forEach((response, index) => {
+            if (response.status === 'fulfilled') next[accounts[index].id] = response.value.next_page_token
+          })
+          return next
+        })
+        publishResults()
+        responses.forEach((response, index) => {
+          if (response.status !== 'fulfilled') return
+          void invoke('cache_search_messages', { accountId: accounts[index].id, query, page: response.value, append: false }).catch((error: unknown) => {
+            if (!cancelled && requestId === searchRequestIdRef.current) setToastMessage(getDisplayError(error))
+          })
         })
       })
     }
@@ -881,6 +1085,7 @@ function App() {
       setSearchPartialError(false)
       setSearchResults([])
       setSearchActiveIndex(0)
+      setSearchPageTokens(Object.fromEntries(accounts.map((account) => [account.id, null])))
       void search()
     }, 180)
     return () => {
@@ -935,10 +1140,44 @@ function App() {
   }, [activeAccountId, activeFolder, activeView, getDisplayError])
 
   const loadNextPage = useCallback(() => {
+    if (isUnifiedInbox) {
+      if (activeView !== 'mail' || activeFolder !== 'inbox' || isLoadingMore) return
+      const pagesToLoad = Object.entries(unifiedNextPageTokens).filter((entry): entry is [string, string] => Boolean(entry[1]))
+      if (pagesToLoad.length === 0) return
+      const requestId = ++loadMoreRequestIdRef.current
+      setIsLoadingMore(true)
+      void Promise.allSettled(pagesToLoad.map(([accountId, pageToken]) => invoke<MessagePage>('list_messages', { accountId, pageToken })))
+        .then((results) => {
+          if (requestId !== loadMoreRequestIdRef.current || !isUnifiedInbox || activeFolder !== 'inbox' || activeView !== 'mail') return
+          let successfulCount = 0
+          let firstFailure: unknown = null
+          results.forEach((result, index) => {
+            const accountId = pagesToLoad[index][0]
+            if (result.status === 'rejected') {
+              firstFailure ??= result.reason
+              return
+            }
+            successfulCount += 1
+            setUnifiedNextPageTokens((current) => ({ ...current, [accountId]: result.value.next_page_token }))
+            setMessages((current) => mergeUnifiedAccountMessages(current, accountId, result.value.messages))
+          })
+          if (firstFailure) {
+            setMailboxLoadError(successfulCount === 0)
+            setToastMessage(getDisplayError(firstFailure))
+          } else {
+            setMailboxLoadError(false)
+          }
+        })
+        .finally(() => {
+          if (requestId === loadMoreRequestIdRef.current) setIsLoadingMore(false)
+        })
+      return
+    }
     const pageToken = activeView === 'mail'
       ? activeFolder === 'inbox' && messagesAccountId === activeAccountId ? nextPageToken : activeFolder !== 'inbox' ? folderNextPageToken : null
       : null
     if (!activeAccountId || !pageToken || isLoadingMore) return
+    const requestId = ++loadMoreRequestIdRef.current
     const requestedAccountId = activeAccountId
     const requestedFolder = activeFolder
     setIsLoadingMore(true)
@@ -947,48 +1186,51 @@ function App() {
       : invoke<MessagePage>('list_folder_messages', { accountId: activeAccountId, folder: activeFolder, pageToken })
     void loadPage
       .then((page) => {
-        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
+        if (requestId !== loadMoreRequestIdRef.current || requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
         setMailboxLoadError(false)
         if (activeFolder === 'inbox') {
-          setMessages((current) => [...current, ...page.messages.filter((message) => !current.some((item) => item.id === message.id))])
+          setMessages((current) => appendUniqueMessages(current, page.messages))
           setNextPageToken(page.next_page_token)
         } else {
-          setFolderMessages((current) => [...current, ...page.messages.filter((message) => !current.some((item) => item.id === message.id))])
+          setFolderMessages((current) => appendUniqueMessages(current, page.messages))
           setFolderNextPageToken(page.next_page_token)
           void invoke('cache_folder_messages', { accountId: activeAccountId, folder: activeFolder, page, append: true }).catch((error: unknown) => setToastMessage(getDisplayError(error)))
         }
       })
       .catch((error: unknown) => {
-        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
-        if (requestedFolder === 'inbox') setNextPageToken(null)
-        else setFolderNextPageToken(null)
+        if (requestId !== loadMoreRequestIdRef.current || requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
         setMailboxLoadError(true)
         setToastMessage(getDisplayError(error))
       })
       .finally(() => {
-        if (requestedAccountId === activeAccountId && requestedFolder === activeFolder) setIsLoadingMore(false)
+        if (requestId === loadMoreRequestIdRef.current) setIsLoadingMore(false)
       })
-  }, [activeAccountId, activeFolder, activeView, folderNextPageToken, getDisplayError, isLoadingMore, messagesAccountId, nextPageToken, setFolderMessages, setFolderNextPageToken, setToastMessage])
+  }, [activeAccountId, activeFolder, activeView, folderNextPageToken, getDisplayError, isLoadingMore, isUnifiedInbox, messagesAccountId, nextPageToken, setFolderMessages, setFolderNextPageToken, setToastMessage, unifiedNextPageTokens])
 
   useEffect(() => {
     if (!selectedMessageId || !activeAccountId || activeView !== 'mail') return
     let cancelled = false
-    const cachedMessage = selectableMessagesRef.current.find((message) => message.id === selectedMessageId)
+    const cachedMessage = selectableMessagesRef.current.find((message) => getMessageIdentity(message, activeAccountId) === selectedMessageId)
+    if (!cachedMessage) return
+    const messageAccountId = cachedMessage?.account_id ?? activeAccountId
+    const messageId = cachedMessage.id
     const threadId = cachedMessage?.thread_id
     const hasCachedBody = Boolean(cachedMessage && (cachedMessage.body_html || (cachedMessage.body && cachedMessage.body !== cachedMessage.preview)))
     if (threadId) {
-      if (loadedThreadIdRef.current === threadId) return
-      loadedThreadIdRef.current = threadId
+      const threadKey = `${messageAccountId}:${threadId}`
+      if (loadedThreadIdRef.current === threadKey) return
+      loadedThreadIdRef.current = threadKey
       let canRenderCachedThread = hasCachedBody
       const applyThreadMessages = (loadedMessages: MailMessage[]) => {
-        setThreadMessages(loadedMessages)
-        setMessages((current) => appendUniqueMessages(current, loadedMessages))
-        setFolderMessages((current) => appendUniqueMessages(current, loadedMessages))
+        const messagesWithAccount = withAccountId(messageAccountId, loadedMessages)
+        setThreadMessages(messagesWithAccount)
+        setMessages((current) => appendUniqueMessages(current, messagesWithAccount))
+        setFolderMessages((current) => appendUniqueMessages(current, messagesWithAccount))
       }
-      void invoke<MailMessage[] | null>('get_cached_thread', { accountId: activeAccountId, threadId })
+      void invoke<MailMessage[] | null>('get_cached_thread', { accountId: messageAccountId, threadId })
         .then((cachedMessages) => {
           if (cancelled || !cachedMessages?.length) return
-          const cachedSelectedMessage = cachedMessages.find((message) => message.id === selectedMessageId)
+          const cachedSelectedMessage = cachedMessages.find((message) => getMessageIdentity(message, messageAccountId) === selectedMessageId)
           canRenderCachedThread = Boolean(cachedSelectedMessage && (cachedSelectedMessage.body_html || (cachedSelectedMessage.body && cachedSelectedMessage.body !== cachedSelectedMessage.preview)))
           applyThreadMessages(cachedMessages)
           if (canRenderCachedThread) {
@@ -999,7 +1241,7 @@ function App() {
         .catch((error: unknown) => {
           if (!cancelled) setToastMessage(getDisplayError(error))
         })
-      void invoke<MailMessage[]>('get_thread', { accountId: activeAccountId, threadId })
+      void invoke<MailMessage[]>('get_thread', { accountId: messageAccountId, threadId })
         .then((loadedMessages) => {
           if (loadedMessages.length === 0) throw new Error('EMPTY_CONVERSATION')
           if (cancelled) return
@@ -1021,13 +1263,14 @@ function App() {
     }
     if (hasCachedBody) return
     if (loadingMessageId !== selectedMessageId) return
-    void invoke<MailMessage>('get_message', { accountId: activeAccountId, messageId: selectedMessageId })
+    void invoke<MailMessage>('get_message', { accountId: messageAccountId, messageId })
       .then((loadedMessage) => {
         if (cancelled) return
-          setMessages((current) => current.map((message) => message.id === loadedMessage.id ? loadedMessage : message))
-          setFolderMessages((current) => current.map((message) => message.id === loadedMessage.id ? loadedMessage : message))
-          setMessageLoadErrorId((current) => current === selectedMessageId ? null : current)
-          setLoadingMessageId((current) => current === selectedMessageId ? null : current)
+        const loadedMessageWithAccount = { ...loadedMessage, account_id: messageAccountId }
+        setMessages((current) => current.map((message) => getMessageIdentity(message, activeAccountId) === selectedMessageId ? loadedMessageWithAccount : message))
+        setFolderMessages((current) => current.map((message) => getMessageIdentity(message, activeAccountId) === selectedMessageId ? loadedMessageWithAccount : message))
+        setMessageLoadErrorId((current) => current === selectedMessageId ? null : current)
+        setLoadingMessageId((current) => current === selectedMessageId ? null : current)
       })
       .catch((error: unknown) => {
         if (cancelled) return
@@ -1055,17 +1298,24 @@ function App() {
     if (!isTauriRuntime()) return
     const window = getCurrentWindow()
     const unlisten = window.onCloseRequested((event) => {
+      if (allowWindowCloseRef.current) return
+      if (hasUnsavedComposeContent()) {
+        event.preventDefault()
+        pendingWindowCloseAfterComposeRef.current = true
+        setIsComposeCloseConfirmationOpen(true)
+        return
+      }
       if (settings.closeToTray) {
         event.preventDefault()
         void hideToTray().catch(handleWindowActionError)
         return
       }
-      if (allowWindowCloseRef.current || !settings.confirmOnClose) return
+      if (!settings.confirmOnClose) return
       event.preventDefault()
       setIsCloseConfirmationOpen(true)
     })
     return () => { void unlisten.then((removeListener) => removeListener()) }
-  }, [handleWindowActionError, hideToTray, settings.closeToTray, settings.confirmOnClose])
+  }, [handleWindowActionError, hasUnsavedComposeContent, hideToTray, settings.closeToTray, settings.confirmOnClose])
 
   useEffect(() => {
     if (!toastMessage) return
@@ -1074,17 +1324,48 @@ function App() {
   }, [toastMessage])
 
   const activeAccount = accounts.find((account) => account.id === activeAccountId) ?? accounts[0]
-  const activeAttachmentLimits = activeAccount?.provider === 'outlook' ? attachmentLimits.outlook : attachmentLimits.gmail
+  const composeAccount = accounts.find((account) => account.id === composeAccountId) ?? activeAccount
+  const composeAttachmentLimits = composeAccount?.provider === 'outlook' ? attachmentLimits.outlook : attachmentLimits.gmail
   const visibleMessages = selectableMessages
+  const folderUnreadCounts = useMemo<Partial<Record<MailNavigationFolder, number>>>(() => {
+    const counts: Partial<Record<MailNavigationFolder, number>> = {}
+    const loadedMessages = activeFolder === 'inbox'
+      ? selectableMessages
+      : activeFolder !== 'starred'
+        ? folderMessages
+        : []
+    if (activeFolder === 'inbox') counts.inbox = loadedMessages.filter((message) => message.unread).length
+    if (activeFolder !== 'inbox' && activeFolder !== 'starred') counts[activeFolder] = loadedMessages.filter((message) => message.unread).length
+    return counts
+  }, [activeFolder, folderMessages, selectableMessages])
+  const accountUnreadCounts = useMemo<Record<string, number>>(() => {
+    const counts: Record<string, number> = {}
+    messages.forEach((message) => {
+      if (!message.unread) return
+      const accountId = message.account_id ?? activeAccountId
+      if (!accountId) return
+      counts[accountId] = (counts[accountId] ?? 0) + 1
+    })
+    return counts
+  }, [activeAccountId, messages])
+  const activeSyncStatus: AccountSyncStatus = isUnifiedInbox && activeFolder === 'inbox'
+    ? accounts.some((account) => accountSyncStatus[account.id] === 'syncing')
+      ? 'syncing'
+      : accounts.some((account) => accountSyncStatus[account.id] === 'error') ? 'error' : 'idle'
+    : accountSyncStatus[activeAccountId] ?? 'idle'
   const visibleNextPageToken = activeView === 'mail'
-    ? activeFolder === 'inbox' && messagesAccountId === activeAccountId ? nextPageToken : activeFolder !== 'inbox' ? folderNextPageToken : null
+    ? !isUnifiedInbox && activeFolder === 'inbox' && messagesAccountId === activeAccountId ? nextPageToken : !isUnifiedInbox && activeFolder !== 'inbox' ? folderNextPageToken : null
     : null
-  useEffect(() => {
-    if (!isTauriRuntime() || activeView !== 'mail' || !visibleNextPageToken || isLoadingMore) return
-    const timeoutId = window.setTimeout(() => loadNextPage(), 80)
-    return () => window.clearTimeout(timeoutId)
-  }, [activeView, isLoadingMore, loadNextPage, visibleNextPageToken])
-  const selectedMessage = visibleMessages.find((message) => message.id === selectedMessageId) ?? null
+  const hasUnifiedNextPage = isUnifiedInbox && activeFolder === 'inbox' && Object.values(unifiedNextPageTokens).some(Boolean)
+  const selectedMessage = visibleMessages.find((message) => getMessageIdentity(message, activeAccountId) === selectedMessageId) ?? null
+  const selectedMessageAccount = selectedMessage?.account_id
+    ? accounts.find((account) => account.id === selectedMessage.account_id) ?? activeAccount
+    : activeAccount
+  const selectedMessageCapabilities = providerCapabilitiesByAccount[selectedMessageAccount?.id ?? activeAccountId] ?? null
+  const selectedMessageKey = selectedMessage ? getMessageIdentity(selectedMessage, activeAccountId) : null
+  const contextMessage = contextMenu
+    ? selectableMessages.find((message) => getMessageIdentity(message, activeAccountId) === contextMenu.messageId) ?? null
+    : null
   const selectedMessageSubject = selectedMessage?.subject || t('noSubject')
   const selectedMessageSender = selectedMessage ? getSenderLabel(selectedMessage.sender, selectedMessage.address) : ''
   const selectedMessageTime = selectedMessage ? formatMessageTime(selectedMessage.time, settings, i18n.language) : ''
@@ -1102,18 +1383,20 @@ function App() {
   const readerDeleteAction: MessageAction = activeFolder === 'trash' ? 'delete_forever' : 'trash'
   const isMailboxBusy = isLoadingAccounts || isLoadingFolder || isLoadingMessages
   const shouldShowLoadingSkeleton = isMailboxBusy && visibleMessages.length === 0
-  const shouldShowMobileReader = !selectedMessageId && (accounts.length === 0 || isMailboxBusy)
+  const shouldShowMessageSelectionToolbar = Boolean(activeAccount && !shouldShowLoadingSkeleton && !(mailboxLoadError && filteredMessages.length === 0))
+  const shouldShowMobileReader = !selectedMessage && (accounts.length === 0 || isMailboxBusy)
+  const shouldShowReaderState = !selectedMessage && (accountLoadError || (!isLoadingAccounts && accounts.length === 0))
   const accountTabStopId = accounts.find((account) => account.id === activeAccountId)?.id ?? accounts[0]?.id
 
-  const handleMailRowKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, messageId: string) => {
+  const handleMailRowKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, messageKey: string) => {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
-    const currentIndex = filteredMessages.findIndex((message) => message.id === messageId)
+    const currentIndex = displayedMessages.findIndex((message) => getMessageIdentity(message, activeAccountId) === messageKey)
     if (currentIndex < 0) return
-    const nextIndex = event.key === 'ArrowDown' ? Math.min(currentIndex + 1, filteredMessages.length - 1) : event.key === 'ArrowUp' ? Math.max(currentIndex - 1, 0) : event.key === 'Home' ? 0 : filteredMessages.length - 1
+    const nextIndex = event.key === 'ArrowDown' ? Math.min(currentIndex + 1, displayedMessages.length - 1) : event.key === 'ArrowUp' ? Math.max(currentIndex - 1, 0) : event.key === 'Home' ? 0 : displayedMessages.length - 1
     if (nextIndex === currentIndex) return
     event.preventDefault()
-    const nextMessage = filteredMessages[nextIndex]
-    document.querySelector<HTMLButtonElement>(`[data-mail-id="${CSS.escape(nextMessage.id)}"]`)?.focus()
+    const nextMessage = displayedMessages[nextIndex]
+      document.querySelector<HTMLButtonElement>(`[data-mail-id="${CSS.escape(getMessageIdentity(nextMessage, activeAccountId))}"]`)?.focus()
   }
 
   const handleAccountKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, accountId: string) => {
@@ -1136,12 +1419,15 @@ function App() {
     if (nextFilter !== activeFilter) clearReaderSelection()
     setActiveFilter(nextFilter)
     if (nextFilter === 'starred') {
+      invalidateLoadMore()
+      setIsUnifiedInbox(false)
       setActiveFolder('starred')
       setIsLoadingFolder(true)
       setFolderMessages([])
       setFolderNextPageToken(null)
       dismissSearch()
     } else if (activeFolder === 'starred') {
+      invalidateLoadMore()
       setActiveFolder('inbox')
       setIsLoadingFolder(false)
       setFolderMessages([])
@@ -1158,10 +1444,13 @@ function App() {
     clearBulkSelection()
     clearReaderSelection()
     clearSearch()
+    invalidateLoadMore()
+    setIsUnifiedInbox(false)
     setActiveFolder('inbox')
     setActiveFilter('all')
     setFolderMessages([])
     setFolderNextPageToken(null)
+    setUnifiedNextPageTokens({})
     setIsLoadingFolder(false)
     setActiveView('mail')
     if (!accountChanged) return
@@ -1169,7 +1458,31 @@ function App() {
     setMessages([])
     setMessagesAccountId(null)
     setNextPageToken(null)
+    setUnifiedNextPageTokens({})
     setActiveAccountId(accountId)
+  }
+
+  const selectUnifiedInbox = () => {
+    if (isComposing) {
+      setToastMessage(t('closeComposerToSwitchAccount'))
+      return
+    }
+    clearBulkSelection()
+    clearReaderSelection()
+    clearSearch()
+    invalidateLoadMore()
+    setIsUnifiedInbox(true)
+    setActiveFolder('inbox')
+    setActiveFilter('all')
+    setFolderMessages([])
+    setFolderNextPageToken(null)
+    setIsLoadingFolder(false)
+    setIsLoadingMessages(true)
+    setMessages([])
+    setMessagesAccountId(null)
+    setNextPageToken(null)
+    setUnifiedNextPageTokens({})
+    setActiveView('mail')
   }
 
   const handleMailFilterKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, filter: MailFilter) => {
@@ -1186,6 +1499,35 @@ function App() {
     selectMailFilter(nextFilter)
     window.requestAnimationFrame(() => {
       document.querySelector<HTMLButtonElement>(`[data-mail-filter="${nextFilter}"]`)?.focus()
+    })
+  }
+
+  const selectMailFolder = (folder: MailNavigationFolder) => {
+    clearBulkSelection()
+    clearReaderSelection()
+    dismissSearch()
+    invalidateLoadMore()
+    setIsUnifiedInbox(false)
+    setActiveFolder(folder)
+    setIsLoadingFolder(folder !== 'inbox')
+    setActiveFilter(activeFilter === 'starred' ? 'all' : activeFilter)
+    setFolderMessages([])
+    setFolderNextPageToken(null)
+  }
+
+  const handleMailFolderKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, folder: MailNavigationFolder) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    const currentIndex = MAIL_NAVIGATION_FOLDERS.indexOf(folder)
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? MAIL_NAVIGATION_FOLDERS.length - 1
+        : (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + MAIL_NAVIGATION_FOLDERS.length) % MAIL_NAVIGATION_FOLDERS.length
+    const nextFolder = MAIL_NAVIGATION_FOLDERS[nextIndex]
+    selectMailFolder(nextFolder)
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>(`[data-mail-folder="${nextFolder}"]`)?.focus()
     })
   }
 
@@ -1207,75 +1549,115 @@ function App() {
     })
   }, [getDisplayError, setToastMessage])
 
-  const updateMessage = useCallback((messageId: string, update: Partial<MailMessage>) => {
-    setMessages((current) => current.map((message) => message.id === messageId ? { ...message, ...update } : message))
-    setFolderMessages((current) => current.map((message) => message.id === messageId ? { ...message, ...update } : message))
-    setThreadMessages((current) => current.map((message) => message.id === messageId ? { ...message, ...update } : message))
-  }, [setFolderMessages, setMessages, setThreadMessages])
+  const updateMessage = useCallback((messageKey: string, update: Partial<MailMessage>) => {
+    setMessages((current) => current.map((message) => getMessageIdentity(message, activeAccountId) === messageKey ? { ...message, ...update } : message))
+    setFolderMessages((current) => current.map((message) => getMessageIdentity(message, activeAccountId) === messageKey ? { ...message, ...update } : message))
+    setThreadMessages((current) => current.map((message) => getMessageIdentity(message, activeAccountId) === messageKey ? { ...message, ...update } : message))
+  }, [activeAccountId, setFolderMessages, setMessages, setThreadMessages])
 
-  const removeMessageEverywhere = (messageId: string) => {
-    setMessages((current) => current.filter((message) => message.id !== messageId))
-    setFolderMessages((current) => current.filter((message) => message.id !== messageId))
+  const removeMessageEverywhere = (messageKey: string) => {
+    setMessages((current) => current.filter((message) => getMessageIdentity(message, activeAccountId) !== messageKey))
+    setFolderMessages((current) => current.filter((message) => getMessageIdentity(message, activeAccountId) !== messageKey))
   }
 
-  const removeMessageFromInbox = (messageId: string) => {
-    setMessages((current) => current.filter((message) => message.id !== messageId))
+  const removeMessageFromInbox = (messageKey: string) => {
+    setMessages((current) => current.filter((message) => getMessageIdentity(message, activeAccountId) !== messageKey))
   }
 
-  const isActionAvailable = useCallback((action: MessageAction) => {
-    if (!activeProviderCapabilities) return false
+  const isActionAvailable = useCallback((action: MessageAction, accountId = activeAccountId) => {
+    const capabilities = providerCapabilitiesByAccount[accountId]
+    if (!capabilities) return false
     switch (action) {
-      case 'archive': return activeProviderCapabilities.can_archive
+      case 'archive': return capabilities.can_archive
       case 'trash':
-      case 'untrash': return activeProviderCapabilities.can_delete
-      case 'delete_forever': return activeProviderCapabilities.can_permanently_delete
+      case 'untrash': return capabilities.can_delete
+      case 'delete_forever': return capabilities.can_permanently_delete
       case 'mark_read':
-      case 'mark_unread': return activeProviderCapabilities.can_mark_read
+      case 'mark_unread': return capabilities.can_mark_read
       case 'star':
-      case 'unstar': return activeProviderCapabilities.can_star
+      case 'unstar': return capabilities.can_star
       case 'spam':
-      case 'not_spam': return activeProviderCapabilities.can_spam
+      case 'not_spam': return capabilities.can_spam
     }
-  }, [activeProviderCapabilities])
+  }, [activeAccountId, providerCapabilitiesByAccount])
 
-  const runMessageAction = useCallback((messageId: string, action: MessageAction, onSuccess: () => void) => {
-    if (!activeAccountId || messageActionInFlightId || !isActionAvailable(action)) return
-    const requestedAccountId = activeAccountId
-    setMessageActionInFlightId(messageId)
-    void invoke('modify_message', { accountId: requestedAccountId, messageId, action })
+  const isBulkActionAvailable = useCallback((action: MessageAction) => {
+    const selectedMessages = filteredMessages.filter((message) => selectedMessageIds.has(getMessageIdentity(message, activeAccountId)))
+    return selectedMessages.length > 0 && selectedMessages.every((message) => isActionAvailable(action, message.account_id ?? activeAccountId))
+  }, [activeAccountId, filteredMessages, isActionAvailable, selectedMessageIds])
+
+  const runMessageAction = useCallback((messageKey: string, action: MessageAction, onSuccess: () => void) => {
+    const message = selectableMessagesRef.current.find((item) => getMessageIdentity(item, activeAccountId) === messageKey)
+    const requestedAccountId = message?.account_id ?? activeAccountId
+    const requestedFolder = activeFolder
+    const requestedIsUnifiedInbox = isUnifiedInbox
+    if (!message || !requestedAccountId || messageActionInFlightId || !isActionAvailable(action, requestedAccountId)) return
+    setMessageActionInFlightId(messageKey)
+    void invoke('modify_message', { accountId: requestedAccountId, messageId: message.id, action })
       .then(() => {
-        if (requestedAccountId === activeAccountId) onSuccess()
+        const isCurrentView = requestedAccountId === activeAccountIdRef.current
+          && requestedFolder === activeFolderRef.current
+          && requestedIsUnifiedInbox === isUnifiedInboxRef.current
+        if (isCurrentView) onSuccess()
       })
-      .catch((error: unknown) => setToastMessage(getDisplayError(error)))
-      .finally(() => setMessageActionInFlightId((current) => current === messageId ? null : current))
-  }, [activeAccountId, getDisplayError, isActionAvailable, messageActionInFlightId, setToastMessage])
+      .catch((error: unknown) => {
+        setToastMessage(getDisplayError(error))
+      })
+      .finally(() => setMessageActionInFlightId((current) => current === messageKey ? null : current))
+  }, [activeAccountId, activeFolder, getDisplayError, isActionAvailable, isUnifiedInbox, messageActionInFlightId, setToastMessage])
 
   const runBulkMessageAction = useCallback(async (action: MessageAction) => {
-    const visibleMessageIds = new Set(filteredMessages.map((message) => message.id))
-    const messageIds = Array.from(selectedMessageIds).filter((messageId) => visibleMessageIds.has(messageId))
-    if (!activeAccountId || messageIds.length === 0 || bulkActionInFlight || !isActionAvailable(action)) return
+    const visibleMessageKeys = new Set(filteredMessages.map((message) => getMessageIdentity(message, activeAccountId)))
+    const selectedMessages = filteredMessages.filter((message) => selectedMessageIds.has(getMessageIdentity(message, activeAccountId)) && visibleMessageKeys.has(getMessageIdentity(message, activeAccountId)))
+    if (!activeAccountId || selectedMessages.length === 0 || bulkActionInFlight || selectedMessages.some((message) => !isActionAvailable(action, message.account_id ?? activeAccountId))) return
+    const requestedAccountId = activeAccountId
+    const requestedFolder = activeFolder
+    const requestedIsUnifiedInbox = isUnifiedInbox
+    const messagesByAccount = new Map<string, string[]>()
+    selectedMessages.forEach((message) => {
+      const accountId = message.account_id ?? activeAccountId
+      const accountMessages = messagesByAccount.get(accountId) ?? []
+      accountMessages.push(message.id)
+      messagesByAccount.set(accountId, accountMessages)
+    })
     setBulkActionInFlight(true)
     try {
-      const result = await invoke<BulkMessageActionResult>('modify_messages', { accountId: activeAccountId, messageIds, action })
-      const ids = new Set(result.succeeded_message_ids)
+      const accountEntries = Array.from(messagesByAccount.entries())
+      const results = await Promise.allSettled(accountEntries.map(([accountId, messageIds]) => invoke<BulkMessageActionResult>('modify_messages', { accountId, messageIds, action })))
+      const isCurrentView = requestedAccountId === activeAccountIdRef.current
+        && requestedFolder === activeFolderRef.current
+        && requestedIsUnifiedInbox === isUnifiedInboxRef.current
+      if (!isCurrentView) return
+      const failedMessageIds = results.flatMap((result, index) => result.status === 'fulfilled'
+        ? result.value.failed_message_ids
+        : accountEntries[index]?.[1] ?? [])
+      const succeededKeys = new Set(results.flatMap((result, index) => {
+        if (result.status !== 'fulfilled') return []
+        const accountId = accountEntries[index]?.[0]
+        return accountId ? result.value.succeeded_message_ids.map((id) => getMessageIdentity({ id, account_id: accountId })) : []
+      }))
       if (action === 'archive' || action === 'trash' || action === 'delete_forever') {
-        setMessages((current) => current.filter((message) => !ids.has(message.id)))
-        setFolderMessages((current) => current.filter((message) => !ids.has(message.id)))
+        setMessages((current) => current.filter((message) => !succeededKeys.has(getMessageIdentity(message, activeAccountId))))
+        setFolderMessages((current) => current.filter((message) => !succeededKeys.has(getMessageIdentity(message, activeAccountId))))
       } else if (action === 'mark_read' || action === 'mark_unread') {
         const unread = action === 'mark_unread'
-        setMessages((current) => current.map((message) => ids.has(message.id) ? { ...message, unread } : message))
-        setFolderMessages((current) => current.map((message) => ids.has(message.id) ? { ...message, unread } : message))
+        setMessages((current) => current.map((message) => succeededKeys.has(getMessageIdentity(message, activeAccountId)) ? { ...message, unread } : message))
+        setFolderMessages((current) => current.map((message) => succeededKeys.has(getMessageIdentity(message, activeAccountId)) ? { ...message, unread } : message))
       }
-      clearBulkSelection()
-      setToastMessage(result.failed_message_ids.length > 0
-        ? t('bulkActionFailed', { count: result.failed_message_ids.length })
+      setSelectedMessageIds((current) => {
+        const next = new Set(current)
+        succeededKeys.forEach((messageKey) => next.delete(messageKey))
+        return next
+      })
+      setToastMessage(failedMessageIds.length > 0
+        ? t('bulkActionFailed', { count: failedMessageIds.length })
         : t('bulkActionComplete'))
     } catch (error: unknown) {
       setToastMessage(getDisplayError(error))
     } finally {
       setBulkActionInFlight(false)
     }
-  }, [activeAccountId, bulkActionInFlight, clearBulkSelection, filteredMessages, getDisplayError, isActionAvailable, selectedMessageIds, setFolderMessages, setMessages, setToastMessage, t])
+  }, [activeAccountId, activeFolder, bulkActionInFlight, filteredMessages, getDisplayError, isActionAvailable, isUnifiedInbox, selectedMessageIds, setFolderMessages, setMessages, setToastMessage, t])
 
   const archiveMessage = (messageId: string) => {
     runMessageAction(messageId, 'archive', () => {
@@ -1388,10 +1770,10 @@ function App() {
   }, [runMessageAction, updateMessage])
 
   useEffect(() => {
-    if (!selectedMessageId || !activeAccountId || !selectedMessage?.unread || !activeProviderCapabilities?.can_mark_read) return
+    if (!selectedMessageId || !activeAccountId || !selectedMessage?.unread || !selectedMessageCapabilities?.can_mark_read) return
     const timeoutId = window.setTimeout(() => markMessageRead(selectedMessageId), 0)
     return () => window.clearTimeout(timeoutId)
-  }, [activeAccountId, activeProviderCapabilities?.can_mark_read, markMessageRead, messageActionInFlightId, selectedMessage?.unread, selectedMessageId])
+  }, [activeAccountId, markMessageRead, messageActionInFlightId, selectedMessage?.unread, selectedMessageCapabilities?.can_mark_read, selectedMessageId])
 
   const markMessageReadFromContext = (messageId: string) => {
     runMessageAction(messageId, 'mark_read', () => {
@@ -1402,7 +1784,7 @@ function App() {
   }
 
   const starMessage = (messageId: string) => {
-    const message = selectableMessages.find((item) => item.id === messageId)
+    const message = selectableMessages.find((item) => getMessageIdentity(item, activeAccountId) === messageId)
     if (!message) return
     runMessageAction(messageId, message.starred ? 'unstar' : 'star', () => {
       updateMessage(messageId, { starred: !message.starred })
@@ -1412,11 +1794,13 @@ function App() {
   }
 
   const downloadAttachment = (attachment: Pick<MailAttachment, 'id' | 'filename'>, messageId = selectedMessageId) => {
-    if (!activeAccountId || !messageId || downloadingAttachmentId) return
+    const message = messageId ? selectableMessagesRef.current.find((item) => getMessageIdentity(item, activeAccountId) === messageId) : undefined
+    const requestedAccountId = message?.account_id ?? activeAccountId
+    if (!requestedAccountId || !message || downloadingAttachmentId) return
     setDownloadingAttachmentId(attachment.id)
     void invoke<string>('download_attachment', {
-      accountId: activeAccountId,
-      messageId,
+      accountId: requestedAccountId,
+      messageId: message.id,
       attachmentId: attachment.id,
       filename: attachment.filename,
     })
@@ -1425,28 +1809,52 @@ function App() {
       .finally(() => setDownloadingAttachmentId(null))
   }
 
-  const updateSetting = <Key extends keyof AppSettings>(key: Key, value: AppSettings[Key]) => {
-    const next = { ...settings, [key]: value }
+  const updateSetting = <Key extends keyof AppSettings>(key: Key, value: AppSettings[Key]): boolean => {
+    const previous = settingsRef.current
+    const next = { ...previous, [key]: value }
+    try {
+      saveSettings(next)
+    } catch {
+      setToastMessage(t('settingsSaveFailed'))
+      return false
+    }
+    settingsRef.current = next
     setSettings(next)
-    saveSettings(next)
     if (key === 'launchAtStartup') {
+      const requestId = ++launchAtStartupRequestIdRef.current
       void invoke('set_launch_at_startup', { enabled: next.launchAtStartup }).catch((error: unknown) => {
-        const reverted = { ...next, launchAtStartup: !next.launchAtStartup }
-        saveSettings(reverted)
+        if (requestId !== launchAtStartupRequestIdRef.current || settingsRef.current.launchAtStartup !== next.launchAtStartup) return
+        const reverted = { ...settingsRef.current, launchAtStartup: !next.launchAtStartup }
+        try {
+          saveSettings(reverted)
+        } catch {
+          settingsRef.current = reverted
+          setSettings(reverted)
+          setToastMessage(`${getDisplayError(error)} ${t('settingsSaveFailed')}`)
+          return
+        }
+        settingsRef.current = reverted
         setSettings(reverted)
         setToastMessage(getDisplayError(error))
       })
     }
+    return true
   }
 
   const setDefaultAccount = (accountId: string) => {
+    if (accountMutationInFlightRef.current) return
+    accountMutationInFlightRef.current = true
+    setIsAccountMutationInFlight(true)
+    accountsLoadRequestIdRef.current += 1
     void invoke<MailAccount[]>('set_default_account', { accountId }).then((updatedAccounts) => {
       setAccounts(updatedAccounts)
+      invalidateLoadMore()
       setDefaultAccountId(accountId)
       setIsLoadingMessages(true)
       setMessages([])
       setMessagesAccountId(null)
       setNextPageToken(null)
+      setUnifiedNextPageTokens({})
       setFolderMessages([])
       setFolderNextPageToken(null)
       setIsLoadingFolder(false)
@@ -1457,41 +1865,88 @@ function App() {
       setActiveFolder('inbox')
       setActiveFilter('all')
       setActiveView('mail')
-    }).catch((error: unknown) => setToastMessage(getDisplayError(error)))
+    }).catch((error: unknown) => setToastMessage(getDisplayError(error))).finally(() => {
+      accountMutationInFlightRef.current = false
+      setIsAccountMutationInFlight(false)
+    })
   }
 
   const refreshMailbox = async () => {
-    if (!activeAccountId || isRefreshing || syncInFlightAccountsRef.current.has(activeAccountId)) return
+    if (!activeAccountId || isRefreshing) return
     const requestedAccountId = activeAccountId
     const requestedFolder = activeFolder
+    const requestedIsUnifiedInbox = isUnifiedInbox
+    const refreshCandidates = requestedIsUnifiedInbox && activeFolder === 'inbox' ? accounts : activeAccount ? [activeAccount] : []
+    const accountsToRefresh = refreshCandidates.filter((account) => !syncInFlightAccountsRef.current.has(account.id))
+    if (accountsToRefresh.length === 0) return
     setIsRefreshing(true)
-    syncInFlightAccountsRef.current.add(requestedAccountId)
+    accountsToRefresh.forEach((account) => syncInFlightAccountsRef.current.add(account.id))
+    setAccountSyncStatus((current) => accountsToRefresh.reduce((next, account) => ({ ...next, [account.id]: 'syncing' as const }), current))
     try {
       if (activeFolder === 'inbox') {
-        const result = await invoke<SyncResult>('sync_messages', { accountId: activeAccountId })
-        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
-        setMessages((current) => mergeMessageLists(current, result.page.messages))
-        setNextPageToken(result.page.next_page_token)
-        setMessagesAccountId(activeAccountId)
+        const results = await Promise.allSettled(accountsToRefresh.map((account) => invoke<SyncResult>('sync_messages', { accountId: account.id })))
+        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder || requestedIsUnifiedInbox !== isUnifiedInbox) return
+        let successfulCount = 0
+        let firstFailure: unknown = null
+        results.forEach((result, index) => {
+          if (result.status === 'fulfilled') {
+            successfulCount += 1
+            setAccountSyncStatus((current) => ({ ...current, [accountsToRefresh[index].id]: 'idle' }))
+            const accountId = accountsToRefresh[index].id
+            if (requestedIsUnifiedInbox) setUnifiedNextPageTokens((current) => ({ ...current, [accountId]: result.value.page.next_page_token }))
+            setMessages((current) => {
+              const withoutRemoved = removeMessagesForAccount(current, accountId, result.value.removed_message_ids)
+              return requestedIsUnifiedInbox
+                ? mergeUnifiedAccountMessages(withoutRemoved, accountId, result.value.page.messages)
+                : mergeMessageLists(withoutRemoved, withAccountId(accountId, result.value.page.messages))
+            })
+          } else {
+            setAccountSyncStatus((current) => ({ ...current, [accountsToRefresh[index].id]: 'error' }))
+            firstFailure ??= result.reason
+          }
+        })
+        if (!requestedIsUnifiedInbox) {
+          const result = results[0]
+          if (result.status === 'fulfilled') {
+            setNextPageToken(result.value.page.next_page_token)
+            setMessagesAccountId(activeAccountId)
+          }
+        }
+        if (firstFailure) {
+          setMailboxLoadError(successfulCount === 0)
+          setToastMessage(`${t(successfulCount > 0 ? 'syncPartialFailed' : 'mailboxLoadFailed')}: ${getDisplayError(firstFailure)}`)
+        } else {
+          setMailboxLoadError(false)
+          setToastMessage(t('syncComplete'))
+        }
       } else {
         const folder = activeFolder
         const page = await invoke<MessagePage>('list_folder_messages', { accountId: activeAccountId, folder })
-        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder) return
+        if (requestedAccountId !== activeAccountId || requestedFolder !== activeFolder || requestedIsUnifiedInbox !== isUnifiedInbox) return
+        setAccountSyncStatus((current) => ({ ...current, [activeAccountId]: 'idle' }))
         setFolderMessages((current) => mergeMessageLists(current, page.messages))
         setFolderNextPageToken(page.next_page_token)
         await invoke('cache_folder_messages', { accountId: activeAccountId, folder, page, append: false })
       }
-      setToastMessage(t('syncComplete'))
+      if (activeFolder !== 'inbox') setToastMessage(t('syncComplete'))
     } catch (error: unknown) {
+      setAccountSyncStatus((current) => accountsToRefresh.reduce((next, account) => ({ ...next, [account.id]: 'error' as const }), current))
       setToastMessage(getDisplayError(error))
     } finally {
-      syncInFlightAccountsRef.current.delete(requestedAccountId)
+      accountsToRefresh.forEach((account) => {
+        syncInFlightAccountsRef.current.delete(account.id)
+      })
       setIsRefreshing(false)
     }
   }
 
   const requestWindowClose = () => {
     if (!isTauriRuntime()) return
+    if (hasUnsavedComposeContent()) {
+      pendingWindowCloseAfterComposeRef.current = true
+      setIsComposeCloseConfirmationOpen(true)
+      return
+    }
     if (settings.closeToTray) {
       void hideToTray().catch(handleWindowActionError)
       return
@@ -1500,14 +1955,13 @@ function App() {
       setIsCloseConfirmationOpen(true)
       return
     }
-    void getCurrentWindow().close()
+    closeWindowImmediately()
   }
 
   const confirmWindowClose = () => {
     if (!isTauriRuntime()) return
-    allowWindowCloseRef.current = true
     setIsCloseConfirmationOpen(false)
-    void getCurrentWindow().close()
+    closeWindowImmediately()
   }
 
   const minimizeWindowToTray = () => {
@@ -1517,14 +1971,32 @@ function App() {
   }
 
   const removeAccount = (accountId: string) => {
+    if (accountMutationInFlightRef.current) return
+    if (isComposing && composeAccountId === accountId) {
+      setToastMessage(t('closeComposerBeforeRemoveAccount'))
+      return
+    }
+    accountMutationInFlightRef.current = true
+    setIsAccountMutationInFlight(true)
+    accountsLoadRequestIdRef.current += 1
     void invoke<MailAccount[]>('remove_account', { accountId })
       .then((updatedAccounts) => {
         setAccounts(updatedAccounts)
+        setUnifiedNextPageTokens((current) => {
+          const next = { ...current }
+          delete next[accountId]
+          return next
+        })
+        if (isUnifiedInbox && activeAccountId !== accountId) {
+          setMessages((current) => current.filter((message) => message.account_id !== accountId))
+        }
         const nextAccount = updatedAccounts.find((account) => account.is_default) ?? updatedAccounts[0]
         setDefaultAccountId(nextAccount?.id ?? '')
         if (activeAccountId === accountId) {
           clearBulkSelection()
+          invalidateLoadMore()
           setIsLoadingMessages(Boolean(nextAccount))
+          setIsUnifiedInbox(isUnifiedInbox && updatedAccounts.length > 1)
           setActiveAccountId(nextAccount?.id ?? '')
           setActiveFolder('inbox')
           setActiveFilter('all')
@@ -1533,13 +2005,21 @@ function App() {
           setMessages([])
           setMessagesAccountId(null)
           setNextPageToken(null)
+          setUnifiedNextPageTokens({})
           setFolderMessages([])
           clearSearch()
           clearReaderSelection()
         }
         setToastMessage(t('accountRemoved'))
       })
-      .catch((error: unknown) => setToastMessage(getDisplayError(error)))
+      .catch((error: unknown) => {
+        setToastMessage(getDisplayError(error))
+        loadAccounts()
+      })
+      .finally(() => {
+        accountMutationInFlightRef.current = false
+        setIsAccountMutationInFlight(false)
+      })
   }
 
   const startAuth = async (provider: MailAccount['provider'], loginHint?: string) => {
@@ -1552,13 +2032,24 @@ function App() {
     }
     let attempts = 0
     await new Promise<void>((resolve, reject) => {
-      const pollAuthState = window.setInterval(() => {
+      let pollAuthState: number | null = null
+      let settled = false
+      const settle = (handler: () => void) => {
+        if (settled) return
+        settled = true
+        if (pollAuthState !== null) window.clearTimeout(pollAuthState)
+        handler()
+      }
+      const poll = async () => {
+        if (settled) return
         attempts += 1
-        void invoke<AuthState>('get_auth_status').then(async (authState) => {
+        try {
+          const authState = await invoke<AuthState>('get_auth_status')
+          if (settled) return
           if (authState.status === 'connected') {
-            window.clearInterval(pollAuthState)
             try {
               const loadedAccounts = await invoke<MailAccount[]>('list_accounts')
+              if (settled) return
               setAccounts(loadedAccounts)
               setAccountLoadError(false)
               const defaultAccount = loadedAccounts.find((account) => account.is_default) ?? loadedAccounts[0]
@@ -1579,31 +2070,33 @@ function App() {
                 setActiveFolder('inbox')
                 setActiveView('mail')
               }
-              resolve()
+              settle(resolve)
             } catch (error) {
-              reject(error)
+              settle(() => reject(error))
             }
           } else if (authState.status === 'failed') {
-            window.clearInterval(pollAuthState)
-            const message = getDisplayError(authState.error ?? t('authFailed'))
+            const message = getDisplayError(authState.error ?? (provider === 'outlook' ? t('outlookAuthFailed') : t('gmailAuthFailed')))
             setToastMessage(message)
-            reject(new Error(message))
+            settle(() => reject(new Error(message)))
           } else if (attempts >= 600) {
-            window.clearInterval(pollAuthState)
-            const message = t('authTimedOut')
+            const message = provider === 'outlook' ? t('outlookAuthTimedOut') : t('gmailAuthTimedOut')
             setToastMessage(message)
-            reject(new Error(message))
+            settle(() => reject(new Error(message)))
+          } else {
+            pollAuthState = window.setTimeout(() => {
+              void poll()
+            }, 500)
           }
-        }).catch((error: unknown) => {
-          window.clearInterval(pollAuthState)
-          reject(error)
-        })
-      }, 500)
+        } catch (error) {
+          settle(() => reject(error))
+        }
+      }
+      void poll()
     })
   }
 
   const openReply = () => {
-    if (!activeProviderCapabilities?.can_reply) return
+    if (!selectedMessageCapabilities?.can_reply) return
     setIsReplying(true)
     setReplyDraft('')
   }
@@ -1633,7 +2126,7 @@ function App() {
       if (event.key !== 'Escape') return
       if (document.querySelector('[role="dialog"]')) return
       const target = event.target
-      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target instanceof HTMLElement && target.isContentEditable) return
       event.preventDefault()
       closeReader()
     }
@@ -1644,6 +2137,9 @@ function App() {
   useEffect(() => {
     const handleGlobalShortcut = (event: globalThis.KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k' || document.querySelector('[role="dialog"][aria-modal="true"]')) return
+      const target = event.target
+      const isEditableTarget = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target instanceof HTMLElement && target.isContentEditable
+      if (isEditableTarget && target !== searchInputRef.current) return
       event.preventDefault()
       setContextMenu(null)
       searchInputRef.current?.focus()
@@ -1665,10 +2161,12 @@ function App() {
 
   const handleSearchQueryChange = (value: string) => {
     const query = value.trim()
+    searchLoadRequestIdRef.current += 1
     setContextMenu(null)
     setSearchQuery(value)
     setSearchResults([])
     setSearchPageTokens({})
+    setIsLoadingMoreSearch(false)
     setSearchError(false)
     setSearchPartialError(false)
     setSearchActiveIndex(0)
@@ -1683,6 +2181,8 @@ function App() {
   }
 
   const retrySearch = () => {
+    searchLoadRequestIdRef.current += 1
+    setIsLoadingMoreSearch(false)
     setSearchError(false)
     setSearchRetryNonce((current) => current + 1)
   }
@@ -1692,6 +2192,7 @@ function App() {
     const requestedSearchRequestId = searchRequestIdRef.current
     const accountsWithNextPage = accounts.filter((account) => searchPageTokens[account.id])
     if (!query || accountsWithNextPage.length === 0 || isLoadingMoreSearch) return
+    const loadRequestId = ++searchLoadRequestIdRef.current
     setIsLoadingMoreSearch(true)
     const responsesPromise = Promise.allSettled(accountsWithNextPage.map((account) => invoke<MessagePage>('search_messages', {
       accountId: account.id,
@@ -1699,7 +2200,7 @@ function App() {
       pageToken: searchPageTokens[account.id],
     })))
     void responsesPromise.then((responses) => {
-      if (requestedSearchRequestId !== searchRequestIdRef.current || query !== searchQuery.trim()) return
+      if (loadRequestId !== searchLoadRequestIdRef.current || requestedSearchRequestId !== searchRequestIdRef.current || query !== searchQuery.trim()) return
       const nextResults = responses.flatMap((response, index) => response.status === 'fulfilled'
         ? response.value.messages.map((message) => ({ account: accountsWithNextPage[index], message }))
         : [])
@@ -1711,17 +2212,20 @@ function App() {
         })
         return next
       })
+      const firstFailure = responses.find((response): response is PromiseRejectedResult => response.status === 'rejected')
+      if (firstFailure) setSearchPartialError(true)
       responses.forEach((response, index) => {
         if (response.status !== 'fulfilled') return
         void invoke('cache_search_messages', { accountId: accountsWithNextPage[index].id, query, page: response.value, append: true }).catch((error: unknown) => {
-          if (requestedSearchRequestId === searchRequestIdRef.current) setToastMessage(getDisplayError(error))
+          if (loadRequestId === searchLoadRequestIdRef.current && requestedSearchRequestId === searchRequestIdRef.current) setToastMessage(getDisplayError(error))
         })
       })
-    }).finally(() => setIsLoadingMoreSearch(false))
+    }).finally(() => {
+      if (loadRequestId === searchLoadRequestIdRef.current) setIsLoadingMoreSearch(false)
+    })
   }
 
-  const cacheSentMessage = async (messageId: string) => {
-    const requestedAccountId = activeAccountId
+  const cacheSentMessage = async (messageId: string, requestedAccountId = composeAccountId ?? activeAccountId) => {
     try {
       const sentMessage = await invoke<MailMessage>('cache_sent_message', { accountId: requestedAccountId, messageId })
       if (requestedAccountId === activeAccountId && activeFolder === 'sent') {
@@ -1733,14 +2237,16 @@ function App() {
   }
 
   const submitReply = async () => {
-    if (!selectedMessage || !activeAccount?.address || isSendingReply || !activeProviderCapabilities?.can_reply) return
+    const replyAccountId = selectedMessage?.account_id ?? activeAccountId
+    const replyAccount = accounts.find((account) => account.id === replyAccountId)
+    if (!selectedMessage || !replyAccount?.address || isSendingReply || !selectedMessageCapabilities?.can_reply) return
     setIsSendingReply(true)
     const subject = /^re:/i.test(selectedMessage.subject.trim()) ? selectedMessage.subject : `Re: ${selectedMessage.subject}`
     try {
       const sentMessageId = await invoke<string>('send_reply', {
-        accountId: activeAccountId,
+        accountId: replyAccountId,
         messageId: selectedMessage.id,
-        sender: activeAccount.address,
+        sender: replyAccount.address,
         recipient: selectedMessage.address,
         subject,
         body: replyDraft,
@@ -1750,7 +2256,7 @@ function App() {
       setIsReplying(false)
       setReplyDraft('')
       setToastMessage(t('replySent'))
-      void cacheSentMessage(sentMessageId)
+      void cacheSentMessage(sentMessageId, replyAccountId)
     } catch (error) {
       setToastMessage(`${t('replySendFailed')} ${getDisplayError(error)}`)
     } finally {
@@ -1758,9 +2264,12 @@ function App() {
     }
   }
 
-  const closeComposer = () => {
+  const resetComposer = () => {
     if (isSendingMessage) return
     composeOpenSequenceRef.current += 1
+    composeRevisionRef.current += 1
+    draftListRequestIdRef.current += 1
+    draftLoadRequestIdRef.current += 1
     setIsComposing(false)
     setIsDraftsPanelOpen(false)
     setComposeAccountId(null)
@@ -1771,27 +2280,83 @@ function App() {
     setComposeSubject('')
     setComposeBody('')
     setComposeBodyHtml('')
+    setComposeAttachments([])
     setDraftStatus('idle')
+  }
+
+  const closeWindowImmediately = () => {
+    if (!isTauriRuntime()) return
+    allowWindowCloseRef.current = true
+    setIsCloseConfirmationOpen(false)
+    void getCurrentWindow().close().catch((error: unknown) => {
+      allowWindowCloseRef.current = false
+      handleWindowActionError(error)
+    })
+  }
+
+  const cancelComposeCloseConfirmation = () => {
+    pendingWindowCloseAfterComposeRef.current = false
+    setIsComposeCloseConfirmationOpen(false)
+  }
+
+  const discardComposer = async () => {
+    if (isSendingMessage || draftSaveInFlightRef.current) return
+    const shouldCloseWindow = pendingWindowCloseAfterComposeRef.current
+    const draftId = composeDraftId
+    const accountId = composeAccountId ?? activeAccountId
+    if (draftId && accountId && isTauriRuntime()) {
+      try {
+        await invoke('delete_draft', { accountId, draftId })
+        setComposeDrafts((current) => current.filter((item) => item.id !== draftId))
+      } catch (error: unknown) {
+        setToastMessage(`${t('draftDeleteFailed')} ${getDisplayError(error)}`)
+        return
+      }
+    }
+    pendingWindowCloseAfterComposeRef.current = false
+    setIsComposeCloseConfirmationOpen(false)
+    resetComposer()
+    if (shouldCloseWindow) closeWindowImmediately()
+  }
+
+  const closeComposer = () => {
+    if (isSendingMessage || draftSaveInFlightRef.current) return
+    const hasComposeContent = [composeRecipient, composeCc, composeBcc, composeSubject, composeBody].some((value) => value.trim().length > 0) || composeAttachments.length > 0
+    if (hasComposeContent && draftStatus === 'idle') {
+      pendingWindowCloseAfterComposeRef.current = false
+      setIsComposeCloseConfirmationOpen(true)
+      return
+    }
+    pendingWindowCloseAfterComposeRef.current = false
+    resetComposer()
   }
 
   const refreshComposeDrafts = async (accountId = composeAccountId ?? activeAccountId) => {
     if (!accountId || !isTauriRuntime()) return
+    const requestId = ++draftListRequestIdRef.current
+    const composeGeneration = composeOpenSequenceRef.current
     setIsLoadingDrafts(true)
     try {
-      setComposeDrafts(await invoke<DraftListItem[]>('list_drafts', { accountId }))
+      const drafts = await invoke<DraftListItem[]>('list_drafts', { accountId })
+      if (requestId !== draftListRequestIdRef.current || composeGeneration !== composeOpenSequenceRef.current) return
+      setComposeDrafts(drafts)
     } catch (error) {
+      if (requestId !== draftListRequestIdRef.current || composeGeneration !== composeOpenSequenceRef.current) return
       setToastMessage(`${t('draftLoadFailed')} ${getDisplayError(error)}`)
     } finally {
-      setIsLoadingDrafts(false)
+      if (requestId === draftListRequestIdRef.current && composeGeneration === composeOpenSequenceRef.current) setIsLoadingDrafts(false)
     }
   }
 
-  const saveCurrentComposeDraft = async () => {
+  const saveCurrentComposeDraft = async (): Promise<boolean> => {
     const accountId = composeAccountId ?? activeAccountId
     const composeAccount = accounts.find((account) => account.id === accountId)
-    if (!composeAccount?.address || !accountId || isSendingMessage) return
+    if (!composeAccount?.address || !accountId || isSendingMessage || draftSaveInFlightRef.current) return false
     const hasContent = [composeRecipient, composeCc, composeBcc, composeSubject, composeBody].some((value) => value.trim().length > 0) || composeAttachments.length > 0
-    if (!hasContent) return
+    if (!hasContent) return false
+    const composeGeneration = composeOpenSequenceRef.current
+    const composeRevision = composeRevisionRef.current
+    draftSaveInFlightRef.current = true
     setDraftStatus('saving')
     try {
       const draft = await invoke<MailDraft>('save_draft', {
@@ -1803,62 +2368,98 @@ function App() {
         bcc: splitEmailAddresses(composeBcc).join(', '),
         subject: composeSubject.trim(),
         body: composeBody,
-        bodyHtml: composeBodyHtml,
+        bodyHtml: sanitizeComposeHtml(composeBodyHtml),
         attachments: composeAttachments.map(({ filename, mimeType, dataBase64 }) => ({ filename, mimeType, dataBase64 })),
       })
+      if (composeGeneration !== composeOpenSequenceRef.current) return false
       setComposeDraftId(draft.id)
-      setComposeAttachments(draft.attachments)
-      await refreshComposeDrafts()
+      await refreshComposeDrafts(accountId)
+      if (composeRevision !== composeRevisionRef.current) {
+        setDraftStatus('idle')
+        return false
+      }
       setDraftStatus('saved')
       setToastMessage(t('draftSaved'))
-    } catch {
+      return true
+    } catch (error: unknown) {
       setDraftStatus('idle')
-      setToastMessage(t('draftSaveFailed'))
+      setToastMessage(`${t('draftSaveFailed')} ${getDisplayError(error)}`)
+      return false
+    } finally {
+      draftSaveInFlightRef.current = false
     }
+  }
+
+  const saveAndCloseComposer = async () => {
+    const shouldCloseWindow = pendingWindowCloseAfterComposeRef.current
+    const saved = await saveCurrentComposeDraft()
+    if (!saved) return
+    pendingWindowCloseAfterComposeRef.current = false
+    setIsComposeCloseConfirmationOpen(false)
+    resetComposer()
+    if (shouldCloseWindow) closeWindowImmediately()
   }
 
   const deleteComposeDraft = async (draft: DraftListItem) => {
     const accountId = composeAccountId ?? activeAccountId
+    if (!accountId || draftSaveInFlightRef.current) return
+    const composeGeneration = composeOpenSequenceRef.current
     try {
       await invoke('delete_draft', { accountId, draftId: draft.id })
+      if (composeGeneration !== composeOpenSequenceRef.current) return
       setComposeDrafts((current) => current.filter((item) => item.id !== draft.id))
       if (composeDraftId === draft.id) {
+        composeRevisionRef.current += 1
         setComposeDraftId(null)
         setDraftStatus('idle')
       }
-    } catch {
-      setToastMessage(t('draftDeleteFailed'))
+    } catch (error: unknown) {
+      if (composeGeneration !== composeOpenSequenceRef.current) return
+      setToastMessage(`${t('draftDeleteFailed')} ${getDisplayError(error)}`)
     }
   }
 
   const selectComposeDraft = async (draft: DraftListItem) => {
-    if (isSendingMessage) return
+    if (isSendingMessage || draftSaveInFlightRef.current) return
     const accountId = composeAccountId ?? activeAccountId
+    if (!accountId) return
+    const requestId = ++draftLoadRequestIdRef.current
+    const composeGeneration = composeOpenSequenceRef.current
+    const composeRevision = composeRevisionRef.current
     try {
       const loadedDraft = await invoke<MailDraft>('get_draft', { accountId, draftId: draft.id })
+      if (requestId !== draftLoadRequestIdRef.current || composeGeneration !== composeOpenSequenceRef.current || composeRevision !== composeRevisionRef.current) return
+      composeRevisionRef.current += 1
       setComposeDraftId(loadedDraft.id)
       setComposeRecipient(loadedDraft.recipient)
       setComposeCc(loadedDraft.cc)
       setComposeBcc(loadedDraft.bcc)
       setComposeSubject(loadedDraft.subject)
       setComposeBody(loadedDraft.body)
-      setComposeBodyHtml(loadedDraft.bodyHtml)
+      setComposeBodyHtml(sanitizeComposeHtml(loadedDraft.bodyHtml))
       setComposeAttachments(loadedDraft.attachments)
       setDraftStatus('saved')
       setIsDraftsPanelOpen(false)
-    } catch {
-      setToastMessage(t('draftLoadFailed'))
+    } catch (error: unknown) {
+      if (requestId !== draftLoadRequestIdRef.current || composeGeneration !== composeOpenSequenceRef.current) return
+      setToastMessage(`${t('draftLoadFailed')} ${getDisplayError(error)}`)
     }
   }
 
   const saveComposeRecipient = (email: string) => {
-    setSavedRecipients(saveRecipient(email))
-    setToastMessage(t('recipientSaved'))
+    try {
+      setSavedRecipients(saveRecipient(email))
+      setToastMessage(t('recipientSaved'))
+    } catch {
+      setToastMessage(t('recipientSaveFailed'))
+    }
   }
 
   const openComposer = async () => {
     if (!activeProviderCapabilities?.can_send) return
     composeOpenSequenceRef.current += 1
+    composeRevisionRef.current += 1
+    draftLoadRequestIdRef.current += 1
     const accountId = activeAccountId
     setComposeAccountId(accountId)
     setComposeDraftId(null)
@@ -1870,18 +2471,22 @@ function App() {
   }
 
   const submitMessage = async (attachments: ComposeAttachment[]) => {
-    if (!activeAccount?.address || !activeProviderCapabilities?.can_send || !areValidEmailAddresses(composeRecipient) || (composeCc.trim() && !areValidEmailAddresses(composeCc)) || (composeBcc.trim() && !areValidEmailAddresses(composeBcc)) || !composeSubject.trim() || !composeBody.trim() || isSendingMessage) return
+    const composeTargetAccountId = composeAccountId ?? activeAccountId
+    const composeTargetAccount = accounts.find((account) => account.id === composeTargetAccountId)
+    const composeTargetCapabilities = providerCapabilitiesByAccount[composeTargetAccountId]
+    if (!composeTargetAccount?.address || !composeTargetCapabilities?.can_send || !areValidEmailAddresses(composeRecipient) || (composeCc.trim() && !areValidEmailAddresses(composeCc)) || (composeBcc.trim() && !areValidEmailAddresses(composeBcc)) || !composeSubject.trim() || !composeBody.trim() || isSendingMessage || draftSaveInFlightRef.current) return
     setIsSendingMessage(true)
+    let draftDeletionFailed = false
     try {
       const sentMessageId = await invoke<string>('send_message', {
-        accountId: composeAccountId ?? activeAccountId,
-        sender: accounts.find((account) => account.id === (composeAccountId ?? activeAccountId))?.address ?? activeAccount.address,
+        accountId: composeTargetAccountId,
+        sender: composeTargetAccount.address,
         recipient: splitEmailAddresses(composeRecipient).join(', '),
         cc: splitEmailAddresses(composeCc).join(', '),
         bcc: splitEmailAddresses(composeBcc).join(', '),
         subject: composeSubject.trim(),
         body: composeBody,
-        bodyHtml: composeBodyHtml,
+        bodyHtml: sanitizeComposeHtml(composeBodyHtml),
         attachments: attachments.map(({ filename, mimeType, dataBase64 }) => ({ filename, mimeType, dataBase64 })),
       })
       setIsComposing(false)
@@ -1893,13 +2498,18 @@ function App() {
       setComposeBodyHtml('')
       setComposeAttachments([])
       if (composeDraftId) {
-        void invoke('delete_draft', { accountId: composeAccountId ?? activeAccountId, draftId: composeDraftId }).catch((error: unknown) => setToastMessage(`${t('draftDeleteFailed')} ${getDisplayError(error)}`))
-        setComposeDrafts((current) => current.filter((item) => item.id !== composeDraftId))
+        try {
+          await invoke('delete_draft', { accountId: composeTargetAccountId, draftId: composeDraftId })
+          setComposeDrafts((current) => current.filter((item) => item.id !== composeDraftId))
+        } catch (error: unknown) {
+          draftDeletionFailed = true
+          setToastMessage(`${t('draftDeleteFailed')} ${getDisplayError(error)}`)
+        }
       }
       setComposeDraftId(null)
       setIsDraftsPanelOpen(false)
-      setToastMessage(t('messageSent'))
-      void cacheSentMessage(sentMessageId)
+      setToastMessage(draftDeletionFailed ? `${t('messageSent')} ${t('draftDeleteFailed')}` : t('messageSent'))
+      void cacheSentMessage(sentMessageId, composeTargetAccountId)
     } catch (error) {
       setToastMessage(`${t('messageSendFailed')} ${getDisplayError(error)}`)
     } finally {
@@ -1908,13 +2518,13 @@ function App() {
   }
 
   const selectMessage = (messageId: string) => {
-    const nextMessage = visibleMessages.find((item) => item.id === messageId)
+    const nextMessage = visibleMessages.find((item) => getMessageIdentity(item, activeAccountId) === messageId)
     if (nextMessage) selectReaderMessage(nextMessage)
   }
 
   useEffect(() => {
     if (!selectedMessageId || activeView !== 'mail') return undefined
-    const mobileViewport = window.matchMedia('(max-width: 580px)')
+    const mobileViewport = window.matchMedia('(max-width: 680px)')
     const focusMobileReader = () => {
       if (mobileViewport.matches) readerBackButtonRef.current?.focus()
     }
@@ -1931,22 +2541,26 @@ function App() {
   }
 
   const selectReaderMessage = (nextMessage: MailMessage) => {
-    const needsBody = !nextMessage.body_html && (!nextMessage.body || nextMessage.body === nextMessage.preview)
-    setSelectedMessageId(nextMessage.id)
-    setThreadMessages(nextMessage.body_html || (nextMessage.body && nextMessage.body !== nextMessage.preview) ? [nextMessage] : [])
+    const messageWithAccount = nextMessage.account_id ? nextMessage : { ...nextMessage, account_id: activeAccountId }
+    const messageKey = getMessageIdentity(messageWithAccount, activeAccountId)
+    const needsBody = !messageWithAccount.body_html && (!messageWithAccount.body || messageWithAccount.body === messageWithAccount.preview)
+    setSelectedMessageId(messageKey)
+    setThreadMessages(messageWithAccount.body_html || (messageWithAccount.body && messageWithAccount.body !== messageWithAccount.preview) ? [messageWithAccount] : [])
     loadedThreadIdRef.current = null
     setMessageLoadErrorId(null)
     setIsReaderDetailsOpen(false)
     setIsReaderScrolled(false)
-    setLoadingMessageId(needsBody ? nextMessage.id : null)
+    setLoadingMessageId(needsBody ? messageKey : null)
     setContextMenu(null)
   }
 
   const selectSearchResult = (result: MailSearchResult) => {
-    const nextMessage = result.message
+    const nextMessage = { ...result.message, account_id: result.account.id }
     const isCurrentAccount = result.account.id === messagesAccountId
     clearReaderSelection()
     clearSearch()
+    invalidateLoadMore()
+    setIsUnifiedInbox(false)
     setActiveView('mail')
     setActiveAccountId(result.account.id)
     setActiveFolder('inbox')
@@ -1954,7 +2568,7 @@ function App() {
     setFolderMessages([])
     setFolderNextPageToken(null)
     setMessagesAccountId(result.account.id)
-    setMessages((current) => isCurrentAccount ? mergeMessageLists(current, [nextMessage]) : [nextMessage])
+    setMessages((current) => isCurrentAccount ? appendUniqueMessages(current, [nextMessage]) : [nextMessage])
     setNextPageToken(isCurrentAccount ? nextPageToken : null)
     setIsLoadingMessages(!isCurrentAccount)
     selectReaderMessage(nextMessage)
@@ -1982,7 +2596,7 @@ function App() {
   }
 
   return (
-    <main className="app-shell" onContextMenu={handleContextMenu} onClick={() => setContextMenu(null)}>
+    <main className={`app-shell ${isSidebarExpanded ? 'sidebar-expanded' : ''}`} onContextMenu={handleContextMenu} onClick={() => setContextMenu(null)}>
       <WindowHeader
         onRequestClose={requestWindowClose}
         onWindowActionError={handleWindowActionError}
@@ -2032,86 +2646,153 @@ function App() {
         /> : null}
       </WindowHeader>
       <aside className="sidebar" aria-label={t('navigation')}>
-        <nav ref={accountListRef} className="account-list" aria-label={t('accounts')}>
-            {accounts.map((account) => (
-              <AccountButton key={account.id} account={account} active={activeAccountId === account.id} syncStatus={accountSyncStatus[account.id] ?? 'idle'} providerLogos={providerLogos} tabIndex={account.id === accountTabStopId ? 0 : -1} onSelect={() => selectAccount(account.id)} onKeyDown={(event) => handleAccountKeyDown(event, account.id)} />
-            ))}
+        <nav id="account-rail-nav" ref={accountListRef} className={`account-list ${isSidebarExpanded ? 'expanded' : ''}`} aria-label={t('accounts')}>
+          {accounts.map((account) => (
+            <AccountButton key={account.id} account={account} active={!isUnifiedInbox && activeAccountId === account.id} syncStatus={accountSyncStatus[account.id] ?? 'idle'} unreadCount={accountUnreadCounts[account.id]} expanded={isSidebarExpanded} providerLogos={providerLogos} tabIndex={account.id === accountTabStopId ? 0 : -1} onSelect={() => selectAccount(account.id)} onKeyDown={(event) => handleAccountKeyDown(event, account.id)} />
+          ))}
+          {!isLoadingAccounts ? <div className="account-rail-utilities">
+            {accounts.length > 1 ? <button className={`account-button all-accounts-button ${isUnifiedInbox ? 'active' : ''} ${isSidebarExpanded ? 'expanded' : ''}`} type="button" aria-label={t('allInboxes')} title={isSidebarExpanded ? undefined : t('allInboxes')} aria-current={isUnifiedInbox ? 'page' : undefined} onClick={selectUnifiedInbox}>
+              <IconInbox aria-hidden="true" size={20} stroke={1.8} />
+              {isSidebarExpanded ? <span className="account-button-copy"><strong>{t('allInboxes')}</strong><span>{t('allInboxesDescription')}</span></span> : null}
+            </button> : null}
+            <button className={`account-button account-add-rail-button ${isSidebarExpanded ? 'expanded' : ''}`} type="button" aria-label={t('addAccount')} title={isSidebarExpanded ? undefined : t('addAccount')} onClick={() => { setOpenAddAccount(true); setActiveView('settings'); setContextMenu(null); clearSearch() }}>
+              <IconMailPlus aria-hidden="true" size={19} stroke={1.8} />
+              {isSidebarExpanded ? <span className="account-button-copy"><strong>{t('addAccount')}</strong><span>{t('addAccountDescription')}</span></span> : null}
+            </button>
+          </div> : null}
         </nav>
         <div className="sidebar-footer">
+          <button className="sidebar-toggle" type="button" aria-expanded={isSidebarExpanded} aria-controls="account-rail-nav" aria-label={t(isSidebarExpanded ? 'collapseSidebar' : 'expandSidebar')} title={t(isSidebarExpanded ? 'collapseSidebar' : 'expandSidebar')} onClick={() => setIsSidebarExpanded((current) => !current)}>
+            {isSidebarExpanded ? <IconChevronLeft aria-hidden="true" size={18} stroke={1.8} /> : <IconChevronRight aria-hidden="true" size={18} stroke={1.8} />}
+            {isSidebarExpanded ? <span>{t('collapseSidebar')}</span> : null}
+          </button>
           <button ref={settingsButtonRef} className={`settings-button ${activeView === 'settings' ? 'active' : ''}`} type="button" aria-label={t('settings')} title={t('settings')} aria-current={activeView === 'settings' ? 'page' : undefined} onClick={() => { setOpenAddAccount(false); setActiveView(activeView === 'settings' ? 'mail' : 'settings'); setContextMenu(null); clearSearch() }}>
             <IconSettings aria-hidden="true" size={18} stroke={1.8} />
+            {isSidebarExpanded ? <span>{t('settings')}</span> : null}
           </button>
         </div>
       </aside>
-      <section className={`content-area ${activeView === 'settings' ? 'settings-active' : ''} ${selectedMessageId && activeView === 'mail' ? 'reader-open' : ''} ${shouldShowMobileReader && activeView === 'mail' ? 'mobile-reader-empty' : ''}`}>
-        <aside className={`main-sidebar ${activeAccount ? 'has-account' : 'no-account'}`} aria-label={t('mainSidebar')}>
-          <div className="mail-sidebar-header">
-            <div className="mail-sidebar-title-group">
-              <h1>{activeFolder === 'inbox' ? t('inbox') : activeFolder === 'starred' ? t('starredMail') : t(activeFolder)}</h1>
-              <span id="mail-account-status" aria-live="polite" dir={activeAccount ? 'ltr' : undefined}>{isLoadingAccounts ? t('loadingAccounts') : accountLoadError ? t('accountsUnavailable') : activeAccount?.address ?? t('noConnectedAccounts')}</span>
-            </div>
-            {activeAccount ? <div className="mail-sidebar-actions"><Button className="mail-refresh-button" variant="ghost" size="icon" type="button" disabled={isRefreshing} aria-busy={isRefreshing} aria-label={t('refreshMail')} title={t('refreshMail')} onClick={() => { void refreshMailbox() }}><IconRefresh className={isRefreshing ? 'is-spinning' : undefined} aria-hidden="true" size={16} stroke={1.8} /></Button></div> : null}
-          </div>
-          <nav className="mail-folder-nav" aria-labelledby="mail-folders-label">
-            <span className="mail-section-label" id="mail-folders-label">{t('mailFolders')}</span>
-            {[
-              { id: 'inbox' as const, label: t('inbox'), icon: IconInbox },
-              { id: 'sent' as const, label: t('sent'), icon: IconSend },
-              { id: 'spam' as const, label: t('spam'), icon: IconAlertTriangle },
-              { id: 'trash' as const, label: t('trash'), icon: IconTrash },
-            ].map((folder) => {
-              const Icon = folder.icon
-              return <Button className={`folder-nav-item ${activeFolder === folder.id ? 'active' : ''}`} key={folder.id} variant="ghost" type="button" disabled={!activeAccount} aria-describedby={!activeAccount ? 'mail-account-status' : undefined} aria-current={activeFolder === folder.id ? 'page' : undefined} onClick={() => { clearBulkSelection(); clearReaderSelection(); dismissSearch(); setActiveFolder(folder.id); setIsLoadingFolder(folder.id !== 'inbox'); setActiveFilter(activeFilter === 'starred' ? 'all' : activeFilter); setFolderMessages([]); setFolderNextPageToken(null) }}><Icon aria-hidden="true" size={16} stroke={1.8} /><span>{folder.label}</span></Button>
-            })}
-          </nav>
-          <div className="mail-filters">
-            <span className="mail-section-label" id="mail-filters-label">{t('mailFilters')}</span>
-            <div className="mail-filter-options" role="group" aria-labelledby="mail-filters-label">
-              {(['unread', 'starred', 'attachments'] as const).map((filter) => (
-                <button className={`mail-filter ${activeFilter === filter ? 'active' : ''}`} data-mail-filter={filter} key={filter} type="button" disabled={!activeAccount} aria-describedby={!activeAccount ? 'mail-account-status' : undefined} aria-pressed={activeFilter === filter} tabIndex={activeAccount && (activeFilter === filter || (activeFilter === 'all' && filter === 'unread')) ? 0 : -1} onClick={() => selectMailFilter(filter)} onKeyDown={(event) => handleMailFilterKeyDown(event, filter)}>
-                  {t(`${filter}Mail`)}
-                </button>
-              ))}
-            </div>
-          </div>
-          {filteredMessages.length > 0 ? <div className="message-selection-toolbar" role="toolbar" aria-label={t('bulkMailActions')}>
-            <button className="message-selection-toggle" type="button" aria-pressed={filteredMessages.length > 0 && filteredMessages.every((message) => selectedMessageIds.has(message.id))} aria-label={filteredMessages.length > 0 && filteredMessages.every((message) => selectedMessageIds.has(message.id)) ? t('deselectAllMessages') : t('selectAllMessages')} onClick={toggleAllMessageSelection}><span className={`message-selection-box ${filteredMessages.length > 0 && filteredMessages.every((message) => selectedMessageIds.has(message.id)) ? 'checked' : ''}`} aria-hidden="true" />{selectedMessageIds.size > 0 ? <span className="message-selection-count" aria-live="polite">{t('selectedMessages', { count: selectedMessageIds.size })}</span> : null}</button>
-            {selectedMessageIds.size > 0 ? <div className="message-selection-actions">
-              <Button variant="ghost" size="icon" type="button" disabled={bulkActionInFlight || !isActionAvailable('archive')} aria-label={t('archive')} title={t('archive')} onClick={() => { void runBulkMessageAction('archive') }}><IconArchive aria-hidden="true" size={20} stroke={1.8} /></Button>
-              <Button variant="ghost" size="icon" type="button" disabled={bulkActionInFlight || !isActionAvailable('mark_read')} aria-label={t('markRead')} title={t('markRead')} onClick={() => { void runBulkMessageAction('mark_read') }}><IconMail aria-hidden="true" size={20} stroke={1.8} /></Button>
-              <Button variant="ghost" size="icon" type="button" disabled={bulkActionInFlight || !isActionAvailable('mark_unread')} aria-label={t('markUnread')} title={t('markUnread')} onClick={() => { void runBulkMessageAction('mark_unread') }}><IconMail aria-hidden="true" size={20} stroke={1.8} /></Button>
-              <Button variant="ghost" size="icon" type="button" disabled={bulkActionInFlight || !isActionAvailable('trash')} aria-label={t('delete')} title={t('delete')} onClick={() => { void runBulkMessageAction('trash') }}><IconTrash aria-hidden="true" size={20} stroke={1.8} /></Button>
-              <Button variant="ghost" size="icon" type="button" aria-label={t('cancel')} title={t('cancel')} onClick={clearBulkSelection}><IconX aria-hidden="true" size={20} stroke={1.8} /></Button>
-            </div> : null}
-          </div> : null}
-          <div className="message-list" aria-busy={isLoadingAccounts || isLoadingFolder || isLoadingMessages}>
-            {!activeAccount && !isLoadingAccounts ? null : shouldShowLoadingSkeleton ? <div className="message-list-loading" role="status" aria-label={t('loadingMailbox')}>
-              {[0, 1, 2, 3].map((item) => <div className="message-row-skeleton" key={item}>
-                <div className="message-row-skeleton-head"><Skeleton className="message-row-skeleton-avatar" /><Skeleton className="message-row-skeleton-dot" /><Skeleton className="message-row-skeleton-sender" /><Skeleton className="message-row-skeleton-time" /></div>
-                <Skeleton className="message-row-skeleton-subject" />
-                <Skeleton className="message-row-skeleton-preview" />
-              </div>)}
-            </div> : mailboxLoadError && filteredMessages.length === 0 ? (
-              <div className="message-list-error" role="alert">
-                <strong>{t('mailboxLoadFailed')}</strong>
-                <span>{t('mailboxLoadFailedDescription')}</span>
-                <Button variant="ghost" type="button" onClick={() => { void refreshMailbox() }}>{t('tryAgain')}</Button>
+      <section className={`content-area ${activeView === 'settings' ? 'settings-active' : ''} ${selectedMessage && activeView === 'mail' ? 'reader-open' : ''} ${shouldShowMobileReader && activeView === 'mail' ? 'mobile-reader-empty' : ''}`}>
+        {activeView === 'mail' ? <div className="mail-workspace">
+          <header className="mail-workspace-header">
+            <div className="mail-workspace-heading">
+              <div className="mail-workspace-title-group">
+                <h1 id="mail-workspace-title">{activeFolder === 'inbox' ? t('inbox') : activeFolder === 'starred' ? t('starredMail') : t(activeFolder)}</h1>
+                <span id="mail-account-status" aria-live="polite" dir={activeAccount ? 'ltr' : undefined}>{isLoadingAccounts ? t('loadingAccounts') : accountLoadError ? t('accountsUnavailable') : isUnifiedInbox ? t('allInboxes') : activeAccount?.address ?? t('noConnectedAccounts')}</span>
               </div>
-            ) : filteredMessages.length > 0 ? filteredMessages.map((message) => (
-              <MailRow key={message.id} message={{ ...message, time: formatMessageTime(message.time, settings, i18n.language) }} selected={selectedMessageId === message.id} selectionChecked={selectedMessageIds.has(message.id)} unreadLabel={t('unreadMail')} onSelect={selectMessage} onToggleSelection={toggleMessageSelection} onContextMenu={handleMailContextMenu} onKeyDown={handleMailRowKeyDown} />
-            )) : (
-              <MailListEmptyState icon={emptyListIcon} title={emptyListCopy.title} description={emptyListCopy.description} />
-            )}
-          </div>
-        </aside>
-        <section ref={mainCanvasRef} className="main-canvas" aria-label={selectedMessage ? undefined : t('mainCanvas')} aria-labelledby={selectedMessage ? 'reader-message-subject' : undefined} onScroll={handleReaderScroll}>
+              <div className="mail-workspace-actions">
+                {activeSyncStatus !== 'idle' ? <span className={`mail-sync-status ${activeSyncStatus}`} role="status" aria-live="polite"><span className="mail-sync-status-dot" aria-hidden="true" />{t(activeSyncStatus === 'syncing' ? 'syncingMail' : 'syncFailed')}</span> : null}
+                {activeAccount ? <Button className="mail-refresh-button" variant="ghost" size="icon" type="button" disabled={isRefreshing} aria-busy={isRefreshing} aria-label={t('refreshMail')} title={t('refreshMail')} onClick={() => { void refreshMailbox() }}><IconRefresh className={isRefreshing ? 'is-spinning' : undefined} aria-hidden="true" size={16} stroke={1.8} /></Button> : null}
+                {activeAccount && activeProviderCapabilities?.can_send ? <Button className="compose-button" type="button" onClick={() => { void openComposer() }}><IconPencil aria-hidden="true" size={17} stroke={1.8} />{t('compose')}</Button> : null}
+              </div>
+            </div>
+            <div className="mail-workspace-toolbar">
+              <nav className="mail-folder-nav" aria-labelledby="mail-folders-label">
+                <span className="mail-section-label" id="mail-folders-label">{t('mailFolders')}</span>
+                <div className="mail-folder-options">
+                  {[
+                    { id: 'inbox' as const, label: t('inbox'), icon: IconInbox },
+                    { id: 'sent' as const, label: t('sent'), icon: IconSend },
+                    { id: 'spam' as const, label: t('spam'), icon: IconAlertTriangle },
+                    { id: 'trash' as const, label: t('trash'), icon: IconTrash },
+                  ].map((folder) => {
+                    const Icon = folder.icon
+                    const unreadCount = folderUnreadCounts[folder.id]
+                    return <Button className={`folder-nav-item ${activeFolder === folder.id ? 'active' : ''}`} data-mail-folder={folder.id} key={folder.id} variant="ghost" type="button" disabled={!activeAccount} aria-describedby={!activeAccount ? 'mail-account-status' : undefined} aria-current={activeFolder === folder.id ? 'page' : undefined} onClick={() => selectMailFolder(folder.id)} onKeyDown={(event) => handleMailFolderKeyDown(event, folder.id)}><Icon aria-hidden="true" size={16} stroke={1.8} /><span>{folder.label}</span>{unreadCount && unreadCount > 0 ? <span className="folder-unread-count" aria-label={t('folderUnreadCount', { count: unreadCount })}>{unreadCount}</span> : null}</Button>
+                  })}
+                </div>
+              </nav>
+              <div className="mail-filters">
+                <span className="mail-section-label" id="mail-filters-label">{t('mailFilters')}</span>
+                <div className="mail-filter-options" role="group" aria-labelledby="mail-filters-label">
+                  {(['unread', 'starred', 'attachments'] as const).map((filter) => (
+                    <button className={`mail-filter ${activeFilter === filter ? 'active' : ''}`} data-mail-filter={filter} key={filter} type="button" disabled={!activeAccount} aria-describedby={!activeAccount ? 'mail-account-status' : undefined} aria-pressed={activeFilter === filter} tabIndex={activeAccount && (activeFilter === filter || (activeFilter === 'all' && filter === 'unread')) ? 0 : -1} onClick={() => selectMailFilter(filter)} onKeyDown={(event) => handleMailFilterKeyDown(event, filter)}>
+                      {t(`${filter}Mail`)}
+                    </button>
+                  ))}
+                  {activeFilter !== 'all' ? <button className="mail-filter mail-filter-clear" type="button" onClick={() => selectMailFilter(activeFilter)}>{t('clearFilter')}</button> : null}
+                </div>
+              </div>
+              <div className="mail-view-controls" role="group" aria-label={t('mailViewOptions')}>
+                <label className="mail-view-control">
+                  <span>{t('sortMail')}</span>
+                  <Select value={mailSort} disabled={!activeAccount} onValueChange={(value) => { if (MAIL_SORT_OPTIONS.includes(value as MailSort)) setMailSort(value as MailSort) }}>
+                    <SelectTrigger className="mail-view-select" aria-label={t('sortMail')}><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="newest">{t('sortNewest')}</SelectItem>
+                      <SelectItem value="oldest">{t('sortOldest')}</SelectItem>
+                      <SelectItem value="sender_asc">{t('sortSenderAsc')}</SelectItem>
+                      <SelectItem value="sender_desc">{t('sortSenderDesc')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </label>
+                <label className="mail-view-control">
+                  <span>{t('density')}</span>
+                  <Select value={settings.density} disabled={!activeAccount} onValueChange={(value) => { if (value === 'compact' || value === 'comfortable' || value === 'spacious') updateSetting('density', value as Density) }}>
+                    <SelectTrigger className="mail-view-select mail-density-select" aria-label={t('density')}><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="compact">{t('compact')}</SelectItem>
+                      <SelectItem value="comfortable">{t('comfortable')}</SelectItem>
+                      <SelectItem value="spacious">{t('spacious')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </label>
+              </div>
+            </div>
+          </header>
+          <div className={`mail-workspace-body ${selectedMessage ? 'reader-open' : shouldShowReaderState ? 'reader-state-open' : ''}`}>
+            <section className="mail-list-pane" aria-labelledby="mail-workspace-title">
+              {shouldShowMessageSelectionToolbar ? <div className="message-selection-toolbar" role="toolbar" aria-label={t('bulkMailActions')}>
+                <div className="message-selection-summary">
+                  <button className="message-selection-toggle" type="button" disabled={filteredMessages.length === 0} aria-pressed={allVisibleMessagesSelected} aria-label={allVisibleMessagesSelected ? t('deselectAllMessages') : t('selectAllMessages')} onClick={toggleAllMessageSelection}><span className={`message-selection-box ${allVisibleMessagesSelected ? 'checked' : ''}`} aria-hidden="true" /></button>
+                  <span className="message-total-count" aria-live="polite">{t('mailCount', { count: filteredMessages.length })}</span>
+                  {selectedVisibleMessageCount > 0 ? <span className="message-selection-count" aria-live="polite">{t('selectedMessages', { count: selectedVisibleMessageCount })}</span> : null}
+                </div>
+                <div className="message-selection-actions" role="group" aria-label={t('bulkMailActions')}>
+                  <Button variant="ghost" size="icon" type="button" disabled={selectedVisibleMessageCount === 0 || bulkActionInFlight || !isBulkActionAvailable('archive')} aria-label={t('archive')} title={t('archive')} onClick={() => { void runBulkMessageAction('archive') }}><IconArchive aria-hidden="true" size={20} stroke={1.8} /></Button>
+                  <Button variant="ghost" size="icon" type="button" disabled={selectedVisibleMessageCount === 0 || bulkActionInFlight || !isBulkActionAvailable('mark_read')} aria-label={t('markRead')} title={t('markRead')} onClick={() => { void runBulkMessageAction('mark_read') }}><IconMail aria-hidden="true" size={20} stroke={1.8} /></Button>
+                  <Button variant="ghost" size="icon" type="button" disabled={selectedVisibleMessageCount === 0 || bulkActionInFlight || !isBulkActionAvailable('mark_unread')} aria-label={t('markUnread')} title={t('markUnread')} onClick={() => { void runBulkMessageAction('mark_unread') }}><IconMail aria-hidden="true" size={20} stroke={1.8} /></Button>
+                  <Button variant="ghost" size="icon" type="button" disabled={selectedVisibleMessageCount === 0 || bulkActionInFlight || !isBulkActionAvailable('trash')} aria-label={t('delete')} title={t('delete')} onClick={() => { void runBulkMessageAction('trash') }}><IconTrash aria-hidden="true" size={20} stroke={1.8} /></Button>
+                  <Button variant="ghost" size="icon" type="button" disabled={selectedVisibleMessageCount === 0 || bulkActionInFlight} aria-label={t('cancel')} title={t('cancel')} onClick={clearBulkSelection}><IconX aria-hidden="true" size={20} stroke={1.8} /></Button>
+                </div>
+              </div> : null}
+              <div className="message-list" aria-busy={isLoadingAccounts || isLoadingFolder || isLoadingMessages}>
+                {!selectedMessage && filteredMessages.length > 0 ? <div className="message-list-column-header" aria-hidden="true">
+                  <span />
+                  <span>{t('messageSender')}</span>
+                  <span />
+                  <span>{t('subject')}</span>
+                  <span>{t('messageReceived')}</span>
+                  <span />
+                </div> : null}
+                {!activeAccount && !isLoadingAccounts ? null : shouldShowLoadingSkeleton ? <div className="message-list-loading" role="status" aria-label={t('loadingMailbox')}>
+                  {[0, 1, 2, 3].map((item) => <div className="message-row-skeleton" key={item}>
+                    <div className="message-row-skeleton-head"><Skeleton className="message-row-skeleton-avatar" /><Skeleton className="message-row-skeleton-dot" /><Skeleton className="message-row-skeleton-sender" /><Skeleton className="message-row-skeleton-time" /></div>
+                    <Skeleton className="message-row-skeleton-subject" />
+                    <Skeleton className="message-row-skeleton-preview" />
+                  </div>)}
+                </div> : mailboxLoadError && filteredMessages.length === 0 ? (
+                  <div className="message-list-error" role="alert">
+                    <strong>{t('mailboxLoadFailed')}</strong>
+                    <span>{t('mailboxLoadFailedDescription')}</span>
+                    <Button variant="ghost" type="button" onClick={() => { void refreshMailbox() }}>{t('tryAgain')}</Button>
+                  </div>
+                ) : displayedMessages.length > 0 ? displayedMessages.map((message) => (
+                  <MailRow key={getMessageIdentity(message, activeAccountId)} message={{ ...message, messageKey: getMessageIdentity(message, activeAccountId), accountLabel: isUnifiedInbox ? accounts.find((account) => account.id === message.account_id)?.address : undefined, time: formatMessageTime(message.time, settings, i18n.language) }} selected={selectedMessageId === getMessageIdentity(message, activeAccountId)} selectionChecked={selectedMessageIds.has(getMessageIdentity(message, activeAccountId))} unreadLabel={t('unreadMail')} isStarDisabled={!isActionAvailable(message.starred ? 'unstar' : 'star', message.account_id ?? activeAccountId)} onSelect={selectMessage} onToggleSelection={toggleMessageSelection} onToggleStar={starMessage} onContextMenu={handleMailContextMenu} onKeyDown={handleMailRowKeyDown} />
+                )) : (
+                  <MailListEmptyState icon={emptyListIcon} title={emptyListCopy.title} description={emptyListCopy.description} />
+                )}
+              </div>
+              {visibleNextPageToken || hasUnifiedNextPage ? <Button className="load-more-button" variant="ghost" type="button" disabled={isLoadingMore} onClick={() => loadNextPage()}>{isLoadingMore ? t('loadingMoreMail') : t('loadMoreMail')}</Button> : null}
+            </section>
+            <section ref={mainCanvasRef} className="main-canvas" aria-label={selectedMessage ? undefined : t('mainCanvas')} aria-labelledby={selectedMessage ? 'reader-message-subject' : undefined} onScroll={handleReaderScroll}>
           {selectedMessage ? (
             <article className="mail-reader">
-              <ReaderToolbar labels={{ toolbarLabel: t('messageToolbar'), archive: activeFolder === 'trash' ? t('restore') : activeFolder === 'spam' ? t('notSpam') : t('archive'), delete: t('delete'), markUnread: t('markUnread'), reply: t('reply'), moreActions: t('moreActions'), backToMailList: t('backToMailList') }} backButtonRef={readerBackButtonRef} disabled={messageActionInFlightId === selectedMessage.id} disabledActions={{ archive: !isActionAvailable(readerArchiveAction), delete: !isActionAvailable(readerDeleteAction), markUnread: !isActionAvailable('mark_unread'), reply: !activeProviderCapabilities?.can_reply }} onBack={closeReader} onArchive={() => activeFolder === 'trash' || activeFolder === 'spam' ? restoreMessage(selectedMessage.id) : requestArchiveMessage(selectedMessage.id)} onDelete={() => requestDeleteMessage(selectedMessage.id)} onMarkUnread={() => markMessageUnread(selectedMessage.id)} onReply={openReply} />
+              <ReaderToolbar labels={{ toolbarLabel: t('messageToolbar'), archive: activeFolder === 'trash' ? t('restore') : activeFolder === 'spam' ? t('notSpam') : t('archive'), delete: t('delete'), markUnread: t('markUnread'), reply: t('reply'), backToMailList: t('backToMailList') }} backButtonRef={readerBackButtonRef} disabled={messageActionInFlightId === selectedMessageKey} disabledActions={{ archive: !isActionAvailable(readerArchiveAction, selectedMessageAccount?.id ?? activeAccountId), delete: !isActionAvailable(readerDeleteAction, selectedMessageAccount?.id ?? activeAccountId), markUnread: !isActionAvailable('mark_unread', selectedMessageAccount?.id ?? activeAccountId), reply: !selectedMessageCapabilities?.can_reply }} onBack={closeReader} onArchive={() => selectedMessageKey ? activeFolder === 'trash' || activeFolder === 'spam' ? restoreMessage(selectedMessageKey) : requestArchiveMessage(selectedMessageKey) : undefined} onDelete={() => { if (selectedMessageKey) requestDeleteMessage(selectedMessageKey) }} onMarkUnread={() => { if (selectedMessageKey) markMessageUnread(selectedMessageKey) }} onReply={openReply} />
               <header className={`reader-header ${isReaderScrolled ? 'is-compact' : ''}`}>
                 <div className="reader-title-row">
                   <h2 id="reader-message-subject" title={selectedMessageSubject}>{selectedMessageSubject}</h2>
-                  <Button className={`reader-star ${selectedMessage.starred ? 'active' : ''}`} variant="ghost" size="icon" type="button" aria-label={t('starMail')} title={t('starMail')} aria-pressed={selectedMessage.starred} disabled={!isActionAvailable(selectedMessage.starred ? 'unstar' : 'star')} onClick={() => starMessage(selectedMessage.id)}>
+                  <Button className={`reader-star ${selectedMessage.starred ? 'active' : ''}`} variant="ghost" size="icon" type="button" aria-label={t('starMail')} title={t('starMail')} aria-pressed={selectedMessage.starred} disabled={!isActionAvailable(selectedMessage.starred ? 'unstar' : 'star', selectedMessageAccount?.id ?? activeAccountId)} onClick={() => { if (selectedMessageKey) starMessage(selectedMessageKey) }}>
                     <IconStar aria-hidden="true" size={18} stroke={1.8} fill={selectedMessage.starred ? 'currentColor' : 'none'} />
                   </Button>
                 </div>
@@ -2124,21 +2805,21 @@ function App() {
                     </button>
                     {isReaderDetailsOpen ? <div className="reader-details" id="reader-details">
                       <span><small>{t('from')}</small><span dir="ltr">{selectedMessage.address}</span></span>
-                      <span><small>{t('to')}</small><span dir="ltr">{activeAccount?.address ?? ''}</span></span>
+                      <span><small>{t('to')}</small><span dir="ltr">{selectedMessageAccount?.address ?? ''}</span></span>
                     </div> : null}
                   </div>
                   <time dateTime={selectedMessage.time}>{selectedMessageTime}</time>
                 </div>
               </header>
-              <div className="reader-body" aria-busy={loadingMessageId === selectedMessage.id}>
-                {loadingMessageId === selectedMessage.id ? (
+              <div className="reader-body" aria-busy={loadingMessageId === selectedMessageKey}>
+                {loadingMessageId === selectedMessageKey ? (
                   <div className="reader-loading" role="status" aria-label={t('loadingMail')}>
                     <Skeleton className="reader-loading-line reader-loading-line-wide" />
                     <Skeleton className="reader-loading-line" />
                     <Skeleton className="reader-loading-line reader-loading-line-short" />
                   </div>
-                ) : messageLoadErrorId === selectedMessage.id ? (
-                  <div className="reader-error" role="alert"><strong>{t('messageLoadFailed')}</strong><span>{t('messageLoadFailedDescription')}</span><Button variant="ghost" type="button" onClick={() => retryMessageLoad(selectedMessage.id)}>{t('tryAgain')}</Button></div>
+                ) : messageLoadErrorId === selectedMessageKey ? (
+                  <div className="reader-error" role="alert"><strong>{t('messageLoadFailed')}</strong><span>{t('messageLoadFailedDescription')}</span><Button variant="ghost" type="button" onClick={() => { if (selectedMessageKey) retryMessageLoad(selectedMessageKey) }}>{t('tryAgain')}</Button></div>
                 ) : selectedMessage.body_html ? <MailHtml html={selectedMessage.body_html} title={t('mailContent')} fontScale={settings.readerFontScale} onLinkClick={handleReaderLinkClick} /> : selectedMessage.body ? <p className="reader-plain-text" dir="auto">{selectedMessage.body}</p> : <p className="reader-no-content">{t('messageContentUnavailable')}</p>}
                 {selectedMessage.attachments?.length ? <section className="reader-attachments" aria-labelledby="reader-attachments-title">
                   <h3 id="reader-attachments-title"><IconPaperclip aria-hidden="true" size={16} stroke={1.8} />{t('attachments')}</h3>
@@ -2150,12 +2831,14 @@ function App() {
                     </Button>)}
                   </div>
                 </section> : null}
-                {threadMessages.filter((message) => message.id !== selectedMessage.id).length > 0 ? <section className="thread-history" aria-labelledby="thread-history-title">
+                {threadMessages.filter((message) => getMessageIdentity(message, selectedMessageAccount?.id ?? activeAccountId) !== selectedMessageKey).length > 0 ? <section className="thread-history" aria-labelledby="thread-history-title">
                   <div className="thread-history-heading"><h3 id="thread-history-title">{t('conversation')}</h3><span>{t('threadMessageCount', { count: threadMessages.length })}</span></div>
-                  {threadMessages.filter((message) => message.id !== selectedMessage.id).map((message) => {
-                    return <ThreadMessageCard key={message.id} sender={message.sender} address={message.address} avatarUrl={message.avatar_url} time={formatMessageTime(message.time, settings, i18n.language)} dateTime={message.time} recipient={activeAccount?.address ?? ''} attachments={message.attachments ?? []} downloadingAttachmentId={downloadingAttachmentId} unread={message.unread} starred={message.starred} archiveLabel={activeFolder === 'spam' ? t('notSpam') : activeFolder === 'trash' ? t('restore') : t('archive')} body={message.body} bodyHtml={message.body_html} fontScale={settings.readerFontScale} onLinkClick={handleReaderLinkClick} onDownloadAttachment={(attachment) => downloadAttachment(attachment, message.id)} onToggleStar={() => starMessage(message.id)} onToggleRead={() => { if (message.unread) markMessageRead(message.id); else markMessageUnread(message.id) }} onArchive={() => activeFolder === 'spam' || activeFolder === 'trash' ? restoreMessage(message.id) : requestArchiveMessage(message.id)} onDelete={() => requestDeleteMessage(message.id)} disabledActions={{ star: !isActionAvailable(message.starred ? 'unstar' : 'star'), markRead: !isActionAvailable(message.unread ? 'mark_read' : 'mark_unread'), archive: !isActionAvailable(readerArchiveAction), delete: !isActionAvailable(readerDeleteAction), reply: !activeProviderCapabilities?.can_reply }} onReply={() => {
-                      setSelectedMessageId(message.id)
-                      loadedThreadIdRef.current = message.thread_id ?? null
+                  {threadMessages.filter((message) => getMessageIdentity(message, selectedMessageAccount?.id ?? activeAccountId) !== selectedMessageKey).map((message) => {
+                    const messageKey = getMessageIdentity(message, selectedMessageAccount?.id ?? activeAccountId)
+                    return <ThreadMessageCard key={messageKey} sender={message.sender} address={message.address} avatarUrl={message.avatar_url} time={formatMessageTime(message.time, settings, i18n.language)} dateTime={message.time} recipient={selectedMessageAccount?.address ?? ''} attachments={message.attachments ?? []} downloadingAttachmentId={downloadingAttachmentId} unread={message.unread} starred={message.starred} archiveLabel={activeFolder === 'spam' ? t('notSpam') : activeFolder === 'trash' ? t('restore') : t('archive')} body={message.body} bodyHtml={message.body_html} fontScale={settings.readerFontScale} onLinkClick={handleReaderLinkClick} onDownloadAttachment={(attachment) => downloadAttachment(attachment, messageKey)} onToggleStar={() => starMessage(messageKey)} onToggleRead={() => { if (message.unread) markMessageRead(messageKey); else markMessageUnread(messageKey) }} onArchive={() => activeFolder === 'spam' || activeFolder === 'trash' ? restoreMessage(messageKey) : requestArchiveMessage(messageKey)} onDelete={() => requestDeleteMessage(messageKey)} disabledActions={{ star: !isActionAvailable(message.starred ? 'unstar' : 'star', message.account_id ?? selectedMessageAccount?.id ?? activeAccountId), markRead: !isActionAvailable(message.unread ? 'mark_read' : 'mark_unread', message.account_id ?? selectedMessageAccount?.id ?? activeAccountId), archive: !isActionAvailable(readerArchiveAction, message.account_id ?? selectedMessageAccount?.id ?? activeAccountId), delete: !isActionAvailable(readerDeleteAction, message.account_id ?? selectedMessageAccount?.id ?? activeAccountId), reply: !providerCapabilitiesByAccount[message.account_id ?? selectedMessageAccount?.id ?? activeAccountId]?.can_reply }} onReply={() => {
+                      setSelectedMessageId(messageKey)
+                      const messageAccountId = message.account_id ?? selectedMessageAccount?.id ?? activeAccountId
+                      loadedThreadIdRef.current = message.thread_id && messageAccountId ? `${messageAccountId}:${message.thread_id}` : null
                       setIsReaderDetailsOpen(false)
                       setIsReplying(true)
                       setReplyDraft('')
@@ -2178,8 +2861,10 @@ function App() {
           ) : (
             <EmptyState icon={accounts.length === 0 ? 'account' : 'mail'} title={accounts.length === 0 ? t('connectAccount') : t('noMailSelected')} description={accounts.length === 0 ? t('connectAccountDescription') : t('noMailSelectedDescription')} actionLabel={accounts.length === 0 ? t('addAccount') : undefined} actionHasPopup={accounts.length === 0 ? 'dialog' : undefined} onAction={accounts.length === 0 ? () => { setOpenAddAccount(true); setActiveView('settings') } : undefined} />
           )}
-        </section>
-        {activeView === 'settings' ? <section className="settings-page" aria-labelledby="settings-title"><Suspense fallback={<div className="settings-loading" role="status">{t('loadingMailbox')}</div>}><SettingsPanel settings={settings} onChange={updateSetting} accounts={accounts} providerLogos={providerLogos} defaultAccountId={defaultAccountId} onSetDefault={setDefaultAccount} onRemoveAccount={removeAccount} onStartAuth={startAuth} onError={(error: unknown) => setToastMessage(getDisplayError(error))} onBackToMail={() => { setOpenAddAccount(false); setActiveView('mail'); clearSearch(); window.requestAnimationFrame(() => settingsButtonRef.current?.focus()) }} isAddAccountOpen={openAddAccount} onAddAccountOpenChange={setOpenAddAccount} /></Suspense></section> : null}
+            </section>
+          </div>
+        </div> : null}
+        {activeView === 'settings' ? <section className="settings-page" aria-labelledby="settings-title"><Suspense fallback={<div className="settings-loading" role="status">{t('loadingMailbox')}</div>}><SettingsPanel settings={settings} onChange={updateSetting} accounts={accounts} providerLogos={providerLogos} defaultAccountId={defaultAccountId} onSetDefault={setDefaultAccount} onRemoveAccount={removeAccount} onStartAuth={startAuth} onError={(error: unknown) => setToastMessage(getDisplayError(error))} onBackToMail={() => { setOpenAddAccount(false); setActiveView('mail'); clearSearch(); window.requestAnimationFrame(() => settingsButtonRef.current?.focus()) }} isAddAccountOpen={openAddAccount} onAddAccountOpenChange={setOpenAddAccount} isAccountMutationInFlight={isAccountMutationInFlight} /></Suspense></section> : null}
       </section>
       {isComposing ? <section className="compose-page" aria-labelledby="compose-title">
         <header className="compose-page-header">
@@ -2189,12 +2874,12 @@ function App() {
             <Button variant="ghost" size="icon" type="button" aria-label={t('drafts')} title={t('drafts')} aria-expanded={isDraftsPanelOpen} onClick={() => { setIsDraftsPanelOpen((current) => !current); refreshComposeDrafts() }} disabled={isSendingMessage}><IconFileText aria-hidden="true" size={17} stroke={1.8} /></Button>
             {isDraftsPanelOpen ? <DraftsPanel drafts={composeDrafts} currentDraftId={composeDraftId} canSave={[composeRecipient, composeCc, composeBcc, composeSubject, composeBody].some((value) => value.trim().length > 0) || composeAttachments.length > 0} isSaving={draftStatus === 'saving'} isLoading={isLoadingDrafts} formatTime={(value) => formatMessageTime(value, settings, i18n.language)} title={t('drafts')} savingLabel={t('draftSaving')} loadingLabel={t('draftLoading')} saveLabel={t('saveDraft')} emptyLabel={t('noDrafts')} untitledLabel={t('untitledDraft')} noRecipientsLabel={t('noRecipients')} deleteLabel={t('deleteDraft')} onSave={() => { void saveCurrentComposeDraft() }} onSelect={(draft) => { void selectComposeDraft(draft) }} onDelete={(draft) => { void deleteComposeDraft(draft) }} /> : null}
           </div>
-          <Button variant="ghost" size="icon" type="button" aria-label={t('closeDialog')} title={t('closeDialog')} onClick={closeComposer} disabled={isSendingMessage}><IconX aria-hidden="true" size={18} stroke={1.8} /></Button>
+          <Button variant="ghost" size="icon" type="button" aria-label={t('closeDialog')} title={t('closeDialog')} onClick={closeComposer} disabled={isSendingMessage || draftStatus === 'saving'}><IconX aria-hidden="true" size={18} stroke={1.8} /></Button>
         </header>
-        <ComposeForm recipient={composeRecipient} cc={composeCc} bcc={composeBcc} subject={composeSubject} body={composeBody} bodyHtml={composeBodyHtml} attachments={composeAttachments} attachmentLimits={activeAttachmentLimits} isSending={isSendingMessage} savedRecipients={savedRecipients} onSaveRecipient={saveComposeRecipient} onRecipientChange={updateComposeRecipient} onCcChange={updateComposeCc} onBccChange={updateComposeBcc} onSubjectChange={updateComposeSubject} onBodyChange={updateComposeBody} onBodyHtmlChange={(value) => { setComposeBodyHtml(value); setDraftStatus('idle') }} onAttachmentsChange={(attachments) => { setComposeAttachments(attachments); setDraftStatus('idle') }} onCancel={closeComposer} onSubmit={submitMessage} />
+        <ComposeForm senderAddress={composeAccount?.address ?? ''} recipient={composeRecipient} cc={composeCc} bcc={composeBcc} subject={composeSubject} body={composeBody} bodyHtml={composeBodyHtml} attachments={composeAttachments} attachmentLimits={composeAttachmentLimits} isSending={isSendingMessage} isDraftSaving={draftStatus === 'saving'} savedRecipients={savedRecipients} onSaveRecipient={saveComposeRecipient} onRecipientChange={updateComposeRecipient} onCcChange={updateComposeCc} onBccChange={updateComposeBcc} onSubjectChange={updateComposeSubject} onBodyChange={updateComposeBody} onBodyHtmlChange={updateComposeBodyHtml} onAttachmentsChange={updateComposeAttachments} onCancel={closeComposer} onSubmit={submitMessage} />
       </section> : null}
       {activeView === 'mail' && activeAccount && activeProviderCapabilities?.can_send && !isComposing ? <Button className="floating-compose-button" size="icon" type="button" aria-label={t('compose')} title={t('compose')} onClick={() => { void openComposer() }}><IconPencil aria-hidden="true" size={19} stroke={1.8} /></Button> : null}
-       {contextMenu ? <MailContextMenu x={contextMenu.x} y={contextMenu.y} menuLabel={t('mailActions')} disabled={messageActionInFlightId !== null} disabledActions={{ markUnread: !isActionAvailable((selectableMessages.find((message) => message.id === contextMenu.messageId)?.unread ?? false) ? 'mark_read' : 'mark_unread'), star: !isActionAvailable((selectableMessages.find((message) => message.id === contextMenu.messageId)?.starred ?? false) ? 'unstar' : 'star'), spam: !isActionAvailable('spam'), archive: !isActionAvailable(readerArchiveAction), delete: !isActionAvailable(readerDeleteAction) }} showSpam={activeFolder !== 'spam' && activeFolder !== 'trash'} returnFocusElement={contextMenu.returnFocusElement} labels={{ markUnread: (selectableMessages.find((message) => message.id === contextMenu.messageId)?.unread ?? false) ? t('markRead') : t('markUnread'), star: t('starMail'), archive: activeFolder === 'trash' ? t('restore') : activeFolder === 'spam' ? t('notSpam') : t('archive'), delete: t('delete'), reportSpam: t('reportSpam') }} onClose={() => setContextMenu(null)} onMarkUnread={() => { const message = selectableMessages.find((item) => item.id === contextMenu.messageId); if (message?.unread) markMessageReadFromContext(contextMenu.messageId); else markMessageUnread(contextMenu.messageId) }} onStar={() => starMessage(contextMenu.messageId)} onSpam={() => moveMessageToSpam(contextMenu.messageId)} onArchive={() => activeFolder === 'trash' || activeFolder === 'spam' ? restoreMessage(contextMenu.messageId) : requestArchiveMessage(contextMenu.messageId)} onDelete={() => requestDeleteMessage(contextMenu.messageId)} /> : null}
+       {contextMenu ? <MailContextMenu x={contextMenu.x} y={contextMenu.y} menuLabel={t('mailActions')} disabled={messageActionInFlightId !== null} disabledActions={{ markUnread: !isActionAvailable((contextMessage?.unread ?? false) ? 'mark_read' : 'mark_unread', contextMessage?.account_id ?? activeAccountId), star: !isActionAvailable((contextMessage?.starred ?? false) ? 'unstar' : 'star', contextMessage?.account_id ?? activeAccountId), spam: !isActionAvailable('spam', contextMessage?.account_id ?? activeAccountId), archive: !isActionAvailable(readerArchiveAction, contextMessage?.account_id ?? activeAccountId), delete: !isActionAvailable(readerDeleteAction, contextMessage?.account_id ?? activeAccountId) }} showSpam={activeFolder !== 'spam' && activeFolder !== 'trash'} returnFocusElement={contextMenu.returnFocusElement} labels={{ markUnread: (contextMessage?.unread ?? false) ? t('markRead') : t('markUnread'), star: t('starMail'), archive: activeFolder === 'trash' ? t('restore') : activeFolder === 'spam' ? t('notSpam') : t('archive'), delete: t('delete'), reportSpam: t('reportSpam') }} onClose={() => setContextMenu(null)} onMarkUnread={() => { if (contextMessage?.unread) markMessageReadFromContext(contextMenu.messageId); else markMessageUnread(contextMenu.messageId) }} onStar={() => starMessage(contextMenu.messageId)} onSpam={() => moveMessageToSpam(contextMenu.messageId)} onArchive={() => activeFolder === 'trash' || activeFolder === 'spam' ? restoreMessage(contextMenu.messageId) : requestArchiveMessage(contextMenu.messageId)} onDelete={() => requestDeleteMessage(contextMenu.messageId)} /> : null}
       <Dialog open={pendingArchiveId !== null} title={t('confirmArchiveTitle')} closeLabel={t('closeDialog')} onClose={cancelArchiveMessage}>
         <div className="confirm-dialog-content"><p>{t('confirmArchiveDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" onClick={cancelArchiveMessage}>{t('cancel')}</Button><Button onClick={confirmArchiveMessage}>{t('archive')}</Button></div></div>
       </Dialog>
@@ -2203,6 +2888,9 @@ function App() {
       </Dialog>
       <Dialog open={pendingPermanentDeleteId !== null} title={t('confirmPermanentDeleteTitle')} closeLabel={t('closeDialog')} onClose={cancelPermanentDeleteMessage}>
         <div className="confirm-dialog-content"><p>{t('confirmPermanentDeleteDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" onClick={cancelPermanentDeleteMessage}>{t('cancel')}</Button><Button variant="danger" onClick={() => { if (pendingPermanentDeleteId) permanentlyDeleteMessage(pendingPermanentDeleteId) }}>{t('delete')}</Button></div></div>
+      </Dialog>
+      <Dialog open={isComposeCloseConfirmationOpen} title={t('closeComposerTitle')} closeLabel={t('closeDialog')} onClose={cancelComposeCloseConfirmation}>
+        <div className="confirm-dialog-content"><p>{t('closeComposerDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" type="button" onClick={cancelComposeCloseConfirmation}>{t('cancel')}</Button><Button variant="danger" type="button" disabled={isSendingMessage || draftStatus === 'saving'} onClick={() => { void discardComposer() }}>{t('discardDraft')}</Button><Button type="button" disabled={draftStatus === 'saving'} onClick={() => { void saveAndCloseComposer() }}>{t('saveDraft')}</Button></div></div>
       </Dialog>
       <Dialog open={isCloseConfirmationOpen} title={t('confirmCloseTitle')} closeLabel={t('closeDialog')} onClose={() => setIsCloseConfirmationOpen(false)}>
         <div className="confirm-dialog-content"><p>{t('confirmCloseDescription')}</p><div className="confirm-dialog-actions"><Button variant="ghost" type="button" onClick={() => setIsCloseConfirmationOpen(false)}>{t('cancel')}</Button><Button type="button" onClick={minimizeWindowToTray}><IconMinus aria-hidden="true" size={15} stroke={1.8} />{t('minimizeToTrayNow')}</Button><Button variant="danger" type="button" onClick={confirmWindowClose}>{t('close')}</Button></div></div>

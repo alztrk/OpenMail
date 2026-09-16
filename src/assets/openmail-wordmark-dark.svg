@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="96" viewBox="0 0 300 96" fill="none" role="img" aria-labelledby="openmail-title openmail-description">
+  <title id="openmail-title">OpenMail</title>
+  <desc id="openmail-description">Open, a mail envelope shaped like the letter M, and ail.</desc>
+
+  <text x="0" y="67" fill="#F2F7F3" font-family="Bahnschrift, 'Segoe UI Variable', 'Segoe UI', sans-serif" font-size="58" font-weight="600" letter-spacing="-1.8">Open</text>
+
+  <g transform="translate(126 15) scale(2.75)" fill="none" stroke="#9AD5A3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
+    <path d="m3 7 9 6 9-6" />
+  </g>
+
+  <text x="193" y="67" fill="#F2F7F3" font-family="Bahnschrift, 'Segoe UI Variable', 'Segoe UI', sans-serif" font-size="58" font-weight="600" letter-spacing="-1.8">ail</text>
+</svg>

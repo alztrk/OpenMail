@@ -1,4 +1,4 @@
-import { IconArchive, IconArrowLeft, IconDots, IconMail, IconMessageReply, IconTrash } from '@tabler/icons-react'
+import { IconArchive, IconArrowLeft, IconMail, IconMessageReply, IconTrash } from '@tabler/icons-react'
 import type { Ref } from 'react'
 import { Button } from '@/components/ui/button'
 
@@ -9,7 +9,6 @@ type ReaderToolbarProps = {
     delete: string
     markUnread: string
     reply: string
-    moreActions: string
     backToMailList: string
   }
   onBack: () => void
@@ -36,7 +35,6 @@ export function ReaderToolbar({ labels, onBack, onArchive, onDelete, onMarkUnrea
       <Button className="reader-tool mark-unread-tool" variant="ghost" aria-label={labels.markUnread} title={labels.markUnread} disabled={disabled || disabledActions.markUnread} onClick={onMarkUnread}><IconMail className="reader-tool-icon" aria-hidden="true" size={16} stroke={1.8} /><span className="reader-tool-label">{labels.markUnread}</span></Button>
       <span className="reader-toolbar-spacer" />
       <Button className="reader-tool" variant="ghost" aria-label={labels.reply} title={labels.reply} disabled={disabled || disabledActions.reply} onClick={onReply}><IconMessageReply className="reader-tool-icon" aria-hidden="true" size={16} stroke={1.8} /><span className="reader-tool-label">{labels.reply}</span></Button>
-      <Button className="reader-tool icon-only" variant="ghost" size="icon" aria-label={labels.moreActions} title={labels.moreActions} disabled><IconDots className="reader-tool-icon" aria-hidden="true" size={16} stroke={1.8} /></Button>
     </nav>
   )
 }
