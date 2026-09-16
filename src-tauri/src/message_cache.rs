@@ -81,7 +81,7 @@ pub fn search_cached_messages(
 ) -> Result<MessagePage, String> {
     let query = query.trim().to_lowercase();
     if query.len() < 2 {
-        return Err("Search query is too short".to_string());
+        return Err("OPENMAIL_SEARCH_QUERY_TOO_SHORT".to_string());
     }
 
     with_cache_lock(data_dir, || {

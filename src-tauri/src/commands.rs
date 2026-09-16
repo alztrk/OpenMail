@@ -34,14 +34,85 @@ impl AppState {
         Self {
             app_data_dir,
             auth_state: Arc::new(Mutex::new(AuthState::default())),
+            account_operation_lock: Arc::new(Mutex::new(())),
+            account_operation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+fn account_operation_lock(
+    state: &AppState,
+    account_id: &str,
+) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    state
+        .account_operation_locks
+        .lock()
+        .map_err(|_| "The account operation lock registry is poisoned".to_string())
+        .map(|mut locks| {
+            locks
+                .entry(account_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        })
+}
+
+fn lock_account_operations(state: &AppState) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    state
+        .account_operation_lock
+        .lock()
+        .map_err(|_| "The account operation lock is poisoned".to_string())
+}
+
+fn ensure_account_exists(data_dir: &std::path::Path, account_id: &str) -> Result<(), String> {
+    if account_store::load_accounts(data_dir)?
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        Ok(())
+    } else {
+        Err("The selected mail account was removed during this operation".to_string())
+    }
+}
+
+fn normalize_search_query(query: &str) -> Result<String, String> {
+    let normalized = query.trim();
+    if normalized.chars().count() < 2 {
+        return Err("OPENMAIL_SEARCH_QUERY_TOO_SHORT".to_string());
+    }
+    Ok(normalized.to_string())
+}
+
+fn rollback_account_removal(
+    data_dir: &std::path::Path,
+    accounts: &[MailAccount],
+    account_id: &str,
+    previous_refresh_token: Option<&str>,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = account_store::save_accounts(data_dir, accounts) {
+        errors.push(format!("account metadata restore failed: {error}"));
+    }
+    if let Err(error) = secure_store::restore_refresh_token(account_id, previous_refresh_token) {
+        errors.push(format!("refresh token restore failed: {error}"));
+    }
+    if let Err(error) = account_store::remove_backup(data_dir) {
+        errors.push(format!("account backup cleanup failed: {error}"));
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 #[tauri::command]
 pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<MailAccount>, String> {
     log::debug!("Loading local mail accounts");
     account_store::load_accounts(&state.app_data_dir)
+}
+
+fn account_address(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
+    account_store::load_accounts(data_dir)?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.address)
+        .ok_or_else(|| "The selected mail account does not exist".to_string())
 }
 
 #[tauri::command]
@@ -417,13 +488,17 @@ pub async fn modify_message(
     action: MessageAction,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     if !provider::supports_message_action(adapter.capabilities(), action) {
-        return Err("The selected provider does not support this message action".to_string());
+        return Err("OPENMAIL_PROVIDER_ACTION_UNSUPPORTED".to_string());
     }
     adapter
         .modify_message(&account_id, &message_id, action)
         .await?;
+    let _operation_guard = lock_account_operations(&state)?;
+    ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::apply_message_action(&state.app_data_dir, &account_id, &message_id, action)
 }
 

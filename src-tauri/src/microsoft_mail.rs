@@ -437,9 +437,10 @@ pub async fn get_draft(account_id: &str, draft_id: &str) -> Result<MailDraft, St
 
 pub async fn save_draft(request: DraftRequest<'_>) -> Result<MailDraft, String> {
     if !is_valid_email_address(request.sender) {
-        return Err("The draft sender is invalid".to_string());
+        return Err("OPENMAIL_DRAFT_SENDER_INVALID".to_string());
     }
-    let message = build_draft_message(&request)?;
+    validate_outgoing_attachments(request.attachments)?;
+    let message = build_message(&request)?;
     let client = shared_http_client()?;
     let response = match request.draft_id.filter(|value| !value.trim().is_empty()) {
         Some(draft_id) => {
@@ -628,36 +629,13 @@ pub async fn send_message(request: SendRequest<'_>) -> Result<String, String> {
     let cc_recipients = parse_recipients_optional(request.cc)?;
     let bcc_recipients = parse_recipients_optional(request.bcc)?;
     if !is_valid_email_address(request.sender) {
-        return Err("The message sender is invalid".to_string());
+        return Err("OPENMAIL_MESSAGE_SENDER_INVALID".to_string());
     }
-    let graph_attachments = request
-        .attachments
+    let attachment_sizes = validate_outgoing_attachments(request.attachments)?;
+    let use_staged_attachments = attachment_sizes
         .iter()
-        .map(|attachment| {
-            STANDARD
-                .decode(&attachment.data_base64)
-                .map_err(|error| {
-                    format!(
-                        "Attachment {} contains invalid base64 data: {error}",
-                        attachment.filename
-                    )
-                })
-                .and_then(|bytes| {
-                    if bytes.len() >= MAX_GRAPH_DIRECT_ATTACHMENT_BYTES {
-                        return Err(format!(
-                            "The Outlook attachment {} must be under 3 MB",
-                            attachment.filename
-                        ));
-                    }
-                    Ok(json!({
-                        "@odata.type": "#microsoft.graph.fileAttachment",
-                        "name": &attachment.filename,
-                        "contentType": &attachment.mime_type,
-                        "contentBytes": STANDARD.encode(bytes),
-                    }))
-                })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .any(|size| *size >= MAX_GRAPH_DIRECT_ATTACHMENT_BYTES)
+        || attachment_sizes.iter().sum::<usize>() >= MAX_GRAPH_DIRECT_ATTACHMENT_BYTES;
     let mut message = json!({
             "subject": request.subject,
             "body": {
@@ -1235,7 +1213,7 @@ fn to_mail_message(message: GraphMessage) -> MailMessage {
 fn parse_recipients(value: &str) -> Result<Vec<serde_json::Value>, String> {
     let recipients = parse_recipients_optional(value)?;
     if recipients.is_empty() {
-        return Err("The message recipient is invalid".to_string());
+        return Err("OPENMAIL_MESSAGE_RECIPIENT_INVALID".to_string());
     }
     Ok(recipients)
 }
@@ -1247,7 +1225,7 @@ fn parse_recipients_optional(value: &str) -> Result<Vec<serde_json::Value>, Stri
         .filter(|recipient| !recipient.is_empty())
         .map(|address| {
             if !is_valid_email_address(address) {
-                return Err(format!("The message recipient is invalid: {address}"));
+                return Err(format!("OPENMAIL_MESSAGE_RECIPIENT_INVALID: {address}"));
             }
             Ok(json!({ "emailAddress": { "address": address } }))
         })

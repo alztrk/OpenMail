@@ -730,7 +730,7 @@ pub async fn get_draft(account_id: &str, draft_id: &str) -> Result<MailDraft, St
 
 pub async fn save_draft(request: DraftRequest<'_>) -> Result<MailDraft, String> {
     if !is_valid_email_address(request.sender) {
-        return Err("The draft sender is invalid".to_string());
+        return Err("OPENMAIL_DRAFT_SENDER_INVALID".to_string());
     }
     let raw_message = build_draft_raw_message(&request)?;
     let refresh_token = secure_store::load_refresh_token(request.account_id)?
@@ -924,18 +924,20 @@ fn collect_draft_attachments_into(part: &MessagePart, result: &mut Vec<DraftAtta
 
 fn build_draft_raw_message(request: &DraftRequest<'_>) -> Result<String, String> {
     validate_attachment_size(request.attachments)?;
+    if !is_valid_email_address(request.sender) {
+        return Err("OPENMAIL_DRAFT_SENDER_INVALID".to_string());
+    }
     let recipients = request
         .recipient
         .split([',', ';'])
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    if recipients.is_empty()
-        || recipients
-            .iter()
-            .any(|value| !is_valid_email_address(value))
+    if recipients
+        .iter()
+        .any(|value| !is_valid_email_address(value))
     {
-        return Err("The draft recipient is invalid".to_string());
+        return Err("OPENMAIL_DRAFT_RECIPIENT_INVALID".to_string());
     }
     let copies = request
         .cc
@@ -1087,10 +1089,10 @@ async fn send_message_with_thread(
             .iter()
             .any(|value| !is_valid_email_address(value))
     {
-        return Err("The reply recipient is invalid".to_string());
+        return Err("OPENMAIL_REPLY_RECIPIENT_INVALID".to_string());
     }
     if !is_valid_email_address(sender) {
-        return Err("The reply sender is invalid".to_string());
+        return Err("OPENMAIL_REPLY_SENDER_INVALID".to_string());
     }
     let normalized_recipients = to_recipients.join(", ");
     let copy_recipients = recipients
@@ -1110,7 +1112,7 @@ async fn send_message_with_thread(
         .chain(blind_copy_recipients.iter())
         .any(|value| !is_valid_email_address(value))
     {
-        return Err("The copy recipient is invalid".to_string());
+        return Err("OPENMAIL_REPLY_COPY_RECIPIENT_INVALID".to_string());
     }
     let copy_header = if copy_recipients.is_empty() {
         String::new()

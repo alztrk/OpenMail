@@ -397,19 +397,47 @@ function App() {
   const { t, i18n } = useTranslation()
   const getDisplayError = useCallback((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
+    if (message.startsWith('Google authorization failed:')) return t('gmailAuthFailed')
+    if (message === 'OAuth callback timed out') return t('gmailAuthTimedOut')
+    if (message.startsWith('Microsoft authorization failed:')) return t('outlookAuthFailed')
+    if (message === 'Microsoft OAuth callback timed out') return t('outlookAuthTimedOut')
     if (message.startsWith('AUTH_REQUIRED:')) return t('gmailReauthorizationRequired')
     if (message.startsWith('GMAIL_CLIENT_CONFIG:')) return t('gmailClientConfigurationRequired')
+    if (message.includes('selected Gmail account has no stored refresh token')) return t('gmailReauthorizationRequired')
     if (message.startsWith('GMAIL_PERMISSION_REQUIRED:')) return t('gmailPermissionRequired')
+    if (message.startsWith('GMAIL_HISTORY_UNAVAILABLE:')) return t('gmailSyncIncomplete')
     if (message.startsWith('GMAIL_SYNC_INCOMPLETE:')) return t('gmailSyncIncomplete')
     if (message.startsWith('GMAIL_DRAFTS_INCOMPLETE:')) return t('gmailDraftsIncomplete')
+    if (message.startsWith('GMAIL_SEND_STATUS_UNKNOWN:')) return t('gmailSendStatusUnknown')
     if (message.startsWith('GMAIL_RATE_LIMITED:')) return t('gmailRateLimited')
     if (message.startsWith('OUTLOOK_REAUTH_REQUIRED:')) return t('outlookReauthorizationRequired')
+    if (message.startsWith('OUTLOOK_CLIENT_CONFIG:')) return t('outlookClientConfigurationRequired')
     if (message.startsWith('OUTLOOK_PERMISSION_REQUIRED:')) return t('outlookPermissionRequired')
+    if (message.startsWith('OUTLOOK_DELTA_CURSOR_INVALID:')) return t('outlookSyncIncomplete')
     if (message.startsWith('OUTLOOK_SYNC_INCOMPLETE:')) return t('outlookSyncIncomplete')
+    if (message.startsWith('OUTLOOK_THREAD_INCOMPLETE:')) return t('outlookThreadIncomplete')
+    if (message.startsWith('OUTLOOK_DRAFTS_INCOMPLETE:')) return t('outlookDraftsIncomplete')
+    if (message.startsWith('OUTLOOK_DRAFT_ATTACHMENTS_INCOMPLETE:')) return t('outlookDraftAttachmentsIncomplete')
     if (message.startsWith('OUTLOOK_RATE_LIMITED:')) return t('outlookRateLimited')
     if (message.startsWith('OUTLOOK_TEMPORARY_ERROR:')) return t('outlookTemporaryError')
+    if (message.startsWith('OUTLOOK_ATTACHMENT_TOO_LARGE:')) return t('outlookAttachmentTooLarge')
+    if (message.startsWith('OUTLOOK_ATTACHMENTS_TOO_LARGE_TOTAL:')) return t('outlookAttachmentsTooLargeTotal')
+    if (message.startsWith('OUTLOOK_ATTACHMENT_UPLOAD_EXPIRED:')) return t('outlookAttachmentUploadExpired')
+    if (message === 'OPENMAIL_SEARCH_QUERY_TOO_SHORT' || message === 'Search query is too short') return t('searchQueryTooShort')
+    if (message === 'OPENMAIL_PROVIDER_ACTION_UNSUPPORTED' || message === 'The selected provider does not support this message action') return t('providerActionUnsupported')
+    if (message === 'OPENMAIL_DRAFT_SENDER_INVALID' || message === 'The draft sender is invalid') return t('invalidDraftSender')
+    if (message === 'OPENMAIL_DRAFT_RECIPIENT_INVALID' || message === 'The draft recipient is invalid') return t('invalidDraftRecipient')
+    if (message === 'OPENMAIL_DRAFT_COPY_RECIPIENT_INVALID' || message === 'The draft copy recipient is invalid') return t('invalidDraftCopyRecipient')
+    if (message === 'OPENMAIL_REPLY_RECIPIENT_INVALID' || message === 'The reply recipient is invalid') return t('invalidReplyRecipient')
+    if (message === 'OPENMAIL_REPLY_SENDER_INVALID' || message === 'The reply sender is invalid') return t('invalidReplySender')
+    if (message === 'OPENMAIL_REPLY_COPY_RECIPIENT_INVALID' || message === 'The copy recipient is invalid') return t('invalidReplyCopyRecipient')
+    if (message.startsWith('OPENMAIL_MESSAGE_RECIPIENT_INVALID') || message.startsWith('The message recipient is invalid')) return t('invalidMessageRecipient')
+    if (message === 'OPENMAIL_MESSAGE_SENDER_INVALID' || message === 'The message sender is invalid') return t('invalidMessageSender')
+    if (message.includes('cache encryption key') || message.includes('local cache')) return t('localDataUnavailable')
+    if (message.startsWith('Gmail ') || message.startsWith('Gmail token refresh failed')) return t('gmailRequestFailed')
+    if (message.startsWith('Microsoft Graph ') || message.startsWith('Microsoft OAuth')) return t('outlookRequestFailed')
     if (message === 'EMPTY_CONVERSATION') return t('emptyConversation')
-    return message
+    return t('unexpectedError')
   }, [t])
   const [accounts, setAccounts] = useState<MailAccount[]>([])
   const [accountSyncStatus, setAccountSyncStatus] = useState<Record<string, AccountSyncStatus>>({})
@@ -2117,7 +2145,7 @@ function App() {
                   <div className="attachment-list">
                     {selectedMessage.attachments.map((attachment) => <Button key={attachment.id} className="attachment-button" variant="ghost" type="button" disabled={downloadingAttachmentId !== null} onClick={() => downloadAttachment(attachment)}>
                       <span className="attachment-name"><IconPaperclip aria-hidden="true" size={15} stroke={1.8} /><span>{attachment.filename}</span></span>
-                      <span className="attachment-size">{formatFileSize(attachment.size)}</span>
+                      <span className="attachment-size">{formatFileSize(attachment.size, i18n.language)}</span>
                       <IconDownload aria-hidden="true" size={15} stroke={1.8} />
                     </Button>)}
                   </div>

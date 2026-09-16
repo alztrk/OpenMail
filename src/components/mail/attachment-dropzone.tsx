@@ -1,6 +1,7 @@
 import { IconPaperclip, IconX } from '@tabler/icons-react'
 import { useRef, useState, type DragEvent, type ChangeEvent } from 'react'
 import { useTranslation } from 'react-i18next'
+import { formatFileSize } from '@/lib/formatters'
 
 export type ComposeAttachment = {
   id: string
@@ -82,22 +83,22 @@ export function AttachmentDropzone({ attachments, onChange, disabled, maxFileSiz
   const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault()
     setIsDragging(false)
-    if (!disabled && event.dataTransfer.files.length > 0) void addFiles(event.dataTransfer.files)
+    if (!disabled && !isReading && event.dataTransfer.files.length > 0) void addFiles(event.dataTransfer.files)
   }
 
   return (
     <div className="compose-attachments">
-      <label className={`compose-attachment-dropzone${isDragging ? ' is-dragging' : ''}${disabled ? ' is-disabled' : ''}`} htmlFor="compose-attachments-input" onDragEnter={(event) => { event.preventDefault(); if (!disabled) setIsDragging(true) }} onDragOver={(event) => { event.preventDefault(); if (!disabled) setIsDragging(true) }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}>
+      <label className={`compose-attachment-dropzone${isDragging ? ' is-dragging' : ''}${disabled || isReading ? ' is-disabled' : ''}`} htmlFor="compose-attachments-input" aria-busy={isReading} onDragEnter={(event) => { event.preventDefault(); if (!disabled && !isReading) setIsDragging(true) }} onDragOver={(event) => { event.preventDefault(); if (!disabled && !isReading) setIsDragging(true) }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}>
         <IconPaperclip aria-hidden="true" size={16} stroke={1.8} />
-        <span>{t('dropAttachments')}</span>
+        <span>{isReading ? t('readingAttachments') : t('dropAttachments')}</span>
         <span className="compose-attachment-browse">{t('chooseFiles')}</span>
-        <input ref={inputRef} id="compose-attachments-input" type="file" multiple disabled={disabled} onChange={handleFileChange} />
+        <input ref={inputRef} id="compose-attachments-input" type="file" multiple disabled={disabled || isReading} onChange={handleFileChange} />
       </label>
       {attachments.length > 0 ? <ul className="compose-attachment-list" aria-label={t('attachments')}>
         {attachments.map(({ id, filename, size }) => <li className="compose-attachment-item" key={id}>
           <span className="compose-attachment-icon"><IconPaperclip aria-hidden="true" size={15} stroke={1.8} /></span>
-          <span className="compose-attachment-info"><span className="compose-attachment-name" title={filename}>{filename}</span><span className="compose-attachment-size">{formatFileSize(size)}</span></span>
-          <button type="button" className="compose-attachment-remove" aria-label={`${t('removeAttachment')}: ${filename}`} title={t('removeAttachment')} disabled={disabled} onClick={() => onChange(attachments.filter((attachment) => attachment.id !== id))}><IconX aria-hidden="true" size={15} stroke={1.8} /></button>
+          <span className="compose-attachment-info"><span className="compose-attachment-name" title={filename}>{filename}</span><span className="compose-attachment-size">{formatFileSize(size, i18n.language)}</span></span>
+          <button type="button" className="compose-attachment-remove" aria-label={`${t('removeAttachment')}: ${filename}`} title={t('removeAttachment')} disabled={disabled || isReading} onClick={() => onChange(attachments.filter((attachment) => attachment.id !== id))}><IconX aria-hidden="true" size={15} stroke={1.8} /></button>
         </li>)}
       </ul> : null}
       {error ? <p className="compose-attachment-error" role="alert">{error}</p> : null}
