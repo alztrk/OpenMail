@@ -65,20 +65,8 @@ jobs:
                 windows = @{ installMode = 'passive' }
               }
             }
-            bundle = @{
-              externalBin = @('binaries/openmail-mcp')
-            }
           } | ConvertTo-Json -Depth 10
           Set-Content -LiteralPath 'src-tauri/tauri.release.conf.json' -Value $config -Encoding utf8
-
-      - name: Build MCP sidecar
-        shell: pwsh
-        run: |
-          cargo build --release --manifest-path src-tauri/Cargo.toml --bin openmail-mcp
-          $targetTriple = rustc --print host-tuple
-          $binariesDirectory = Join-Path $env:GITHUB_WORKSPACE 'src-tauri/binaries'
-          New-Item -ItemType Directory -Force -Path $binariesDirectory | Out-Null
-          Copy-Item 'src-tauri/target/release/openmail-mcp.exe' (Join-Path $binariesDirectory "openmail-mcp-$targetTriple.exe")
 
       - name: Build installers and signed updater artifacts
         uses: tauri-apps/tauri-action@v0
