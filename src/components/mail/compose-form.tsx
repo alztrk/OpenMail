@@ -1,4 +1,4 @@
-import { IconBold, IconItalic, IconLink, IconList, IconPencil, IconUnderline } from '@tabler/icons-react'
+import { IconBold, IconClock, IconItalic, IconLink, IconList, IconPencil, IconUnderline } from '@tabler/icons-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
@@ -16,6 +16,7 @@ type ComposeFormProps = {
   subject: string
   body: string
   bodyHtml: string
+  scheduleAt: string
   attachments: ComposeAttachment[]
   attachmentLimits: { maxFileSize: number; maxTotalSize: number }
   isSending: boolean
@@ -26,6 +27,7 @@ type ComposeFormProps = {
   onSubjectChange: (value: string) => void
   onBodyChange: (value: string) => void
   onBodyHtmlChange: (value: string) => void
+  onScheduleAtChange: (value: string) => void
   onAttachmentsChange: (attachments: ComposeAttachment[]) => void
   savedRecipients: SavedRecipient[]
   onSaveRecipient: (email: string) => void
@@ -41,6 +43,7 @@ export function ComposeForm({
   subject,
   body,
   bodyHtml,
+  scheduleAt,
   attachments,
   attachmentLimits,
   isSending,
@@ -51,6 +54,7 @@ export function ComposeForm({
   onSubjectChange,
   onBodyChange,
   onBodyHtmlChange,
+  onScheduleAtChange,
   onAttachmentsChange,
   savedRecipients,
   onSaveRecipient,
@@ -124,7 +128,11 @@ export function ComposeForm({
       </div>
       <div className="compose-actions">
         <Button variant="ghost" type="button" onClick={onCancel} disabled={isSending || isDraftSaving}>{t('cancel')}</Button>
-        <Button type="submit" disabled={isSending || isDraftSaving || !canSubmit}><IconPencil aria-hidden="true" size={15} stroke={1.8} />{isSending ? t('sending') : t('send')}</Button>
+        <div className="compose-send-actions">
+          <Button variant="ghost" type="button" disabled={isSending || isDraftSaving} onClick={() => onScheduleAtChange(scheduleAt ? '' : new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 16))}><IconClock aria-hidden="true" size={15} stroke={1.8} />{scheduleAt ? t('removeSchedule') : t('scheduleSend')}</Button>
+          {scheduleAt ? <label className="compose-schedule-field" htmlFor="compose-schedule-at"><span>{t('scheduleSendAt')}</span><Input id="compose-schedule-at" type="datetime-local" value={scheduleAt} disabled={isSending || isDraftSaving} onChange={(event) => onScheduleAtChange(event.target.value)} /></label> : null}
+          <Button type="submit" disabled={isSending || isDraftSaving || !canSubmit}><IconPencil aria-hidden="true" size={15} stroke={1.8} />{isSending ? t('sending') : scheduleAt ? t('scheduleSend') : t('send')}</Button>
+        </div>
       </div>
     </form>
   )

@@ -34,6 +34,8 @@ export function shouldSendDesktopNotification(isVisible: boolean, isFocused: boo
 const DESTINATIONS_STORAGE_KEY = 'openmail.notification-destinations'
 const MAX_STORED_DESTINATIONS = 50
 const MAX_NOTIFICATION_LINES = 5
+const FOREGROUND_POLLING_DELAY_MS = 15_000
+const BACKGROUND_POLLING_DELAY_MS = 60_000
 const MAX_POLLING_BACKOFF_MS = 10 * 60 * 1000
 
 export function isQuietHours(settings: AppSettings, now = new Date()): boolean {
@@ -48,8 +50,8 @@ export function isQuietHours(settings: AppSettings, now = new Date()): boolean {
     : currentMinutes >= startMinutes || currentMinutes < endMinutes
 }
 
-export function getPollingDelayMs(_isForeground: boolean, consecutiveFailures: number): number {
-  const baseDelay = 30_000
+export function getPollingDelayMs(isForeground: boolean, consecutiveFailures: number): number {
+  const baseDelay = isForeground ? FOREGROUND_POLLING_DELAY_MS : BACKGROUND_POLLING_DELAY_MS
   if (consecutiveFailures <= 0) return baseDelay
   return Math.min(baseDelay * 2 ** Math.min(consecutiveFailures, 4), MAX_POLLING_BACKOFF_MS)
 }

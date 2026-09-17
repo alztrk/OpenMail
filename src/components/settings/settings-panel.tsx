@@ -27,7 +27,20 @@ type SettingsPanelProps = {
   isAccountMutationInFlight: boolean
   notificationPermission: NotificationPermissionState
   onRequestNotificationPermission: () => Promise<boolean>
+  appLockConfigured: boolean
+  onConfigureAppLock: () => Promise<void>
+  onDisableAppLock: () => Promise<void>
+  onExportBackup: () => Promise<void>
+  onImportBackup: () => Promise<void>
+  appVersion: string
+  updateState: UpdateState
+  updateAvailableVersion: string | null
+  updateProgress: number | null
+  onCheckForUpdates: () => Promise<void>
+  onInstallUpdate: () => Promise<void>
 }
+
+export type UpdateState = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'upToDate' | 'unavailable' | 'error'
 
 type NotificationPermissionState = 'unknown' | 'granted' | 'denied' | 'requesting'
 
@@ -91,7 +104,7 @@ function SettingRow({ label, description, value, children }: SettingRowProps) {
   return <div className="setting-row"><div className="setting-description"><strong id={labelId}>{label}</strong><span id={descriptionId}>{description}</span></div><div className="setting-control">{control}{value ? <output className="setting-value">{value}</output> : null}</div></div>
 }
 
-export function SettingsPanel({ settings, onChange, accounts, providerLogos, defaultAccountId, onSetDefault, onRemoveAccount, onStartAuth, onError, onBackToMail, isAddAccountOpen, onAddAccountOpenChange, isAccountMutationInFlight, notificationPermission, onRequestNotificationPermission }: SettingsPanelProps) {
+export function SettingsPanel({ settings, onChange, accounts, providerLogos, defaultAccountId, onSetDefault, onRemoveAccount, onStartAuth, onError, onBackToMail, isAddAccountOpen, onAddAccountOpenChange, isAccountMutationInFlight, notificationPermission, onRequestNotificationPermission, appLockConfigured, onConfigureAppLock, onDisableAppLock, onExportBackup, onImportBackup, appVersion, updateState, updateAvailableVersion, updateProgress, onCheckForUpdates, onInstallUpdate }: SettingsPanelProps) {
   const { t, i18n } = useTranslation()
   const [activeTab, setActiveTab] = useState<'general' | 'appearance' | 'language' | 'notifications' | 'accounts' | 'oauth'>(accounts.length === 0 ? 'accounts' : 'general')
   const [accountToRemoveId, setAccountToRemoveId] = useState<string | null>(null)
@@ -219,6 +232,7 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
     }
   }
 
+
   const tabs = [
     { id: 'general' as const, label: t('generalSettings'), description: t('settingsGeneralDescription'), icon: IconAdjustmentsHorizontal },
     { id: 'appearance' as const, label: t('appearanceSettings'), description: t('settingsAppearanceDescription'), icon: IconPalette },
@@ -255,6 +269,21 @@ export function SettingsPanel({ settings, onChange, accounts, providerLogos, def
         <div className="settings-group-heading"><strong>{t('confirmationSettings')}</strong><span>{t('confirmationSettingsDescription')}</span></div>
         <SettingRow label={t('confirmOnClose')} description={t('confirmOnCloseDescription')}>{({ labelId, descriptionId }) => <Switch className="setting-toggle" aria-labelledby={labelId} aria-describedby={descriptionId} checked={settings.confirmOnClose} onChange={(e) => onChange('confirmOnClose', e.target.checked)} />}</SettingRow>
         <SettingRow label={t('confirmActions')} description={t('confirmActionsDescription')}>{({ labelId, descriptionId }) => <Switch className="setting-toggle" aria-labelledby={labelId} aria-describedby={descriptionId} checked={settings.confirmActions} onChange={(e) => onChange('confirmActions', e.target.checked)} />}</SettingRow>
+        <div className="settings-group-heading"><strong>{t('appLockGroup')}</strong><span>{t('appLockGroupDescription')}</span></div>
+        <SettingRow label={t('appLock')} description={t('appLockDescription')}><div className="setting-inline-actions"><span className={`app-lock-status ${appLockConfigured ? 'configured' : ''}`}>{appLockConfigured ? t('appLockConfigured') : t('appLockNotConfigured')}</span><Button variant="ghost" type="button" onClick={() => { void (appLockConfigured ? onDisableAppLock() : onConfigureAppLock()) }}>{appLockConfigured ? t('disableAppLock') : t('configureAppLock')}</Button></div></SettingRow>
+        <div className="settings-group-heading"><strong>{t('backupGroup')}</strong><span>{t('backupGroupDescription')}</span></div>
+        <SettingRow label={t('backup')} description={t('backupDescription')}><div className="setting-inline-actions"><Button variant="ghost" type="button" onClick={() => { void onExportBackup() }}>{t('exportBackup')}</Button><Button variant="ghost" type="button" onClick={() => { void onImportBackup() }}>{t('importBackup')}</Button></div></SettingRow>
+        <div className="settings-group-heading"><strong>{t('updatesGroup')}</strong><span>{t('updatesGroupDescription')}</span></div>
+        <SettingRow label={t('applicationVersion')} description={t('applicationVersionDescription')} value={appVersion}>
+          <div className="setting-inline-actions update-actions">
+            {updateState === 'available' && updateAvailableVersion ? <span className="update-status available">{t('updateAvailable', { version: updateAvailableVersion })}</span> : null}
+            {updateState === 'upToDate' ? <span className="update-status">{t('updateAlreadyLatest')}</span> : null}
+            {updateState === 'error' ? <span className="update-status error">{t('updateCheckFailed')}</span> : null}
+            {updateState === 'downloading' && updateProgress !== null ? <span className="update-status">{t('downloadingUpdate', { progress: updateProgress })}</span> : null}
+            <Button variant="ghost" type="button" disabled={updateState === 'checking' || updateState === 'downloading'} onClick={() => { void onCheckForUpdates() }}>{updateState === 'checking' ? t('checkingForUpdates') : t('checkForUpdates')}</Button>
+            {updateState === 'available' ? <Button type="button" onClick={() => { void onInstallUpdate() }}>{t('installUpdate')}</Button> : null}
+          </div>
+        </SettingRow>
       </section> : null}
       {activeTab === 'appearance' ? <section className="settings-section">
         <div className="settings-group-heading"><strong>{t('appearanceSurfaceGroup')}</strong><span>{t('appearanceSurfaceGroupDescription')}</span></div>

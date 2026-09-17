@@ -1,4 +1,4 @@
-import type { KeyboardEvent, MouseEvent } from 'react'
+import { memo, type KeyboardEvent, type MouseEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { IconPaperclip, IconStar } from '@tabler/icons-react'
 import { getSenderLabel } from '@/lib/mail'
@@ -32,7 +32,7 @@ type MailRowProps = {
   onKeyDown?: (event: KeyboardEvent<HTMLButtonElement>, messageId: string) => void
 }
 
-export function MailRow({ message, selected, selectionChecked, unreadLabel, isStarDisabled, onSelect, onToggleSelection, onToggleStar, onContextMenu, onKeyDown }: MailRowProps) {
+export const MailRow = memo(function MailRow({ message, selected, selectionChecked, unreadLabel, isStarDisabled, onSelect, onToggleSelection, onToggleStar, onContextMenu, onKeyDown }: MailRowProps) {
   const { t } = useTranslation()
   const sender = getSenderLabel(message.sender, message.address)
   const subject = message.subject || t('noSubject')
@@ -82,4 +82,4 @@ export function MailRow({ message, selected, selectionChecked, unreadLabel, isSt
       <button className={`message-selection-box ${selectionChecked ? 'checked' : ''}`} type="button" aria-pressed={selectionChecked} aria-label={selectionChecked ? t('deselectMessage') : t('selectMessage')} onClick={() => onToggleSelection(message.messageKey)} />
     </div>
   )
-}
+})

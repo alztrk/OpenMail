@@ -12,10 +12,12 @@ export function sanitizeMailHtml(value: string): string {
   })
   const document = new DOMParser().parseFromString(sanitized, 'text/html')
   document.querySelectorAll('img').forEach((element) => {
-    const source = element.getAttribute('src')
+    const rawSource = element.getAttribute('src')?.trim()
+    const source = rawSource?.startsWith('//') ? `https:${rawSource}` : rawSource
     if (!source || !isSafeMailImageSource(source)) {
       element.removeAttribute('src')
     } else {
+      element.setAttribute('src', source)
       element.setAttribute('loading', 'eager')
       element.setAttribute('referrerpolicy', 'no-referrer')
     }

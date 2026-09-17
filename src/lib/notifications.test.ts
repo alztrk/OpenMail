@@ -22,10 +22,10 @@ describe('notification scheduling', () => {
   })
 
   it('backs off polling after repeated failures', () => {
-    expect(getPollingDelayMs(true, 0)).toBe(30_000)
-    expect(getPollingDelayMs(false, 0)).toBe(30_000)
-    expect(getPollingDelayMs(true, 2)).toBe(120_000)
-    expect(getPollingDelayMs(false, 10)).toBe(480_000)
+    expect(getPollingDelayMs(true, 0)).toBe(15_000)
+    expect(getPollingDelayMs(false, 0)).toBe(60_000)
+    expect(getPollingDelayMs(true, 2)).toBe(60_000)
+    expect(getPollingDelayMs(false, 10)).toBe(600_000)
   })
 
   it('keeps the quiet-hours start inclusive and end exclusive', () => {

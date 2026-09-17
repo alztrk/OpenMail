@@ -29,4 +29,11 @@ describe('sanitizeMailHtml', () => {
     expect(sanitized).not.toContain('data:image/svg+xml')
     expect(sanitized).not.toContain('http://example.com/image.png')
   })
+
+  it('normalizes protocol-relative image URLs to HTTPS', () => {
+    const sanitized = sanitizeMailHtml('<img src="//cdn.example.com/logo.png" />')
+
+    expect(sanitized).toContain('src="https://cdn.example.com/logo.png"')
+    expect(sanitized).toContain('referrerpolicy="no-referrer"')
+  })
 })

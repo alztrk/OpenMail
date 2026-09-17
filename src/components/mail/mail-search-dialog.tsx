@@ -1,4 +1,4 @@
-import type { KeyboardEvent } from 'react'
+import { useEffect, useRef, type KeyboardEvent } from 'react'
 import { IconAlertTriangle, IconSearch } from '@tabler/icons-react'
 import { Button } from '@/components/ui/button'
 import { getSenderLabel } from '@/lib/mail'
@@ -62,7 +62,7 @@ type MailSearchDialogProps = {
   onRetry: () => void
   onSelect: (result: MailSearchResult) => void
   onHighlight: (index: number) => void
-  onLoadMore: () => void
+  onLoadMore: (source?: 'auto' | 'manual') => void
 }
 
 function getResultSenderLabel(result: MailSearchResult): string {
@@ -75,6 +75,21 @@ function getResultLabel(result: MailSearchResult, unreadLabel: string, noSubject
 }
 
 export function MailSearchDialog({ results, isSearching, hasError, hasPartialError, activeIndex, hasMore, isLoadingMore, providerLogos, labels, formatTime, onClose, onRetry, onSelect, onHighlight, onLoadMore }: MailSearchDialogProps) {
+  const resultListRef = useRef<HTMLDivElement>(null)
+  const loadMoreSentinelRef = useRef<HTMLSpanElement>(null)
+
+  useEffect(() => {
+    if (!hasMore || results.length === 0 || isLoadingMore) return
+    const list = resultListRef.current
+    const sentinel = loadMoreSentinelRef.current
+    if (!list || !sentinel || typeof IntersectionObserver === 'undefined') return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) onLoadMore('auto')
+    }, { root: list, rootMargin: '160px 0px' })
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [hasMore, isLoadingMore, onLoadMore, results.length])
+
   const moveResultFocus = (nextIndex: number) => {
     onHighlight(nextIndex)
     window.requestAnimationFrame(() => {
@@ -115,7 +130,7 @@ export function MailSearchDialog({ results, isSearching, hasError, hasPartialErr
       {results.length > 0 ? <span className="search-dialog-count" aria-live="polite">{labels.resultCount(results.length)}</span> : null}
     </div>
     {hasPartialError ? <div className="search-dialog-partial-error" role="status"><IconAlertTriangle aria-hidden="true" size={14} stroke={1.8} /><span>{labels.partialError}</span></div> : null}
-    {isSearching && results.length === 0 ? <div className="search-dialog-state" role="status"><IconSearch className="is-spinning" aria-hidden="true" size={18} stroke={1.8} /><strong>{labels.searching}</strong></div> : hasError ? <div className="search-dialog-state" role="alert"><IconAlertTriangle aria-hidden="true" size={18} stroke={1.8} /><strong>{labels.searchFailed}</strong><span>{labels.searchFailedDescription}</span><Button variant="ghost" type="button" onClick={onRetry}>{labels.tryAgain}</Button></div> : !isSearching && results.length === 0 ? <div className="search-dialog-state"><IconSearch aria-hidden="true" size={18} stroke={1.8} /><strong>{labels.noResults}</strong><span>{labels.noResultsDescription}</span></div> : results.length > 0 ? <div className="search-result-list" role="list" aria-label={labels.title}>
+    {isSearching && results.length === 0 ? <div className="search-dialog-state" role="status"><IconSearch className="is-spinning" aria-hidden="true" size={18} stroke={1.8} /><strong>{labels.searching}</strong></div> : hasError ? <div className="search-dialog-state" role="alert"><IconAlertTriangle aria-hidden="true" size={18} stroke={1.8} /><strong>{labels.searchFailed}</strong><span>{labels.searchFailedDescription}</span><Button variant="ghost" type="button" onClick={onRetry}>{labels.tryAgain}</Button></div> : !isSearching && results.length === 0 ? <div className="search-dialog-state"><IconSearch aria-hidden="true" size={18} stroke={1.8} /><strong>{labels.noResults}</strong><span>{labels.noResultsDescription}</span></div> : results.length > 0 ? <div ref={resultListRef} className="search-result-list" role="list" aria-label={labels.title}>
       {results.map((result, index) => <div key={`${result.account.id}:${result.message.id}`} role="listitem">
         <button className={`search-result ${index === activeIndex ? 'active' : ''} ${result.message.unread ? 'unread' : ''}`} data-search-result-index={index} type="button" aria-current={index === activeIndex ? 'true' : undefined} aria-label={getResultLabel(result, labels.unread, labels.noSubject)} onClick={() => onSelect(result)} onFocus={() => onHighlight(index)} onKeyDown={(event) => handleResultKeyDown(event, index)}>
           <SenderAvatar className="search-result-avatar" label={getResultSenderLabel(result)} address={result.message.address} imageUrl={result.message.avatar_url} loading="lazy" />
@@ -132,7 +147,8 @@ export function MailSearchDialog({ results, isSearching, hasError, hasPartialErr
           </span>
         </button>
       </div>)}
+      {hasMore ? <span ref={loadMoreSentinelRef} className="search-load-sentinel" aria-hidden="true" /> : null}
     </div> : null}
-    {hasMore && results.length > 0 ? <div className="search-dialog-more"><Button variant="ghost" type="button" disabled={isLoadingMore} onClick={onLoadMore}>{isLoadingMore ? labels.loadingMore : labels.loadMore}</Button></div> : null}
+    {hasMore && results.length > 0 ? <div className="search-dialog-more"><Button variant="ghost" type="button" disabled={isLoadingMore} onClick={() => onLoadMore('manual')}>{isLoadingMore ? labels.loadingMore : labels.loadMore}</Button></div> : null}
   </div>
 }
