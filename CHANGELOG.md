@@ -4,8 +4,21 @@ All notable changes to OpenMail are recorded here.
 
 ## Unreleased
 
+### Changed
+
+- GitHub tag releases now synchronize application versions and publish signed Windows installers, updater metadata, and a portable executable through the release workflow.
+- The Settings page can check GitHub for signed updates and install them with visible progress.
+- Secondary mail and compose surfaces are lazy-loaded to reduce the initial frontend bundle.
+- Frontend and backend diagnostics now record mailbox, search, cache, reader, synchronization, notification, and paging timings without storing message content, identifiers, queries, tokens, or account addresses.
+- Foreground mailbox polling now checks for new mail every 15 seconds, while background polling uses a 60-second interval and keeps exponential backoff after failures.
+- Background polling now schedules its first check during app startup instead of waiting for a later window focus or visibility event.
+- Gmail reads now share a six-request limiter and a bounded quota cooldown across mailbox, search, sync, profile, and inline-image requests; mailbox render timing records the first post-update frame for performance diagnosis.
+- Notification suppression now records whether settings, quiet hours, window focus, or Windows permission prevented delivery.
+
 ### Added
 
+- A local `openmail-mcp` server now exposes bounded account, mailbox, message, and thread tools over stdio by default, with explicit opt-in draft, mailbox-action, send, and permanent-delete tools; writes require confirmation, send/reply require idempotency keys, OAuth secrets are never exposed, and draft/send tools validate bounded base64 attachments.
+- Log files now rotate at 5 MB, retain previous files, use local time, and include debug-level diagnostics in development builds.
 - Microsoft Graph Inbox synchronization now persists and follows delta cursors, including provider-reported message removals.
 - Gmail and Microsoft provider errors now expose distinct reconnect, permission, rate-limit, and temporary-service states.
 - Provider recovery error contracts now have regression coverage for HTTP and OAuth failure categories.
@@ -100,6 +113,7 @@ All notable changes to OpenMail are recorded here.
 - Search cache isolation is covered by a Rust regression test.
 - Compose now validates incomplete recipient values immediately and keeps the selected account's sender, capabilities, and attachment limits aligned when account context changes.
 - Stale mailbox paging and refresh responses are ignored after account, folder, or inbox-mode changes, and partial refresh failures are reported instead of showing a false success message.
+- Mailbox and global-search paging now load the next page as their lists approach the end while retaining accessible manual load-more actions; repeated tokens and automatic retry loops are guarded.
 - Draft loading and saving now use request and content revisions so late responses cannot overwrite newer compose edits.
 - Microsoft Graph no longer replays non-idempotent mutations after an authorization failure, avoiding duplicate sends or drafts when a provider response is ambiguous.
 - A corrupted primary message cache now recovers from its valid backup.

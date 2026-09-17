@@ -1,0 +1,112 @@
+name: Release OpenMail
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, for example 0.2.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', inputs.version) }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Synchronize application version
+        shell: pwsh
+        run: pnpm version:set $env:RELEASE_TAG
+
+      - name: Prepare signed updater configuration
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_UPDATER_PUBLIC_KEY)) {
+            throw 'Repository variable TAURI_UPDATER_PUBLIC_KEY is required.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'Repository secret TAURI_SIGNING_PRIVATE_KEY is required.'
+          }
+          $config = @{
+            plugins = @{
+              updater = @{
+                pubkey = $env:TAURI_UPDATER_PUBLIC_KEY
+                endpoints = @('https://github.com/alztrk/OpenMail/releases/latest/download/latest.json')
+                windows = @{ installMode = 'passive' }
+              }
+            }
+            bundle = @{
+              externalBin = @('binaries/openmail-mcp')
+            }
+          } | ConvertTo-Json -Depth 10
+          Set-Content -LiteralPath 'src-tauri/tauri.release.conf.json' -Value $config -Encoding utf8
+
+      - name: Build MCP sidecar
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml --bin openmail-mcp
+          $targetTriple = rustc --print host-tuple
+          $binariesDirectory = Join-Path $env:GITHUB_WORKSPACE 'src-tauri/binaries'
+          New-Item -ItemType Directory -Force -Path $binariesDirectory | Out-Null
+          Copy-Item 'src-tauri/target/release/openmail-mcp.exe' (Join-Path $binariesDirectory "openmail-mcp-$targetTriple.exe")
+
+      - name: Build installers and signed updater artifacts
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: OpenMail ${{ env.RELEASE_TAG }}
+          releaseBody: 'Signed Windows installers and updater metadata for this OpenMail release.'
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          args: --config src-tauri/tauri.release.conf.json
+
+      - name: Build portable executable
+        shell: pwsh
+        run: pnpm tauri build --no-bundle
+
+      - name: Upload portable executable
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            src-tauri/target/release/openmail.exe
+            src-tauri/target/release/openmail-mcp.exe
+          draft: false
