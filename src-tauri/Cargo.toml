@@ -1,12 +1,12 @@
 [package]
 name = "openmail"
-version = "0.1.0"
+version = "0.1.6"
 description = "A lightweight local-first desktop mail client"
 authors = ["OpenMail"]
 license-file = "../LICENSE.md"
 repository = "https://github.com/alztrk/OpenMail"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.85.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -24,16 +24,23 @@ log = "0.4"
 tauri = { version = "2.11.3", features = ["tray-icon", "image-ico"] }
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 oauth2 = "5.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 keyring = { version = "3.6", features = ["windows-native"] }
 webbrowser = "1.0"
 url = "2.5"
 base64 = "0.22"
+pbkdf2 = "0.12"
+sha2 = "0.10"
 aes-gcm = "0.10"
+rfd = "0.15"
 futures = "0.3"
 tokio = { version = "1", features = ["sync", "time"] }
 winreg = "0.55"
+rmcp = { version = "1.7.0", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = "1.0"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"

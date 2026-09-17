@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -10,12 +11,12 @@ use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
-    account_store, config, message_cache,
+    account_store, backup, config, message_cache,
     models::{
         AuthState, MailAccount, MailFolder, MailMessage, MailProvider, MessageAction, MessagePage,
-        SyncResult,
+        ScheduledMessageSummary, SyncResult,
     },
-    provider, secure_store,
+    provider, scheduled_mail, secure_store,
 };
 
 pub struct AppState {
@@ -54,6 +55,72 @@ pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
     window
         .hide()
         .map_err(|error| format!("Could not hide the main window: {error}"))
+}
+
+#[tauri::command]
+pub fn get_app_lock_status() -> Result<bool, String> {
+    secure_store::has_app_lock_pin()
+}
+
+#[tauri::command]
+pub fn set_app_lock_pin(pin: String) -> Result<(), String> {
+    let trimmed_pin = pin.trim();
+    if !(4..=64).contains(&trimmed_pin.len()) || trimmed_pin.chars().any(char::is_whitespace) {
+        return Err("OPENMAIL_APP_LOCK_PIN_INVALID".to_string());
+    }
+    secure_store::save_app_lock_pin(trimmed_pin)
+}
+
+#[tauri::command]
+pub fn verify_app_lock_pin(pin: String) -> Result<bool, String> {
+    secure_store::verify_app_lock_pin(pin.trim())
+}
+
+#[tauri::command]
+pub fn clear_app_lock_pin() -> Result<(), String> {
+    secure_store::delete_app_lock_pin()
+}
+
+#[tauri::command]
+pub fn export_backup(password: String, state: State<'_, AppState>) -> Result<String, String> {
+    backup::export(&state.app_data_dir, &password)
+}
+
+#[tauri::command]
+pub fn import_backup(
+    password: String,
+    serialized: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<MailAccount>, String> {
+    backup::import(&state.app_data_dir, &password, &serialized)
+}
+
+#[tauri::command]
+pub fn save_backup(password: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("OpenMail backup", &["json"])
+        .set_file_name("openmail-backup.json")
+        .save_file()
+    else {
+        return Ok(false);
+    };
+    let serialized = backup::export(&state.app_data_dir, &password)?;
+    fs::write(path, serialized)
+        .map_err(|error| format!("Backup file could not be saved: {error}"))?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn read_backup() -> Result<Option<String>, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("OpenMail backup", &["json"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| format!("Backup file could not be read: {error}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,8 +277,21 @@ fn rollback_account_removal(
 
 #[tauri::command]
 pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<MailAccount>, String> {
+    let started_at = Instant::now();
     log::debug!("Loading local mail accounts");
-    account_store::load_accounts(&state.app_data_dir)
+    let result = account_store::load_accounts(&state.app_data_dir);
+    match &result {
+        Ok(accounts) => log::info!(
+            "Accounts loaded: account_count={} duration_ms={}",
+            accounts.len(),
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::error!(
+            "Accounts could not be loaded: duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 fn account_address(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
@@ -236,7 +316,25 @@ pub fn get_cached_messages(
     account_id: String,
     state: State<'_, AppState>,
 ) -> Result<Option<MessagePage>, String> {
-    message_cache::load(&state.app_data_dir, &account_id)
+    let started_at = Instant::now();
+    let result = message_cache::load(&state.app_data_dir, &account_id);
+    match &result {
+        Ok(Some(page)) => log::debug!(
+            "Mailbox cache hit: message_count={} has_next_page={} duration_ms={}",
+            page.messages.len(),
+            page.next_page_token.is_some(),
+            started_at.elapsed().as_millis()
+        ),
+        Ok(None) => log::debug!(
+            "Mailbox cache miss: duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Mailbox cache read failed: duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -254,7 +352,25 @@ pub fn get_cached_folder_messages(
     folder: MailFolder,
     state: State<'_, AppState>,
 ) -> Result<Option<MessagePage>, String> {
-    message_cache::load_scope(&state.app_data_dir, &account_id, folder.cache_scope())
+    let started_at = Instant::now();
+    let result = message_cache::load_scope(&state.app_data_dir, &account_id, folder.cache_scope());
+    match &result {
+        Ok(Some(page)) => log::debug!(
+            "Folder cache hit: folder={folder:?} message_count={} has_next_page={} duration_ms={}",
+            page.messages.len(),
+            page.next_page_token.is_some(),
+            started_at.elapsed().as_millis()
+        ),
+        Ok(None) => log::debug!(
+            "Folder cache miss: folder={folder:?} duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Folder cache read failed: folder={folder:?} duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -278,7 +394,23 @@ pub fn search_cached_messages(
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
     let query = normalize_search_query(&query)?;
-    message_cache::search_cached_messages(&state.app_data_dir, &account_id, &query)
+    let started_at = Instant::now();
+    let result = message_cache::search_cached_messages(&state.app_data_dir, &account_id, &query);
+    match &result {
+        Ok(page) => log::debug!(
+            "Cached message search completed: message_count={} has_next_page={} query_length={} duration_ms={}",
+            page.messages.len(),
+            page.next_page_token.is_some(),
+            query.len(),
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Cached message search failed: query_length={} duration_ms={}",
+            query.len(),
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -289,17 +421,31 @@ pub async fn cache_folder_messages(
     append: bool,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let started_at = Instant::now();
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let _operation_guard = lock_account_operations(&state)?;
     ensure_account_exists(&state.app_data_dir, &account_id)?;
-    message_cache::save_page_with_scope(
+    let result = message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
         page,
         append,
         folder.cache_scope(),
-    )
+    );
+    match &result {
+        Ok(saved_page) => log::debug!(
+            "Folder cache written: folder={folder:?} append={append} message_count={} has_next_page={} duration_ms={}",
+            saved_page.messages.len(),
+            saved_page.next_page_token.is_some(),
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Folder cache write failed: folder={folder:?} append={append} duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -310,18 +456,34 @@ pub async fn cache_search_messages(
     append: bool,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let started_at = Instant::now();
     let query = normalize_search_query(&query)?;
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let _operation_guard = lock_account_operations(&state)?;
     ensure_account_exists(&state.app_data_dir, &account_id)?;
-    message_cache::save_page_with_scope(
+    let result = message_cache::save_page_with_scope(
         &state.app_data_dir,
         &account_id,
         page,
         append,
         Some(&format!("search:{query}")),
-    )
+    );
+    match &result {
+        Ok(saved_page) => log::debug!(
+            "Search cache written: append={append} message_count={} has_next_page={} query_length={} duration_ms={}",
+            saved_page.messages.len(),
+            saved_page.next_page_token.is_some(),
+            query.len(),
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Search cache write failed: append={append} query_length={} duration_ms={}",
+            query.len(),
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -330,13 +492,24 @@ pub async fn list_messages(
     page_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
-    log::info!("Loading messages for account");
+    let started_at = Instant::now();
+    log::debug!(
+        "Loading messages: page_token_present={}",
+        page_token.is_some()
+    );
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let page = adapter
         .list_messages(&account_id, page_token.as_deref())
         .await?;
+    log::info!(
+        "Messages loaded: page_token_present={} message_count={} has_next_page={} duration_ms={}",
+        page_token.is_some(),
+        page.messages.len(),
+        page.next_page_token.is_some(),
+        started_at.elapsed().as_millis()
+    );
     let _operation_guard = lock_account_operations(&state)?;
     ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::save_page(&state.app_data_dir, &account_id, page, page_token.is_some())
@@ -350,12 +523,35 @@ pub async fn search_messages(
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
     let query = normalize_search_query(&query)?;
+    let started_at = Instant::now();
+    log::debug!(
+        "Searching messages: page_token_present={} query_length={}",
+        page_token.is_some(),
+        query.len()
+    );
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
-    adapter
+    let result = adapter
         .search_messages(&account_id, &query, page_token.as_deref())
-        .await
+        .await;
+    match &result {
+        Ok(page) => log::info!(
+            "Message search completed: page_token_present={} message_count={} has_next_page={} query_length={} duration_ms={}",
+            page_token.is_some(),
+            page.messages.len(),
+            page.next_page_token.is_some(),
+            query.len(),
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Message search failed: page_token_present={} query_length={} duration_ms={}",
+            page_token.is_some(),
+            query.len(),
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -365,12 +561,32 @@ pub async fn list_folder_messages(
     page_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MessagePage, String> {
+    let started_at = Instant::now();
+    log::debug!(
+        "Loading folder messages: folder={folder:?} page_token_present={}",
+        page_token.is_some()
+    );
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
-    adapter
+    let result = adapter
         .list_folder_messages(&account_id, folder, page_token.as_deref())
-        .await
+        .await;
+    match &result {
+        Ok(page) => log::info!(
+            "Folder messages loaded: folder={folder:?} page_token_present={} message_count={} has_next_page={} duration_ms={}",
+            page_token.is_some(),
+            page.messages.len(),
+            page.next_page_token.is_some(),
+            started_at.elapsed().as_millis()
+        ),
+        Err(_) => log::warn!(
+            "Folder messages failed: folder={folder:?} page_token_present={} duration_ms={}",
+            page_token.is_some(),
+            started_at.elapsed().as_millis()
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -379,10 +595,18 @@ pub async fn get_message(
     message_id: String,
     state: State<'_, AppState>,
 ) -> Result<MailMessage, String> {
+    let started_at = Instant::now();
+    log::debug!("Loading message details");
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let message = adapter.get_message(&account_id, &message_id).await?;
+    log::info!(
+        "Message details loaded: has_html_body={} attachment_count={} duration_ms={}",
+        message.body_html.is_some(),
+        message.attachments.len(),
+        started_at.elapsed().as_millis()
+    );
     let _operation_guard = lock_account_operations(&state)?;
     ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::update_message(&state.app_data_dir, &account_id, message.clone())?;
@@ -395,10 +619,17 @@ pub async fn get_thread(
     thread_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MailMessage>, String> {
+    let started_at = Instant::now();
+    log::debug!("Loading message thread");
     let account_lock = account_operation_lock(&state, &account_id)?;
     let _account_guard = account_lock.lock().await;
     let adapter = provider::adapter_for_account(&state.app_data_dir, &account_id)?;
     let thread = adapter.get_thread(&account_id, &thread_id).await?;
+    log::info!(
+        "Message thread loaded: message_count={} duration_ms={}",
+        thread.messages.len(),
+        started_at.elapsed().as_millis()
+    );
     let _operation_guard = lock_account_operations(&state)?;
     ensure_account_exists(&state.app_data_dir, &account_id)?;
     message_cache::update_messages(&state.app_data_dir, &account_id, thread.messages.clone())?;
@@ -509,6 +740,85 @@ pub async fn send_message(
             attachments: &attachments,
         })
         .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn schedule_message(
+    account_id: String,
+    sender: String,
+    recipient: String,
+    cc: String,
+    bcc: String,
+    subject: String,
+    body: String,
+    body_html: String,
+    attachments: Vec<provider::OutgoingAttachment>,
+    scheduled_at: i64,
+    state: State<'_, AppState>,
+) -> Result<scheduled_mail::ScheduledMessage, String> {
+    let _ = sender;
+    let account_lock = account_operation_lock(&state, &account_id)?;
+    let _account_guard = account_lock.lock().await;
+    let account_sender = account_address(&state.app_data_dir, &account_id)?;
+    scheduled_mail::add(
+        &state.app_data_dir,
+        scheduled_mail::ScheduledMessage {
+            id: format!("scheduled-{}", uuid_like_id()),
+            account_id,
+            sender: account_sender,
+            recipient,
+            cc,
+            bcc,
+            subject,
+            body,
+            body_html,
+            attachments,
+            scheduled_at,
+            next_attempt_at: scheduled_at,
+            last_error: None,
+        },
+    )
+}
+
+#[tauri::command]
+pub fn list_scheduled_messages(
+    state: State<'_, AppState>,
+) -> Result<Vec<ScheduledMessageSummary>, String> {
+    Ok(scheduled_mail::list(&state.app_data_dir)?
+        .into_iter()
+        .map(|message| ScheduledMessageSummary {
+            id: message.id,
+            account_id: message.account_id,
+            recipient: message.recipient,
+            subject: message.subject,
+            scheduled_at: message.scheduled_at,
+            last_error: message.last_error,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn cancel_scheduled_message(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    scheduled_mail::remove(&state.app_data_dir, &id)
+}
+
+pub async fn process_scheduled_mail_queue(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let accounts = account_store::load_accounts(&state.app_data_dir)?;
+    let data_dir = state.app_data_dir.clone();
+    scheduled_mail::process_due(&data_dir, &accounts, |account| {
+        provider::adapter_for(account.provider.clone())
+    })
+    .await;
+    Ok(())
+}
+
+fn uuid_like_id() -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{timestamp:x}")
 }
 
 #[tauri::command]

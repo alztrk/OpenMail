@@ -186,7 +186,7 @@ pub struct SendRequest<'a> {
     pub attachments: &'a [OutgoingAttachment],
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutgoingAttachment {
     pub filename: String,
@@ -591,7 +591,7 @@ pub fn adapter_for_account(
 
 pub fn supports_message_action(capabilities: ProviderCapabilities, action: MessageAction) -> bool {
     match action {
-        MessageAction::Archive => capabilities.can_archive,
+        MessageAction::Archive | MessageAction::Unarchive => capabilities.can_archive,
         MessageAction::Trash | MessageAction::Untrash => capabilities.can_delete,
         MessageAction::DeleteForever => capabilities.can_permanently_delete,
         MessageAction::MarkRead | MessageAction::MarkUnread => capabilities.can_mark_read,

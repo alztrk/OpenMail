@@ -48,6 +48,19 @@ pub fn load(data_dir: &Path, account_id: &str) -> Result<Option<MessagePage>, St
     load_scope(data_dir, account_id, None)
 }
 
+pub fn export_serialized(data_dir: &Path) -> Result<Vec<u8>, String> {
+    with_cache_lock(data_dir, || {
+        let cache = read(data_dir)?;
+        serde_json::to_vec(&cache).map_err(|error| error.to_string())
+    })
+}
+
+pub fn import_serialized(data_dir: &Path, serialized: &[u8]) -> Result<(), String> {
+    let cache: CacheFile = serde_json::from_slice(serialized)
+        .map_err(|error| format!("Backup message cache is invalid: {error}"))?;
+    with_cache_lock(data_dir, || write(data_dir, &cache))
+}
+
 pub fn load_thread(
     data_dir: &Path,
     account_id: &str,
@@ -109,7 +122,7 @@ pub fn search_cached_messages(
                 continue;
             }
             for message in entry.page.messages {
-                if message_contains_query(&message, &query) {
+                if message_contains_query(&message, account_id, &entry.account_id, &query) {
                     upsert_message(&mut messages, message);
                 }
             }
@@ -125,16 +138,97 @@ pub fn search_cached_messages(
     })
 }
 
-fn message_contains_query(message: &MailMessage, query: &str) -> bool {
-    [
-        &message.sender,
-        &message.address,
-        &message.subject,
-        &message.preview,
-        &message.body,
-    ]
-    .into_iter()
-    .any(|value| value.to_lowercase().contains(query))
+#[derive(Debug, PartialEq, Eq)]
+struct SearchTerm {
+    field: Option<String>,
+    value: String,
+}
+
+fn message_contains_query(
+    message: &MailMessage,
+    account_id: &str,
+    cache_scope: &str,
+    query: &str,
+) -> bool {
+    parse_search_terms(query)
+        .iter()
+        .all(|term| matches_search_term(message, account_id, cache_scope, term))
+}
+
+fn parse_search_terms(query: &str) -> Vec<SearchTerm> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    let push_current = |current: &mut String, terms: &mut Vec<SearchTerm>| {
+        let value = current.trim().to_lowercase();
+        current.clear();
+        if value.is_empty() {
+            return;
+        }
+        let (field, value) = value
+            .split_once(':')
+            .filter(|(field, value)| {
+                !value.is_empty() && matches!(*field, "from" | "subject" | "is" | "has" | "in")
+            })
+            .map(|(field, value)| (Some(field.to_string()), value.to_string()))
+            .unwrap_or((None, value));
+        terms.push(SearchTerm { field, value });
+    };
+
+    for character in query.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            character if character.is_whitespace() && !quoted => {
+                push_current(&mut current, &mut terms)
+            }
+            character => current.push(character),
+        }
+    }
+    push_current(&mut current, &mut terms);
+    terms
+}
+
+fn matches_search_term(
+    message: &MailMessage,
+    account_id: &str,
+    cache_scope: &str,
+    term: &SearchTerm,
+) -> bool {
+    let contains = |value: &str| value.to_lowercase().contains(&term.value);
+    match term.field.as_deref() {
+        Some("from") => contains(&message.sender) || contains(&message.address),
+        Some("subject") => contains(&message.subject),
+        Some("is") => match term.value.as_str() {
+            "unread" => message.unread,
+            "read" => !message.unread,
+            "starred" => message.starred,
+            _ => false,
+        },
+        Some("has") => term.value == "attachment" && message.has_attachment,
+        Some("in") => matches_cache_folder(account_id, cache_scope, &term.value),
+        None => [
+            &message.sender,
+            &message.address,
+            &message.subject,
+            &message.preview,
+            &message.body,
+        ]
+        .into_iter()
+        .any(|value| contains(value)),
+        _ => false,
+    }
+}
+
+fn matches_cache_folder(account_id: &str, cache_scope: &str, folder: &str) -> bool {
+    match folder {
+        "inbox" => cache_scope == account_id,
+        "sent" => cache_scope.ends_with("::folder:SENT"),
+        "spam" => cache_scope.ends_with("::folder:SPAM"),
+        "trash" => cache_scope.ends_with("::folder:TRASH"),
+        "starred" => cache_scope.ends_with("::folder:STARRED"),
+        _ => false,
+    }
 }
 
 pub fn save_page(
@@ -272,6 +366,18 @@ fn merge_message_details(existing: &MailMessage, incoming: &MailMessage) -> Mail
     }
     if merged.address.is_empty() {
         merged.address = existing.address.clone();
+    }
+    if merged.to.is_empty() {
+        merged.to = existing.to.clone();
+    }
+    if merged.cc.is_empty() {
+        merged.cc = existing.cc.clone();
+    }
+    if merged.bcc.is_empty() {
+        merged.bcc = existing.bcc.clone();
+    }
+    if merged.reply_to.is_empty() {
+        merged.reply_to = existing.reply_to.clone();
     }
     if merged.subject.is_empty() {
         merged.subject = existing.subject.clone();
@@ -459,7 +565,9 @@ fn apply_message_action_locked(
     let destination_key = match action {
         MessageAction::Trash => Some(cache_key(account_id, MailFolder::Trash.cache_scope())),
         MessageAction::Spam => Some(cache_key(account_id, MailFolder::Spam.cache_scope())),
-        MessageAction::Untrash | MessageAction::NotSpam => Some(account_id.to_string()),
+        MessageAction::Unarchive | MessageAction::Untrash | MessageAction::NotSpam => {
+            Some(account_id.to_string())
+        }
         _ => None,
     };
     let message_to_move = if destination_key.is_some() {
@@ -740,6 +848,10 @@ mod tests {
             message_id_header: None,
             sender: "Sender".to_string(),
             address: "sender@example.com".to_string(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
             avatar_url: None,
             subject: "Subject".to_string(),
             preview: "Preview".to_string(),
@@ -1148,6 +1260,79 @@ mod tests {
         assert_eq!(synced.messages[0].attachments.len(), 1);
         assert!(synced.messages[0].has_attachment);
         fs::remove_dir_all(data_dir).expect("cache test directory should be removable");
+    }
+
+    #[test]
+    fn parses_and_matches_supported_search_operators() {
+        let mut unread_attachment = message("invoice body");
+        unread_attachment.has_attachment = true;
+        unread_attachment.starred = true;
+
+        assert_eq!(
+            parse_search_terms(
+                r#"from:sender@example.com subject:"invoice body" is:unread has:attachment in:inbox"#
+            ),
+            vec![
+                SearchTerm {
+                    field: Some("from".to_string()),
+                    value: "sender@example.com".to_string()
+                },
+                SearchTerm {
+                    field: Some("subject".to_string()),
+                    value: "invoice body".to_string()
+                },
+                SearchTerm {
+                    field: Some("is".to_string()),
+                    value: "unread".to_string()
+                },
+                SearchTerm {
+                    field: Some("has".to_string()),
+                    value: "attachment".to_string()
+                },
+                SearchTerm {
+                    field: Some("in".to_string()),
+                    value: "inbox".to_string()
+                },
+            ]
+        );
+        unread_attachment.subject = "invoice body".to_string();
+        assert!(message_contains_query(
+            &unread_attachment,
+            "gmail:test@example.com",
+            "gmail:test@example.com",
+            "from:sender@example.com subject:\"invoice body\" is:unread has:attachment in:inbox"
+        ));
+        assert!(!message_contains_query(
+            &unread_attachment,
+            "gmail:test@example.com",
+            "gmail:test@example.com::folder:TRASH",
+            "in:inbox"
+        ));
+        assert!(!message_contains_query(
+            &unread_attachment,
+            "gmail:test@example.com",
+            "gmail:test@example.com",
+            "is:read"
+        ));
+    }
+
+    #[test]
+    fn inbox_search_does_not_match_a_previous_search_scope() {
+        let message = message("newsletter body");
+        let account_id = "gmail:test@example.com";
+
+        assert!(message_contains_query(
+            &message,
+            account_id,
+            account_id,
+            "in:inbox newsletter"
+        ));
+        assert!(!message_contains_query(
+            &message,
+            account_id,
+            "gmail:test@example.com::search:newsletter",
+            "in:inbox newsletter"
+        ));
     }
 
     #[test]

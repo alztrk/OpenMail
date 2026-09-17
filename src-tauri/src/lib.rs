@@ -1,14 +1,17 @@
 mod account_store;
 mod attachment_store;
+mod backup;
 mod commands;
 mod config;
 mod gmail_auth;
 mod gmail_mail;
+pub mod mcp;
 mod message_cache;
 mod microsoft_auth;
 mod microsoft_mail;
 mod models;
 mod provider;
+mod scheduled_mail;
 mod secure_store;
 
 use tauri::{
@@ -37,6 +40,26 @@ fn restore_main_window(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::LogDir {
+                        file_name: Some("openmail".to_string()),
+                    }),
+                ])
+                .max_file_size(5_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
+                .build(),
+        )
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(desktop)]
             {
@@ -58,17 +81,17 @@ pub fn run() {
                 }))?;
 
             app.manage(commands::AppState::new(app.path().app_data_dir()?));
-            app.handle().plugin(
-                tauri_plugin_log::Builder::default()
-                    .targets([
-                        Target::new(TargetKind::Stdout),
-                        Target::new(TargetKind::LogDir {
-                            file_name: Some("openmail".to_string()),
-                        }),
-                    ])
-                    .level(log::LevelFilter::Info)
-                    .build(),
-            )?;
+            let scheduled_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    if let Err(error) =
+                        commands::process_scheduled_mail_queue(scheduled_app.clone()).await
+                    {
+                        log::warn!("Scheduled mail queue processing failed: {error}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
             app.handle().plugin(tauri_plugin_notification::init())?;
             let show_item = MenuItem::with_id(app, "show", "OpenMail", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
@@ -105,6 +128,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::hide_main_window,
+            commands::get_app_lock_status,
+            commands::set_app_lock_pin,
+            commands::verify_app_lock_pin,
+            commands::clear_app_lock_pin,
+            commands::export_backup,
+            commands::import_backup,
+            commands::save_backup,
+            commands::read_backup,
             commands::send_desktop_notification,
             commands::list_accounts,
             commands::get_provider_capabilities,
@@ -124,6 +155,9 @@ pub fn run() {
             commands::open_external_url,
             commands::send_reply,
             commands::send_message,
+            commands::schedule_message,
+            commands::list_scheduled_messages,
+            commands::cancel_scheduled_message,
             commands::list_drafts,
             commands::get_draft,
             commands::save_draft,

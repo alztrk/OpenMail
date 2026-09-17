@@ -18,6 +18,14 @@ pub struct MailMessage {
     pub message_id_header: Option<String>,
     pub sender: String,
     pub address: String,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    #[serde(default)]
+    pub reply_to: Vec<String>,
     pub avatar_url: Option<String>,
     pub subject: String,
     pub preview: String,
@@ -73,6 +81,17 @@ pub struct NewMailNotification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledMessageSummary {
+    pub id: String,
+    pub account_id: String,
+    pub recipient: String,
+    pub subject: String,
+    pub scheduled_at: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MailProvider {
     Gmail,
@@ -117,6 +136,7 @@ impl MailFolder {
 #[serde(rename_all = "snake_case")]
 pub enum MessageAction {
     Archive,
+    Unarchive,
     Trash,
     Untrash,
     Spam,

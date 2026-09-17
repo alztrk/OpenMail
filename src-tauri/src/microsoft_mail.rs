@@ -1240,6 +1240,7 @@ pub async fn modify_message(
     let client = shared_http_client()?;
     match action {
         MessageAction::Archive => move_message(account_id, message_id, "archive").await,
+        MessageAction::Unarchive => move_message(account_id, message_id, "inbox").await,
         MessageAction::Trash => move_message(account_id, message_id, "deleteditems").await,
         MessageAction::Untrash => move_message(account_id, message_id, "inbox").await,
         MessageAction::Spam => move_message(account_id, message_id, "junkemail").await,
@@ -1597,6 +1598,10 @@ fn to_mail_message(message: GraphMessage) -> MailMessage {
         message_id_header: message.internet_message_id,
         sender,
         address,
+        to: graph_recipient_addresses(message.to_recipients.as_deref()),
+        cc: graph_recipient_addresses(message.cc_recipients.as_deref()),
+        bcc: graph_recipient_addresses(message.bcc_recipients.as_deref()),
+        reply_to: Vec::new(),
         avatar_url,
         subject: message
             .subject
@@ -1613,6 +1618,15 @@ fn to_mail_message(message: GraphMessage) -> MailMessage {
         has_attachment: message.has_attachments.unwrap_or(!attachments.is_empty()),
         attachments,
     }
+}
+
+fn graph_recipient_addresses(recipients: Option<&[GraphRecipient]>) -> Vec<String> {
+    recipients
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|recipient| recipient.email_address.as_ref()?.address.clone())
+        .filter(|address| !address.trim().is_empty())
+        .collect()
 }
 
 fn sender_avatar_url(address: &str) -> Option<String> {

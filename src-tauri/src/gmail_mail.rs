@@ -30,13 +30,15 @@ use crate::{
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const MAX_GMAIL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
-const GMAIL_REQUEST_CONCURRENCY: usize = 8;
+// Keep concurrent Gmail reads below the point where mailbox paging and search
+// can amplify one another into user-level rate limiting.
+const GMAIL_REQUEST_CONCURRENCY: usize = 6;
 const MAX_GMAIL_HISTORY_PAGES: usize = 100;
 const MAX_GMAIL_FULL_SYNC_PAGES: usize = 1_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const MAX_GMAIL_READ_RETRIES: usize = 5;
-const MAX_GMAIL_RETRY_DELAY: Duration = Duration::from_secs(64);
+const MAX_GMAIL_READ_RETRIES: usize = 3;
+const MAX_GMAIL_RETRY_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 struct CachedAccessToken {
@@ -47,6 +49,8 @@ struct CachedAccessToken {
 static ACCESS_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedAccessToken>>> = OnceLock::new();
 static ACCESS_TOKEN_REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+static GMAIL_READ_LIMITER: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+static GMAIL_QUOTA_COOLDOWN: OnceLock<tokio::sync::Mutex<Option<Instant>>> = OnceLock::new();
 
 fn access_token_cache() -> &'static Mutex<HashMap<String, CachedAccessToken>> {
     ACCESS_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -108,6 +112,44 @@ static HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
 fn shared_http_client() -> Result<Client, String> {
     HTTP_CLIENT.get_or_init(build_http_client).clone()
+}
+
+fn gmail_read_limiter() -> &'static tokio::sync::Semaphore {
+    GMAIL_READ_LIMITER.get_or_init(|| tokio::sync::Semaphore::new(GMAIL_REQUEST_CONCURRENCY))
+}
+
+fn gmail_quota_cooldown() -> &'static tokio::sync::Mutex<Option<Instant>> {
+    GMAIL_QUOTA_COOLDOWN.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+async fn wait_for_gmail_quota_cooldown() {
+    loop {
+        let remaining = {
+            let mut cooldown = gmail_quota_cooldown().lock().await;
+            let now = Instant::now();
+            match *cooldown {
+                Some(until) if until > now => Some(until.duration_since(now)),
+                Some(_) => {
+                    *cooldown = None;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(delay) = remaining {
+            tokio::time::sleep(delay).await;
+        } else {
+            return;
+        }
+    }
+}
+
+async fn extend_gmail_quota_cooldown(delay: Duration) {
+    let until = Instant::now() + delay;
+    let mut cooldown = gmail_quota_cooldown().lock().await;
+    if cooldown.is_none_or(|current| current < until) {
+        *cooldown = Some(until);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +221,11 @@ where
     F: Fn() -> RequestBuilder,
 {
     for retry_number in 0..=MAX_GMAIL_READ_RETRIES {
+        let _permit = gmail_read_limiter()
+            .acquire()
+            .await
+            .map_err(|_| "Gmail read limiter is unavailable".to_string())?;
+        wait_for_gmail_quota_cooldown().await;
         let response = build_request()
             .send()
             .await
@@ -196,18 +243,29 @@ where
                 return Err(format_gmail_api_error(status, &body, operation));
             }
             if retry_number == MAX_GMAIL_READ_RETRIES {
+                drop(_permit);
                 return Err(format_gmail_api_error(status, &body, operation));
             }
+            let delay = gmail_retry_delay(retry_number, retry_after);
+            drop(_permit);
+            extend_gmail_quota_cooldown(delay).await;
             log::warn!(
                 "Gmail quota limit reached during {operation}; retry {}/{}",
                 retry_number + 1,
                 MAX_GMAIL_READ_RETRIES
             );
-            sleep_before_gmail_retry(retry_number, retry_after).await;
+            sleep_before_gmail_retry(delay).await;
             continue;
         }
 
         if !is_retryable_gmail_status(status) || retry_number == MAX_GMAIL_READ_RETRIES {
+            if status == StatusCode::TOO_MANY_REQUESTS && retry_number == MAX_GMAIL_READ_RETRIES {
+                drop(_permit);
+                return Err(
+                    "GMAIL_RATE_LIMITED: Gmail request rate limit was not cleared after bounded retries"
+                        .to_string(),
+                );
+            }
             return Ok(response);
         }
 
@@ -216,12 +274,17 @@ where
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
+        let delay = gmail_retry_delay(retry_number, retry_after);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            extend_gmail_quota_cooldown(delay).await;
+        }
+        drop(_permit);
         log::warn!(
             "Gmail transient error during {operation}; retry {}/{}",
             retry_number + 1,
             MAX_GMAIL_READ_RETRIES
         );
-        sleep_before_gmail_retry(retry_number, retry_after).await;
+        sleep_before_gmail_retry(delay).await;
     }
 
     Err("Gmail retry loop ended unexpectedly".to_string())
@@ -251,10 +314,13 @@ fn is_retryable_quota_error(body: &str) -> bool {
         })
 }
 
-async fn sleep_before_gmail_retry(retry_number: usize, retry_after_secs: Option<u64>) {
+fn gmail_retry_delay(retry_number: usize, retry_after_secs: Option<u64>) -> Duration {
     let exponential_secs = 1_u64 << retry_number.min(6);
     let requested_secs = retry_after_secs.unwrap_or(0).max(exponential_secs);
-    let delay = Duration::from_secs(requested_secs).min(MAX_GMAIL_RETRY_DELAY);
+    Duration::from_secs(requested_secs).min(MAX_GMAIL_RETRY_DELAY)
+}
+
+async fn sleep_before_gmail_retry(delay: Duration) {
     let jitter_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::from(duration.subsec_millis()) % 1_001)
@@ -500,17 +566,26 @@ async fn list_messages_with_query(
     };
     let mut messages = Vec::with_capacity(responses.len());
     let mut skipped_count = 0;
+    let mut rate_limited_count = 0;
     for response in responses {
         match response {
             Ok(message) => messages.push(to_mail_message(message)),
             Err(error) => {
                 skipped_count += 1;
+                if error.starts_with("GMAIL_RATE_LIMITED:") {
+                    rate_limited_count += 1;
+                }
                 log::warn!("Gmail message metadata was skipped during list: {error}");
             }
         }
     }
 
     if skipped_count > 0 {
+        if rate_limited_count > 0 {
+            return Err(format!(
+                "GMAIL_RATE_LIMITED: Gmail rate limited {rate_limited_count} message metadata request(s); the cache was left unchanged"
+            ));
+        }
         return Err(format!(
             "GMAIL_SYNC_INCOMPLETE: Gmail could not load {skipped_count} message metadata record(s); the cache was left unchanged"
         ));
@@ -1441,6 +1516,14 @@ pub async fn modify_message(
                 .send()
                 .await
         }
+        MessageAction::Unarchive => {
+            client
+                .post(gmail_message_action_url(message_id, "modify")?)
+                .bearer_auth(access_token)
+                .json(&json!({ "addLabelIds": ["INBOX"] }))
+                .send()
+                .await
+        }
         MessageAction::MarkUnread => {
             client
                 .post(gmail_message_action_url(message_id, "modify")?)
@@ -1682,6 +1765,10 @@ fn to_mail_message(message: GmailMessage) -> MailMessage {
         message_id_header: header_value(headers, "Message-ID"),
         sender,
         address,
+        to: parse_address_list(header_value(headers, "To")),
+        cc: parse_address_list(header_value(headers, "Cc")),
+        bcc: parse_address_list(header_value(headers, "Bcc")),
+        reply_to: parse_address_list(header_value(headers, "Reply-To")),
         avatar_url,
         subject,
         preview: preview.clone(),
@@ -1785,6 +1872,20 @@ fn parse_sender(value: Option<String>) -> (String, String) {
     }
     let decoded = decode_header_value(&value);
     (decoded, value)
+}
+
+fn parse_address_list(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| {
+            let address = part
+                .rsplit_once('<')
+                .map(|(_, address)| address.trim_end_matches('>').trim().to_string())
+                .unwrap_or_else(|| part.trim().to_string());
+            (!address.is_empty()).then_some(address)
+        })
+        .collect()
 }
 
 fn decode_header_value(value: &str) -> String {
@@ -2103,18 +2204,21 @@ async fn fetch_history_page(
 }
 
 async fn fetch_history_id(client: &Client, access_token: &str) -> Result<String, String> {
-    client
-        .get(format!("{GMAIL_API_URL}/profile"))
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<GmailProfile>()
-        .await
-        .map(|profile| profile.history_id)
-        .map_err(|error| error.to_string())
+    send_gmail_read_with_retry(
+        || {
+            client
+                .get(format!("{GMAIL_API_URL}/profile"))
+                .bearer_auth(access_token)
+        },
+        "load Gmail profile",
+    )
+    .await?
+    .error_for_status()
+    .map_err(|error| error.to_string())?
+    .json::<GmailProfile>()
+    .await
+    .map(|profile| profile.history_id)
+    .map_err(|error| error.to_string())
 }
 
 async fn fetch_metadata_messages(
@@ -2268,11 +2372,13 @@ fn inline_image_references(content_id: &str, normalized_id: &str) -> Vec<String>
     vec![
         format!("cid:{content_id}"),
         format!("cid:{normalized_id}"),
+        format!("cid:&lt;{normalized_id}&gt;"),
         format!("cid:%3C{normalized_id}%3E"),
         format!("cid:%3c{normalized_id}%3e"),
         format!("cid://{normalized_id}"),
         format!("cid:{encoded_id}"),
         format!("cid:%3C{encoded_id}%3E"),
+        format!("cid:%3c{encoded_id}%3e"),
     ]
 }
 
@@ -2328,19 +2434,18 @@ async fn fetch_attachment_data(
 ) -> Result<String, String> {
     let started_at = Instant::now();
     let attachment_url = gmail_attachment_url(message_id, attachment_id)?;
-    let data = client
-        .get(attachment_url)
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<AttachmentResponse>()
-        .await
-        .map_err(|error| error.to_string())?
-        .data
-        .ok_or_else(|| "Gmail returned an empty inline attachment".to_string())?;
+    let data = send_gmail_read_with_retry(
+        || client.get(attachment_url.clone()).bearer_auth(access_token),
+        "load Gmail attachment",
+    )
+    .await?
+    .error_for_status()
+    .map_err(|error| error.to_string())?
+    .json::<AttachmentResponse>()
+    .await
+    .map_err(|error| error.to_string())?
+    .data
+    .ok_or_else(|| "Gmail returned an empty inline attachment".to_string())?;
     log::info!(
         "Gmail attachment fetch completed: encoded_bytes={} duration_ms={}",
         data.len(),
@@ -2412,6 +2517,13 @@ mod tests {
         assert!(sender_avatar_url("sender@-example.com").is_none());
     }
 
+    #[test]
+    fn bounds_gmail_retry_delay() {
+        assert_eq!(gmail_retry_delay(0, None), Duration::from_secs(1));
+        assert_eq!(gmail_retry_delay(2, None), Duration::from_secs(4));
+        assert_eq!(gmail_retry_delay(0, Some(30)), MAX_GMAIL_RETRY_DELAY);
+    }
+
     fn encoded(value: &str) -> String {
         URL_SAFE_NO_PAD.encode(value.as_bytes())
     }
@@ -2423,6 +2535,10 @@ mod tests {
             message_id_header: None,
             sender: String::new(),
             address: String::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
             avatar_url: None,
             subject: String::new(),
             preview: String::new(),

@@ -11,6 +11,7 @@ const SERVICE_NAME: &str = "OpenMail";
 const GMAIL_CLIENT_ID_ACCOUNT: &str = "oauth:gmail:client-id";
 const GMAIL_CLIENT_SECRET_ACCOUNT: &str = "oauth:gmail:client-secret";
 const OUTLOOK_CLIENT_ID_ACCOUNT: &str = "oauth:outlook:client-id";
+const APP_LOCK_PIN_ACCOUNT: &str = "app:lock-pin";
 #[cfg(not(test))]
 const STORAGE_KEY_ACCOUNT: &str = "local-storage-encryption-key";
 
@@ -104,6 +105,45 @@ pub fn load_gmail_client_secret() -> Result<Option<String>, String> {
 
 pub fn delete_gmail_client_secret() -> Result<(), String> {
     match Entry::new(SERVICE_NAME, GMAIL_CLIENT_SECRET_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .delete_credential()
+    {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn save_app_lock_pin(pin: &str) -> Result<(), String> {
+    Entry::new(SERVICE_NAME, APP_LOCK_PIN_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .set_password(pin)
+        .map_err(|error| error.to_string())
+}
+
+pub fn has_app_lock_pin() -> Result<bool, String> {
+    match Entry::new(SERVICE_NAME, APP_LOCK_PIN_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .get_password()
+    {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn verify_app_lock_pin(pin: &str) -> Result<bool, String> {
+    match Entry::new(SERVICE_NAME, APP_LOCK_PIN_ACCOUNT)
+        .map_err(|error| error.to_string())?
+        .get_password()
+    {
+        Ok(stored_pin) => Ok(stored_pin == pin),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn delete_app_lock_pin() -> Result<(), String> {
+    match Entry::new(SERVICE_NAME, APP_LOCK_PIN_ACCOUNT)
         .map_err(|error| error.to_string())?
         .delete_credential()
     {
